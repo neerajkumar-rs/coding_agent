@@ -130,6 +130,10 @@ class RunRequestPayload(BaseModel):
     auto_deploy: bool = Field(default=True, description="Deploy staged files on success")
 
 
+class CancelRequest(BaseModel):
+    workspace_dir: str | None = Field(default=None, description="Workspace whose run to cancel")
+
+
 # -----------------------------------------------------------------------------
 # Parsing Helpers
 # -----------------------------------------------------------------------------
@@ -487,6 +491,73 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
     except Exception as exc:
         logger.error(f"agent run failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/agent/cancel")
+async def agent_cancel(payload: CancelRequest | None = None) -> dict[str, Any]:
+    """Request cancellation of the run in progress for a workspace."""
+    from agent_core.engine import get_engine
+
+    workspace = payload.workspace_dir if payload and payload.workspace_dir else state.workspace_root
+    engine = get_engine(workspace)
+    engine.cancel()
+    return {"status": "cancel_requested", "workspace": str(workspace)}
+
+
+@app.get("/agent/events")
+async def agent_events(workspace_dir: str | None = None, run_id: str | None = None, follow: bool = False):
+    """Server-sent events stream of a run's events.jsonl.
+
+    ``follow=true`` tails the file (for live TUI updates); otherwise the
+    current contents are returned and the stream closes.
+    """
+    import asyncio as _asyncio
+
+    from fastapi.responses import StreamingResponse
+
+    from agent_core.run_state import RUNS_DIR_NAME
+
+    workspace = Path(workspace_dir).resolve() if workspace_dir else state.workspace_root
+    runs_dir = workspace / RUNS_DIR_NAME
+    if not runs_dir.is_dir():
+        raise HTTPException(status_code=404, detail="No runs yet for this workspace")
+
+    if run_id:
+        run_dir = runs_dir / run_id
+    else:
+        candidates = sorted((d for d in runs_dir.iterdir() if d.is_dir()), reverse=True)
+        if not candidates:
+            raise HTTPException(status_code=404, detail="No runs yet for this workspace")
+        run_dir = candidates[0]
+    events_path = run_dir / "events.jsonl"
+    if not events_path.exists():
+        raise HTTPException(status_code=404, detail=f"No events for run {run_dir.name}")
+
+    async def event_stream():
+        sent = 0
+        # Replay existing events
+        for line in events_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                yield f"data: {line.strip()}\n\n"
+                sent += 1
+        if not follow:
+            return
+        # Tail for new events while the run is live
+        idle = 0
+        while idle < 300:  # ~5 minutes max tail
+            lines = events_path.read_text(encoding="utf-8").splitlines()
+            new = [ln for ln in lines[sent:] if ln.strip()]
+            for line in new:
+                yield f"data: {line.strip()}\n\n"
+            sent += len(new)
+            if not new:
+                idle += 1
+                yield ": keepalive\n\n"
+            else:
+                idle = 0
+            await _asyncio.sleep(1)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.post("/workspace/status")

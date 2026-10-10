@@ -67,6 +67,9 @@ STEP_URL        = FASTAPI_BASE + "/agent/step"
 STATUS_URL      = FASTAPI_BASE + "/workspace/status"
 DEPLOY_URL      = FASTAPI_BASE + "/agent/deploy"
 INIT_URL        = FASTAPI_BASE + "/workspace/init"
+RUN_URL         = FASTAPI_BASE + "/agent/run"
+CANCEL_URL      = FASTAPI_BASE + "/agent/cancel"
+EVENTS_URL      = FASTAPI_BASE + "/agent/events"
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 LOG_DIR = PROJECT_ROOT / ".agent_logs"
@@ -437,9 +440,11 @@ def show_help() -> None:
     console.print(
         Panel(
             "/help        show commands\n"
+            "/run         autonomous run through agent_core (plan → code → verify → deploy)\n"
             "/status      show service health + staged diff\n"
             "/workspace   change the active workspace path\n"
             "/deploy      push staged files into active workspace\n"
+            "/cancel      cancel the in-progress run for this workspace\n"
             "/logs        tail planner · coder · sandbox logs\n"
             "/models      list installed Ollama models\n"
             "/clear       clear screen\n"
@@ -532,6 +537,101 @@ async def submit(request_text: str, workspace_dir: str) -> None:
         console.print(f"[bold red]HTTP {exc.code}:[/bold red] {body[:400]}")
     except Exception as exc:
         console.print(f"[bold red]Pipeline error:[/bold red] {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Autonomous run with live task table (agent_core engine)
+# ---------------------------------------------------------------------------
+
+def _render_run_table(tasks: dict[str, dict], status: str, llm_calls: int) -> Table:
+    table = Table(title=f"agent_core run — {status} (llm calls: {llm_calls})",
+                  box=box.ROUNDED, border_style="bright_blue")
+    table.add_column("Task", width=6)
+    table.add_column("Name", style="bright_cyan", max_width=40)
+    table.add_column("Status", width=14)
+    table.add_column("Attempts", width=9, justify="right")
+    for number, info in sorted(tasks.items(), key=lambda kv: int(kv[0])):
+        status_str = info.get("status", "pending")
+        color = {
+            "complete": "bright_green", "running": "yellow",
+            "failed": "red", "needs_human": "magenta",
+        }.get(status_str, "dim")
+        table.add_row(
+            str(number), info.get("name", ""),
+            f"[{color}]{status_str}[/{color}]", str(info.get("attempts", 0)),
+        )
+    return table
+
+
+async def run_autonomous(request_text: str, workspace_dir: str) -> None:
+    """POST /agent/run while live-rendering the task table from run state."""
+    await post_json(INIT_URL, {"root_path": workspace_dir})
+
+    run_task = asyncio.create_task(
+        post_json(RUN_URL, {"prompt": request_text, "workspace_dir": workspace_dir})
+    )
+
+    tasks: dict[str, dict] = {}
+    run_status = "running"
+    llm_calls = 0
+    with Live(_render_run_table(tasks, run_status, llm_calls),
+              console=console, refresh_per_second=2) as live:
+        while not run_task.done():
+            try:
+                state_data = await asyncio.to_thread(
+                    _read_latest_run_state, workspace_dir
+                )
+                if state_data:
+                    for t in state_data.get("tasks", []):
+                        key = str(t.get("number", "?"))
+                        tasks[key] = {
+                            "name": t.get("name", ""),
+                            "status": t.get("status", "pending"),
+                            "attempts": t.get("attempts", 0),
+                        }
+                    run_status = state_data.get("status", run_status)
+                    llm_calls = state_data.get("llm_calls", llm_calls)
+                    live.update(_render_run_table(tasks, run_status, llm_calls))
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+
+    result = run_task.result()
+    run_status = result.get("status", "unknown")
+    llm_calls = result.get("llm_calls", llm_calls)
+    live.update(_render_run_table(tasks, run_status, llm_calls))
+
+    color = "bright_green" if run_status == "completed" else "bright_red"
+    console.print(
+        f"\n[{color}]Run {run_status}[/{color}] — "
+        f"files: {result.get('files', [])}, "
+        f"deployed: {result.get('deployed_files', [])}, "
+        f"elapsed: {result.get('elapsed_seconds', 0)}s"
+    )
+    for err in result.get("errors", [])[:3]:
+        console.print(Panel(err, title="error", border_style="red"))
+    for nh in result.get("needs_human", []):
+        console.print(f"[magenta]needs human: {nh}[/magenta]")
+
+
+def _read_latest_run_state(workspace_dir: str) -> dict | None:
+    """Read the newest .agent_runs/<id>/state.json for the live table."""
+    runs_dir = Path(workspace_dir) / ".agent_runs"
+    if not runs_dir.is_dir():
+        return None
+    candidates = sorted(
+        (d for d in runs_dir.iterdir() if d.is_dir()),
+        key=lambda d: d.name,
+        reverse=True,
+    )
+    for d in candidates:
+        state_path = d / "state.json"
+        if state_path.exists():
+            try:
+                return json.loads(state_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -661,6 +761,18 @@ async def main() -> None:
             elif command == "/deploy":
                 try:
                     res = await post_json(DEPLOY_URL, {"workspace_dir": workspace})
+                    console.print(JSON(json.dumps(res)))
+                except Exception as exc:
+                    console.print(f"[red]{exc}[/red]")
+
+            elif command == "/run":
+                request_text = Prompt.ask("Describe the change").strip()
+                if request_text:
+                    await run_autonomous(request_text, workspace)
+
+            elif command == "/cancel":
+                try:
+                    res = await post_json(CANCEL_URL, {"workspace_dir": workspace})
                     console.print(JSON(json.dumps(res)))
                 except Exception as exc:
                     console.print(f"[red]{exc}[/red]")
