@@ -1,8 +1,10 @@
 # Local LLM Master Controller — Ollama Native
 
-A high-performance, GPU-constrained agentic coding pipeline designed for a 4 GB RTX 3050.  
-All LLM inference is routed through a local [Ollama](https://ollama.ai) instance at `http://localhost:11434`.  
-A pure-Python FastAPI supervisor (0 MB VRAM) orchestrates quantized models **sequentially** — never simultaneously — to enforce the VRAM ceiling.
+A GPU-constrained agentic coding pipeline designed for a 4 GB RTX 3050.
+All LLM inference runs through a local [Ollama](https://ollama.ai) instance at
+`http://localhost:11434`. A pure-Python FastAPI supervisor (0 MB VRAM) routes
+work through a **single** `agent_core` engine — one pipeline, one process-wide
+LLM lock, deterministic verification.
 
 ## License
 
@@ -14,37 +16,53 @@ This project is licensed under the [MIT License](./LICENSE).
 
 ```
 FastAPI Master Controller (main.py)   ←  0 MB VRAM deterministic supervisor
-        │
-        │  asyncio.Lock  (one model at a time)
-        │
+        │  /agent/run · /agent/plan · /agent/step · /agent/deploy
+        │  /agent/events (SSE) · /agent/cancel · /agent/rollback
         ▼
-Local Ollama  http://localhost:11434
+agent_core.engine.Engine              ←  THE pipeline (orchestrator.py is a shim)
         │
-        ├── deepseek-r1:1.5b          ←  Planner / Auditor  (THINKER)
-        └── qwen2.5-coder:3b          ←  Code generator     (CODER)
-                │
-                ▼
-        .agent_staging/               ←  Isolated staging cache (never touches production)
-        .agent_logs/                  ←  Discrete per-role session logs
-                │
-                ▼  POST /agent/deploy
-        Active Workspace              ←  Atomic deployment after validation
+        ├── context.py     AST repo map + token budgeter (chars/3.5, ≤85% of num_ctx)
+        ├── planner.py     Plan via Ollama structured outputs (pydantic-validated,
+        │                  one retry) with markdown fallback
+        ├── coder.py       New files: full fenced block. Edits: SEARCH/REPLACE
+        │                  (exact → whitespace-normalized, unique-only)
+        ├── verifier.py    DETERMINISTIC: py_compile → ruff* → import smoke → pytest*
+        │                  (*skipped when tool absent; the only pass/fail gate)
+        ├── auditor.py     LLM review of the DIFF only; verdict pass/concerns;
+        │                  NEVER blocks a deterministic pass
+        ├── staging.py     .agent_staging/ → verify → deploy (backups to
+        │                  .agent_runs/<id>/backup/), path-escape + protected paths
+        └── run_state.py   .agent_runs/<run_id>/{state.json,events.jsonl,tasks.md}
+        │
+        ▼  one process-wide lock (sync threading.Lock + async gateway)
+Local Ollama  http://localhost:11434
+        ├── deepseek-r1:1.5b          ←  Planner / Auditor
+        └── qwen2.5-coder:3b          ←  Coder
 ```
+
+**Run budgets** (per run): 900 s wall time, 40 LLM calls, 2 attempts per task.
+Two consecutive attempts with an identical diagnostic hash → task `needs_human`.
+Run statuses: `completed` | `failed` | `needs_human` | `budget_exhausted` | `cancelled`.
 
 ---
 
 ## Models
 
-| Role | Model | When used |
+| Role | Model | Used by |
 |---|---|---|
-| Planner / Auditor | `deepseek-r1:1.5b` | `/agent/plan`, LLM validation loop |
-| Code Generator | `qwen2.5-coder:3b` (or `1.5b`) | `/agent/step` |
-
-Pull both models once:
+| Planner / Auditor | `deepseek-r1:1.5b` | planner, auditor, spec refinement |
+| Coder | `qwen2.5-coder:3b` (or `1.5b`) | code generation / SEARCH/REPLACE edits |
 
 ```powershell
 ollama pull deepseek-r1:1.5b
 ollama pull qwen2.5-coder:3b
+```
+
+Check whether the planner model conforms to the Plan schema reliably:
+
+```powershell
+.\env\Scripts\python.exe -m agent_core.planner_eval --model deepseek-r1:1.5b
+# >20% schema failure  ->  use --planner-model qwen2.5-coder:3b
 ```
 
 ---
@@ -53,56 +71,52 @@ ollama pull qwen2.5-coder:3b
 
 ### 1. Prerequisites
 
-- Ollama running locally: `ollama serve` (default port 11434)
-- Python virtual environment activated: `.\env\Scripts\activate`
+- Ollama running locally: `ollama serve` (default port 11434). If it is already
+  running, `tui.py` **reuses** it — it never kills ollama.exe processes it did
+  not spawn.
+- Python environment: `.\env\Scripts\activate`
 
 ### 2. Initialize the `.agent` profile
-
-The profile is written to your workspace root as `.agent` (JSON). It controls `num_ctx`, model names, and is read by every Ollama API payload.
 
 ```powershell
 # Auto-benchmark hardware and write profile (RTX 3050 → 4096 tokens)
 .\env\Scripts\python.exe main.py --recalculate
 
-# Or set manual bounds
+# Manual bounds
 .\env\Scripts\python.exe main.py --recalculate --max-context-tokens 8192 --coder-model qwen2.5-coder:1.5b
 ```
 
-Profile written to `e:\coding_agent\.agent`:
+`.agent` (workspace root, git-ignored):
 
 ```json
 {
   "planner_model": "deepseek-r1:1.5b",
   "coder.5b_or_3b": "qwen2.5-coder:3b",
-  "max_context_tokens": 4096
+  "max_context_tokens": 4096,
+  "keep_alive": "5m",
+  "allowed_commands": ["py_compile"]
 }
 ```
 
-Every Ollama payload enforces these options:
+Every Ollama payload enforces exactly:
 
 ```json
 {
-  "keep_alive": "10m",
-  "options": {
-    "num_ctx": 4096,
-    "flash_attention": true,
-    "keep_alive": "10m"
-  }
+  "keep_alive": "5m",                  // top-level only
+  "options": { "num_ctx": 4096, "num_predict": 2048, "temperature": 0.1, "seed": 42 }
 }
 ```
 
-### 3. Start the FastAPI Master Controller
+(`flash_attention` is a **server** setting — see Environment Variables.)
+
+### 3. Run
 
 ```powershell
-.\env\Scripts\uvicorn.exe main:app --host 127.0.0.1 --port 8000
-```
-
-### 4. Launch the TUI (optional)
-
-The Rich TUI starts FastAPI automatically and connects to the Ollama endpoint:
-
-```powershell
+# TUI: reuses running Ollama, starts FastAPI, /run for autonomous runs
 .\env\Scripts\python.exe tui.py
+
+# Or just the controller (localhost by default)
+.\env\Scripts\uvicorn.exe main:app --host 127.0.0.1 --port 8000
 ```
 
 ---
@@ -111,53 +125,49 @@ The Rich TUI starts FastAPI automatically and connects to the Ollama endpoint:
 
 All endpoints accept and return JSON.
 
-### `POST /workspace/init`
-
-Initialize or parse `.agent` configuration, create `.agent_staging/` and `.agent_logs/`.
+### `POST /agent/run` — autonomous pipeline (the one you want)
 
 ```json
-{ "root_path": "E:/my_project", "coder_model": "qwen2.5-coder:3b" }
+{ "prompt": "Create a greeting CLI in generated.py", "auto_deploy": true }
 ```
 
-### `POST /agent/plan`
+Runs the full engine: context scan → plan → per task [coder → stage →
+deterministic verify → audit (diff only)] → deploy on success with backups.
+Response carries `status`, `run_id`, `files`, `deployed_files`, `attempts`,
+`llm_calls`, `errors`, `needs_human`, `audits`.
 
-Query the Planner model (`deepseek-r1:1.5b`). Returns a strict task queue. Raw `<think>` reasoning is logged to `.agent_logs/planner.log`.
+### `POST /agent/plan` / `POST /agent/step`
 
-```json
-{ "prompt": "Add a FastAPI health endpoint to app.py" }
-```
-
-Response schema:
-
-```json
-{
-  "tasks": [
-    { "id": 1, "file": "app.py", "action": "edit", "description": "Add GET /health returning {'status': 'ok'}" }
-  ],
-  "model_used": "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
-}
-```
-
-### `POST /agent/step`
-
-Execute one task from the queue. The Coder model streams a patch into `.agent_staging/`. Then a native OS validation script runs in a subprocess boundary.
-
-- **Windows**: Generates a PowerShell `.ps1` and runs it via `pwsh.exe`.
-- **Linux/macOS**: Generates a Bash `.sh` and runs it.
-- `stdout` / `stderr` are trapped and returned for the evaluation loop.
-- Logged to `.agent_logs/coder.log` (code) and `.agent_logs/sandbox.log` (output).
-
-```json
-{ "task_id": 1 }
-```
+Interactive flow: plan a task queue, then execute tasks one at a time into
+`.agent_staging/`, each followed by a sandbox validation. `/agent/step` accepts
+`custom_command` only as an **allowlisted name** from `.agent`
+(`allowed_commands`, default `["py_compile"]`); free-form shell is rejected.
 
 ### `POST /workspace/status`
 
-Computes `difflib.unified_diff` between `.agent_staging/` and the active workspace. Returns a line-by-line git-style diff object for TUI/GUI change previews.
+`difflib.unified_diff` between `.agent_staging/` and the active workspace.
 
 ### `POST /agent/deploy`
 
-Atomic deployment: maps files from `.agent_staging/` into active workspace paths, then flushes the staging cache. **Only triggered explicitly** — active workspace is never modified during active pipeline cycles.
+Atomic deploy of staged files into the workspace, then flushes staging.
+Overwritten files are backed up to `.agent_runs/<latest>/backup/` first.
+
+### `POST /agent/rollback`
+
+```json
+{ "run_id": "20261010T120000Z-ab12cd" }   // or omit for the latest backup
+```
+
+Restores files from a run's deploy backup.
+
+### `GET /agent/events?workspace_dir=…&run_id=…&follow=true`
+
+Server-sent events stream of a run's `events.jsonl` (replays history;
+`follow=true` tails for live updates).
+
+### `POST /agent/cancel`
+
+Requests cancellation of the in-progress run for a workspace.
 
 ---
 
@@ -165,58 +175,74 @@ Atomic deployment: maps files from `.agent_staging/` into active workspace paths
 
 ```
 e:\coding_agent\
+├── agent_core/            ← THE pipeline
+│   ├── engine.py          ← Engine.run(request): budgets, no-progress, sessions
+│   ├── llm_gateway.py     ← structured outputs (format=schema + pydantic, 1 retry)
+│   ├── schemas.py         ← Plan / AuditResult pydantic models
+│   ├── planner.py         ← structured plan + markdown fallback
+│   ├── coder.py           ← full blocks + SEARCH/REPLACE edits
+│   ├── verifier.py        ← py_compile → ruff → import smoke → pytest
+│   ├── auditor.py         ← diff review, never blocks a deterministic pass
+│   ├── staging.py         ← staging + path safety + backups/rollback
+│   ├── run_state.py       ← .agent_runs journal (state/events/tasks)
+│   ├── context.py         ← AST repo map + token budgeter
+│   └── planner_eval.py    ← planner schema-conformance benchmark
 │
-├── main.py               ← FastAPI Master Controller (5 endpoints)
-├── agent_config.py       ← Dynamic System Engine: .agent profile + --recalculate CLI
-├── ollama_client.py      ← Async Ollama supervisor with asyncio.Lock VRAM fencing
-├── workspace_staging.py  ← Deferred staging cache + difflib status + atomic deploy
-├── sandbox.py            ← OS-aware .ps1/.sh validation script generator & executor
-├── scanner.py            ← Workspace directory scanner + prompt context injection
-├── orchestrator.py       ← Four-role retry pipeline (Thinker→Coder→Writer→Validator)
-├── tui.py                ← Rich CLI: starts FastAPI, streams plan→step→deploy cycle
+├── main.py                ← FastAPI controller (all endpoints)
+├── orchestrator.py        ← COMPAT SHIM over Engine (legacy RunResult)
+├── agent_config.py        ← .agent profile + --recalculate CLI
+├── ollama_client.py       ← think-stripping + truncation-guarded LLM layer
+├── workspace_staging.py   ← staging manager + difflib + atomic deploy
+├── sandbox.py             ← allowlisted validation commands (.ps1/.sh)
+├── scanner.py             ← workspace scanner (interactive endpoints)
+├── tui.py                 ← Rich TUI (reuses running Ollama)
 │
-├── .agent                ← Persistent profile (auto-created, git-ignored)
-├── .agent_staging/       ← Isolated code generation cache (git-ignored)
-├── .agent_logs/          ← Discrete operational logs (git-ignored)
-│   ├── planner.log       ← Raw reasoning + task queue arrays
-│   ├── coder.log         ← Generated source code blocks
-│   └── sandbox.log       ← Subprocess stdout/stderr + exit codes
-│
-├── test_master_controller.py  ← Full lifecycle test suite (no live Ollama needed)
-├── e2e_smoke_test.py          ← End-to-end test with mock Ollama server
-├── test_live_ollama.py        ← Live Ollama connection verification
-└── requirements.txt
+├── tests/                 ← pytest suite (61 tests, offline)
+├── test_master_controller.py  ← legacy lifecycle suite (offline)
+├── e2e_smoke_test.py          ← end-to-end with mock Ollama server
+└── test_live_ollama.py        ← live Ollama connection check
 ```
+
+Workspace-side artifacts (all git-ignored):
+
+```
+.agent             profile        .agent_logs/     role logs
+.agent_staging/    code cache     .agent_runs/<id>/ state.json · events.jsonl · tasks.md · backup/
+```
+
+The workspace root itself only ever receives the **requested target files**
+(after deploy). No `tasks.md`/`summary.txt`/`taskN_code.txt`/stub files.
 
 ---
 
 ## Testing
 
-### Offline tests (mock Ollama server — no GPU required)
-
 ```powershell
-# Unit + integration: staging, difflib, sandbox, FastAPI endpoints
+# Unit tests (61, offline)
+.\env\Scripts\python.exe -m pytest tests/ -q
+
+# Legacy lifecycle suite (offline)
 .\env\Scripts\python.exe test_master_controller.py
 
-# End-to-end: full Thinker→Coder→Write→Compile pipeline
+# End-to-end with a mock Ollama server (offline)
 .\env\Scripts\python.exe e2e_smoke_test.py
-```
 
-### Live Ollama verification
-
-```powershell
+# Live Ollama check (needs ollama serve)
 .\env\Scripts\python.exe test_live_ollama.py
 ```
 
 ---
 
-## VRAM Safety Model
+## VRAM Safety Model (RTX 3050 4 GB)
 
-The RTX 3050's 4 GB hard ceiling is enforced at three levels:
-
-1. **Sequential execution** — `asyncio.Lock` in `OllamaSupervisorClient` ensures only one model inference is in-flight at any time. Thinker and Coder never run in parallel.
-2. **Strict `keep_alive: 10m`** — Models stay resident in VRAM between back-to-back calls to eliminate 0ms reload lag on rapid step execution.
-3. **`num_ctx` cap** — Set to 4096 tokens for 3B models (leaves ~1.8 GB headroom for activations). Configurable via `--recalculate` for 1.5B models (8192 tokens).
+1. **One model at a time** — a single process-wide lock serializes every
+   generation across all workspaces and endpoints.
+2. **Server-side residency** — when the TUI spawns `ollama serve` it sets
+   `OLLAMA_FLASH_ATTENTION=1` and `OLLAMA_MAX_LOADED_MODELS=1`
+   (server env vars — NOT payload fields). `keep_alive: "5m"` keeps the model
+   warm between calls via the payload's top-level field.
+3. **Context discipline** — `num_ctx=4096`; prompt inputs are capped at 85% of
+   the window (tokens ≈ chars/3.5) minus the output reserve.
 
 ---
 
@@ -225,7 +251,11 @@ The RTX 3050's 4 GB hard ceiling is enforced at three levels:
 | Variable | Default | Purpose |
 |---|---|---|
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint |
-| `VIBE_API_URL` | `http://127.0.0.1:8000` | FastAPI controller URL (TUI) |
+| `OLLAMA_FLASH_ATTENTION` | `1` (set by TUI) | Server: flash attention |
+| `OLLAMA_MAX_LOADED_MODELS` | `1` (set by TUI) | Server: one resident model |
+| `VIBE_MAX_WALL_SECONDS` | `900` | Run wall-time budget |
+| `VIBE_MAX_LLM_CALLS` | `40` | Run LLM-call budget |
 | `VIBE_VALIDATION_TIMEOUT_SECONDS` | `300` | Sandbox subprocess timeout |
+| `VIBE_PORT` | `8000` | FastAPI port (TUI) |
 | `PORT` | `8000` | FastAPI listen port |
-| `HOST` | `0.0.0.0` | FastAPI listen host |
+| `HOST` | `127.0.0.1` | FastAPI listen host (set `0.0.0.0` to expose) |
