@@ -18,6 +18,7 @@ logger = logging.getLogger("agent_config")
 DEFAULT_PLANNER_MODEL = "deepseek-r1:1.5b"
 DEFAULT_CODER_MODEL = "qwen2.5-coder:3b"
 DEFAULT_CONTEXT_TOKENS = 4096
+DEFAULT_KEEP_ALIVE = "5m"
 RTX_3050_VRAM_CEILING_GB = 4.0
 
 
@@ -26,12 +27,14 @@ class AgentConfig:
     planner_model: str = DEFAULT_PLANNER_MODEL
     coder_5b_or_3b: str = DEFAULT_CODER_MODEL  # Serialized as "coder.5b_or_3b"
     max_context_tokens: int = DEFAULT_CONTEXT_TOKENS
+    keep_alive: str = DEFAULT_KEEP_ALIVE  # Top-level Ollama keep_alive (model residency)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "planner_model": self.planner_model,
             "coder.5b_or_3b": self.coder_5b_or_3b,
             "max_context_tokens": self.max_context_tokens,
+            "keep_alive": self.keep_alive,
         }
 
     @classmethod
@@ -44,10 +47,12 @@ class AgentConfig:
         )
         planner = data.get("planner_model") or DEFAULT_PLANNER_MODEL
         ctx = int(data.get("max_context_tokens", DEFAULT_CONTEXT_TOKENS))
+        keep_alive = str(data.get("keep_alive") or DEFAULT_KEEP_ALIVE)
         return cls(
             planner_model=planner,
             coder_5b_or_3b=coder,
             max_context_tokens=ctx,
+            keep_alive=keep_alive,
         )
 
     @property

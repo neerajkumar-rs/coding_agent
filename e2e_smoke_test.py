@@ -9,7 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from ollama_client import OllamaEngine
-from orchestrator import VibeOrchestrator
+from orchestrator import RUNS_DIR_NAME, VibeOrchestrator
 
 
 class FakeOllama(BaseHTTPRequestHandler):
@@ -30,12 +30,21 @@ class FakeOllama(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length))
         prompt = payload.get("prompt", "")
         if "validation" in prompt.lower():
-            content = "PASS\nGenerated files satisfy the specification."
+            content = "<think>checking spec compliance</think>PASS\nGenerated files satisfy the specification."
         elif "pure code generator" in prompt.lower():
             content = "```FILE: generated.py\n\ndef greet(name: str) -> str:\n    return f'Hello, {name}!'\n```"
         else:
-            content = "## TASK 1: create greeting\n- files: generated.py\n- logic: def greet(name: str) -> str"
-        response = json.dumps({"response": content}).encode()
+            content = "<think>planning</think>## TASK 1: create greeting\n- files: generated.py\n- logic: def greet(name: str) -> str"
+        response = json.dumps(
+            {
+                "response": content,
+                "done": True,
+                "done_reason": "stop",
+                "prompt_eval_count": 128,
+                "eval_count": 64,
+                "total_duration": 1_000_000_000,
+            }
+        ).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(response)))
@@ -57,12 +66,35 @@ def main() -> None:
             result = VibeOrchestrator(engine=engine, workspace=workspace).run(
                 "Create a greeting function", "generated.py"
             )
-            target = Path(workspace) / "generated.py"
-            summary = Path(workspace) / "summary.txt"
+            workspace_root = Path(workspace)
+            target = workspace_root / "generated.py"
+
             assert result.status == "completed", result
+            assert result.run_id, "run must carry a run_id"
             assert target.exists()
-            assert summary.exists()
-            assert "generated.py" in summary.read_text(encoding="utf-8")
+
+            # Junk-file regression: no fake-role artifacts in the workspace root
+            assert not (workspace_root / "summary.txt").exists()
+            assert not (workspace_root / "tasks.md").exists()
+            assert not list(workspace_root.glob("task*_code.txt"))
+
+            # Run metadata lives under .agent_runs/<run_id>/
+            run_dir = workspace_root / RUNS_DIR_NAME / result.run_id
+            assert (run_dir / "state.json").exists()
+            assert (run_dir / "events.jsonl").exists()
+            assert (run_dir / "tasks.md").exists()
+            state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+            assert state["status"] == "completed", state
+            assert state["llm_calls"] > 0
+
+            # Only the requested target plus benign infrastructure may exist:
+            # .agent (persisted config), .agent_runs/ (run metadata),
+            # __pycache__/ (py_compile byproduct). NO role junk files.
+            root_entries = {p.name for p in workspace_root.iterdir()}
+            assert root_entries <= {"generated.py", ".agent", RUNS_DIR_NAME, "__pycache__"}, root_entries
+
+            # Think blocks were stripped before validation/parsing
+            assert "think" not in result.llm_validation.lower()[:200] or result.llm_validation.startswith("PASS")
         print("E2E smoke test passed: Ollama thinker -> coder -> write -> compile")
     finally:
         server.shutdown()

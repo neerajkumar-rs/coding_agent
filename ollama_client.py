@@ -1,4 +1,19 @@
-"""High-performance asynchronous Ollama API client with strict VRAM fencing."""
+"""High-performance asynchronous Ollama API client with strict VRAM fencing.
+
+Post-processing guarantees (applied in THIS layer, before any caller parses):
+- ``<think>...</think>`` blocks (including an unterminated trailing block) are
+  stripped from every response and returned separately as *reasoning*.
+- A response whose ``done_reason`` is ``"length"`` was cut off. It is never
+  handed back for judgement: :class:`OllamaTruncatedError` (retryable) is
+  raised so callers can retry with an adjusted budget instead of failing.
+
+Ollama payload rules:
+- ``keep_alive`` is a *top-level* request field (never inside ``options``).
+- ``options`` carries only: ``num_ctx``, ``num_predict``, ``temperature``, ``seed``.
+  ``flash_attention`` is NOT a request option — it is the *server* env var
+  ``OLLAMA_FLASH_ATTENTION=1``. ``OLLAMA_MAX_LOADED_MODELS=1`` is also a server
+  env var. ``tui.py`` sets both when it spawns ``ollama serve``.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +21,9 @@ import asyncio
 import json
 import logging
 import os
+import re
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
@@ -16,17 +34,87 @@ from agent_config import AgentConfig, load_agent_config
 logger = logging.getLogger("ollama_client")
 
 DEFAULT_OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
-GENERATE_ENDPOINT = f"{DEFAULT_OLLAMA_HOST}/api/generate"
-TAGS_ENDPOINT = f"{DEFAULT_OLLAMA_HOST}/api/tags"
+
+# Generation budgets -----------------------------------------------------------
+# Reasoning models (deepseek-r1 style) need extra room for <think> + answer.
+DEFAULT_NUM_PREDICT = 2048
+REASONING_NUM_PREDICT = 3072
+MAX_NUM_PREDICT = 4096
+TEMPERATURE_CODE = 0.1
+TEMPERATURE_PLAN = 0.2
+DEFAULT_SEED = 42
+
+_THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN_RE = re.compile(r"<think>(.*)$", re.DOTALL | re.IGNORECASE)
 
 
 class OllamaError(RuntimeError):
     """Raised when Ollama inference fails or returns an error status."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        done_reason: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.done_reason = done_reason
+
+
+class OllamaTruncatedError(OllamaError):
+    """Response was cut off (``done_reason == "length"``). Always retryable."""
+
+    def __init__(self, message: str = "response truncated (done_reason=length)") -> None:
+        super().__init__(message, retryable=True, done_reason="length")
+
+
+def strip_think_blocks(raw_text: str) -> tuple[str, str]:
+    """Remove ``<think>...</think>`` blocks; return ``(reasoning, answer)``.
+
+    Handles an unterminated trailing ``<think>`` block (common when a reasoning
+    model is cut off mid-thought): its content is treated as reasoning and
+    removed from the answer.
+    """
+    if not raw_text:
+        return "", ""
+    reasoning_parts = [m.strip() for m in _THINK_BLOCK_RE.findall(raw_text)]
+    text = _THINK_BLOCK_RE.sub("", raw_text)
+    open_match = _THINK_OPEN_RE.search(text)
+    if open_match:
+        reasoning_parts.append(open_match.group(1).strip())
+        text = text[: open_match.start()]
+    reasoning = "\n".join(part for part in reasoning_parts if part)
+    return reasoning, text.strip()
+
+
+def is_reasoning_model(model_name: str) -> bool:
+    """Heuristic: models that emit ``<think>`` blocks by default."""
+    lowered = model_name.lower()
+    return "deepseek-r1" in lowered or "qwq" in lowered or lowered.startswith("r1")
+
+
+@dataclass
+class LLMResponse:
+    """Fully post-processed model response."""
+
+    text: str
+    reasoning: str
+    model: str
+    done_reason: str = "stop"
+    prompt_tokens: int = 0
+    output_tokens: int = 0
+    seconds: float = 0.0
+
+
+def _default_num_predict(model_name: str) -> int:
+    return REASONING_NUM_PREDICT if is_reasoning_model(model_name) else DEFAULT_NUM_PREDICT
+
 
 class OllamaSupervisorClient:
     """Pure Python deterministic supervisor enforcing sequential model execution.
-    
+
     Operates at 0MB VRAM footprint. Models are called strictly sequentially as
     stateless functions via an async mutex to prevent memory exhaustion on 4GB VRAM.
     """
@@ -95,20 +183,115 @@ class OllamaSupervisorClient:
         system_prompt: str = "",
         config: AgentConfig | None = None,
         stream: bool = False,
+        num_predict: int | None = None,
+        temperature: float = TEMPERATURE_CODE,
+        seed: int = DEFAULT_SEED,
     ) -> dict[str, Any]:
+        """Build a valid Ollama /api/generate payload.
+
+        ``keep_alive`` is top-level; ``options`` carries only num_ctx /
+        num_predict / temperature / seed.
+        """
         cfg = config or load_agent_config()
         return {
             "model": model,
             "prompt": prompt,
             "system": system_prompt,
             "stream": stream,
-            "keep_alive": "10m",
+            "keep_alive": cfg.keep_alive,
             "options": {
                 "num_ctx": cfg.max_context_tokens,
-                "flash_attention": True,
-                "keep_alive": "10m",
+                "num_predict": num_predict if num_predict is not None else _default_num_predict(model),
+                "temperature": temperature,
+                "seed": seed,
             },
         }
+
+    async def generate_response(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        model_name: str | None = None,
+        config: AgentConfig | None = None,
+        num_predict: int | None = None,
+        temperature: float = TEMPERATURE_PLAN,
+        seed: int = DEFAULT_SEED,
+    ) -> LLMResponse:
+        """Sequential stateless generation with think-stripping and truncation guard.
+
+        Never returns a cut-off response for judgement: if Ollama reports
+        ``done_reason == "length"`` and the output hit the ``num_predict``
+        ceiling, we retry once with a larger budget (bounded by the remaining
+        context window); otherwise :class:`OllamaTruncatedError` is raised so
+        the caller can shrink the prompt.
+        """
+        cfg = config or load_agent_config()
+        target_model = model_name or cfg.planner_model
+        resolved = await self.resolve_model_name(target_model)
+        effective_predict = num_predict if num_predict is not None else _default_num_predict(resolved)
+
+        for attempt in range(2):
+            payload = self.build_payload(
+                model=resolved,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                config=cfg,
+                stream=False,
+                num_predict=effective_predict,
+                temperature=temperature,
+                seed=seed,
+            )
+
+            async with self._vram_mutex:
+                logger.info(
+                    f"[Supervisor Lock Acquired] Running {resolved} "
+                    f"(num_ctx={cfg.max_context_tokens}, num_predict={effective_predict}, "
+                    f"temp={temperature}, keep_alive={cfg.keep_alive})"
+                )
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    response = await client.post(self.generate_url, json=payload)
+                    if response.status_code != 200:
+                        raise OllamaError(
+                            f"Ollama generation failed ({response.status_code}): {response.text}"
+                        )
+                    data = response.json()
+
+            raw_text = data.get("response", "")
+            done_reason = data.get("done_reason") or "stop"
+            prompt_tokens = int(data.get("prompt_eval_count", 0) or 0)
+            output_tokens = int(data.get("eval_count", 0) or 0)
+            seconds = round(float(data.get("total_duration", 0) or 0) / 1e9, 3)
+
+            if done_reason == "length":
+                ctx_headroom = cfg.max_context_tokens - prompt_tokens
+                bigger = min(effective_predict * 2, MAX_NUM_PREDICT, max(ctx_headroom, 0))
+                if output_tokens >= effective_predict and bigger > effective_predict and attempt == 0:
+                    logger.warning(
+                        f"Response from {resolved} hit num_predict={effective_predict}; "
+                        f"retrying once with num_predict={bigger}"
+                    )
+                    effective_predict = bigger
+                    continue
+                raise OllamaTruncatedError(
+                    f"response from {resolved} was cut off at the context window "
+                    f"(prompt={prompt_tokens} tok, output={output_tokens} tok, "
+                    f"num_ctx={cfg.max_context_tokens}); retry with a smaller prompt"
+                )
+
+            reasoning, answer = strip_think_blocks(raw_text)
+            return LLMResponse(
+                text=answer,
+                reasoning=reasoning,
+                model=resolved,
+                done_reason=done_reason,
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+                seconds=seconds,
+            )
+
+        raise OllamaTruncatedError(  # unreachable, but keeps type-checkers honest
+            f"response from {resolved} was cut off repeatedly"
+        )
 
     async def generate(
         self,
@@ -116,32 +299,19 @@ class OllamaSupervisorClient:
         system_prompt: str = "",
         model_name: str | None = None,
         config: AgentConfig | None = None,
+        num_predict: int | None = None,
+        temperature: float = TEMPERATURE_PLAN,
     ) -> str:
-        """Sequential stateless generation call with strict lock and 0ms keep_alive."""
-        cfg = config or load_agent_config()
-        target_model = model_name or cfg.planner_model
-        resolved = await self.resolve_model_name(target_model)
-        payload = self.build_payload(
-            model=resolved,
+        """Compatibility wrapper: return only the think-stripped answer text."""
+        response = await self.generate_response(
             prompt=prompt,
             system_prompt=system_prompt,
-            config=cfg,
-            stream=False,
+            model_name=model_name,
+            config=config,
+            num_predict=num_predict,
+            temperature=temperature,
         )
-
-        async with self._vram_mutex:
-            logger.info(
-                f"[Supervisor Lock Acquired] Running {resolved} "
-                f"(num_ctx={cfg.max_context_tokens}, flash_attn=True, keep_alive=10m)"
-            )
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(self.generate_url, json=payload)
-                if response.status_code != 200:
-                    raise OllamaError(
-                        f"Ollama generation failed ({response.status_code}): {response.text}"
-                    )
-                data = response.json()
-                return data.get("response", "")
+        return response.text
 
     async def stream_generate(
         self,
@@ -149,8 +319,15 @@ class OllamaSupervisorClient:
         system_prompt: str = "",
         model_name: str | None = None,
         config: AgentConfig | None = None,
+        num_predict: int | None = None,
+        temperature: float = TEMPERATURE_CODE,
     ) -> AsyncGenerator[str, None]:
-        """Stream generated tokens while holding the VRAM supervisor lock."""
+        """Stream raw generated tokens while holding the VRAM supervisor lock.
+
+        Raw transport: callers that parse the joined output must run it through
+        :func:`strip_think_blocks` first. Raises :class:`OllamaTruncatedError`
+        at end-of-stream if the response was cut off.
+        """
         cfg = config or load_agent_config()
         target_model = model_name or cfg.coder_model
         resolved = await self.resolve_model_name(target_model)
@@ -160,13 +337,16 @@ class OllamaSupervisorClient:
             system_prompt=system_prompt,
             config=cfg,
             stream=True,
+            num_predict=num_predict,
+            temperature=temperature,
         )
 
         async with self._vram_mutex:
             logger.info(
                 f"[Supervisor Lock Acquired for Stream] Running {resolved} "
-                f"(num_ctx={cfg.max_context_tokens}, keep_alive=10m)"
+                f"(num_ctx={cfg.max_context_tokens}, keep_alive={cfg.keep_alive})"
             )
+            done_reason = "stop"
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 async with client.stream("POST", self.generate_url, json=payload) as resp:
                     if resp.status_code != 200:
@@ -179,15 +359,21 @@ class OllamaSupervisorClient:
                             continue
                         try:
                             chunk = json.loads(line)
-                            token = chunk.get("response", "")
-                            if token:
-                                yield token
                         except json.JSONDecodeError:
                             continue
+                        if chunk.get("done"):
+                            done_reason = chunk.get("done_reason") or "stop"
+                        token = chunk.get("response", "")
+                        if token:
+                            yield token
+            if done_reason == "length":
+                raise OllamaTruncatedError(
+                    f"streamed response from {resolved} was cut off (done_reason=length)"
+                )
 
 
 class OllamaEngine:
-    """Lightweight direct Ollama engine adapter replacing legacy proprietary backends."""
+    """Synchronous Ollama engine adapter used by the CLI orchestrator pipeline."""
 
     def __init__(
         self,
@@ -200,53 +386,120 @@ class OllamaEngine:
         self.tags_url = f"{self.base_url}/api/tags"
         self.workspace_root = Path(workspace_root).resolve() if workspace_root else Path.cwd().resolve()
         self.config = config or load_agent_config(self.workspace_root)
-        self._lock = asyncio.Lock()
-        import threading
         self._sync_lock = threading.Lock()
 
     @property
     def active_model(self) -> str | None:
         return self.config.coder_model
 
-    def chat(self, model: str, prompt: str, system: str = "", max_tokens: int | None = None) -> str:
-        """Synchronous chat method hitting local Ollama endpoint with strict options."""
+    def _resolve_model_name(self, requested: str) -> str:
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                res = client.get(self.tags_url)
+                if res.status_code == 200:
+                    installed = [m.get("name", "") for m in res.json().get("models", [])]
+                    for m in installed:
+                        if m == requested or m.startswith(f"{requested}:"):
+                            return m
+                    req_lower = requested.lower()
+                    for m in installed:
+                        m_lower = m.lower()
+                        if "deepseek" in req_lower and "1.5b" in req_lower and "deepseek" in m_lower and "1.5b" in m_lower:
+                            return m
+                        if "coder" in req_lower and "coder" in m_lower:
+                            return m
+        except Exception:
+            pass
+        return requested
+
+    def chat_response(
+        self,
+        model: str,
+        prompt: str,
+        system: str = "",
+        max_tokens: int | None = None,
+        temperature: float = TEMPERATURE_CODE,
+        seed: int = DEFAULT_SEED,
+    ) -> LLMResponse:
+        """Synchronous generation with think-stripping and truncation guard.
+
+        A response cut off at the ``num_predict`` ceiling is retried ONCE with a
+        doubled budget (bounded by remaining context); a response cut off by the
+        context window itself raises :class:`OllamaTruncatedError` so the caller
+        can retry with a smaller prompt instead of judging a partial answer.
+        """
         with self._sync_lock:
-            resolved = model
-            try:
-                with httpx.Client(timeout=5.0) as client:
-                    res = client.get(self.tags_url)
-                    if res.status_code == 200:
-                        installed = [m.get("name", "") for m in res.json().get("models", [])]
-                        for m in installed:
-                            if m == model or m.startswith(f"{model}:"):
-                                resolved = m
-                                break
-                            if "deepseek" in model.lower() and "1.5b" in model.lower() and "deepseek" in m.lower() and "1.5b" in m.lower():
-                                resolved = m
-                                break
-                            if "coder" in model.lower() and "coder" in m.lower():
-                                resolved = m
-                                break
-            except Exception:
-                pass
+            resolved = self._resolve_model_name(model)
+            num_predict = max_tokens if max_tokens else _default_num_predict(resolved)
 
-            payload: dict[str, Any] = {
-                "model": resolved,
-                "prompt": prompt,
-                "system": system,
-                "stream": False,
-                "keep_alive": "10m",
-                "options": {
-                    "num_ctx": self.config.max_context_tokens,
-                    "flash_attention": True,
-                    "keep_alive": "10m",
-                },
-            }
-            if max_tokens:
-                payload["options"]["num_predict"] = max_tokens
+            for attempt in range(2):
+                payload: dict[str, Any] = {
+                    "model": resolved,
+                    "prompt": prompt,
+                    "system": system,
+                    "stream": False,
+                    "keep_alive": self.config.keep_alive,
+                    "options": {
+                        "num_ctx": self.config.max_context_tokens,
+                        "num_predict": num_predict,
+                        "temperature": temperature,
+                        "seed": seed,
+                    },
+                }
+                with httpx.Client(timeout=600.0) as client:
+                    resp = client.post(self.generate_url, json=payload)
+                    if resp.status_code != 200:
+                        raise OllamaError(
+                            f"Ollama generation failed ({resp.status_code}): {resp.text}"
+                        )
+                    data = resp.json()
 
-            with httpx.Client(timeout=600.0) as client:
-                resp = client.post(self.generate_url, json=payload)
-                if resp.status_code != 200:
-                    raise OllamaError(f"Ollama generation failed ({resp.status_code}): {resp.text}")
-                return resp.json().get("response", "")
+                raw_text = data.get("response", "")
+                done_reason = data.get("done_reason") or "stop"
+                prompt_tokens = int(data.get("prompt_eval_count", 0) or 0)
+                output_tokens = int(data.get("eval_count", 0) or 0)
+                seconds = round(float(data.get("total_duration", 0) or 0) / 1e9, 3)
+
+                if done_reason == "length":
+                    ctx_headroom = self.config.max_context_tokens - prompt_tokens
+                    bigger = min(num_predict * 2, MAX_NUM_PREDICT, max(ctx_headroom, 0))
+                    if output_tokens >= num_predict and bigger > num_predict and attempt == 0:
+                        logger.warning(
+                            f"Response from {resolved} hit num_predict={num_predict}; "
+                            f"retrying once with num_predict={bigger}"
+                        )
+                        num_predict = bigger
+                        continue
+                    raise OllamaTruncatedError(
+                        f"response from {resolved} was cut off at the context window "
+                        f"(prompt={prompt_tokens} tok, output={output_tokens} tok, "
+                        f"num_ctx={self.config.max_context_tokens}); retry with a smaller prompt"
+                    )
+
+                reasoning, answer = strip_think_blocks(raw_text)
+                return LLMResponse(
+                    text=answer,
+                    reasoning=reasoning,
+                    model=resolved,
+                    done_reason=done_reason,
+                    prompt_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                    seconds=seconds,
+                )
+
+        raise OllamaTruncatedError(  # unreachable, but keeps type-checkers honest
+            f"response from {resolved} was cut off repeatedly"
+        )
+
+    def chat(
+        self,
+        model: str,
+        prompt: str,
+        system: str = "",
+        max_tokens: int | None = None,
+        temperature: float = TEMPERATURE_CODE,
+    ) -> str:
+        """Compatibility wrapper: return only the think-stripped answer text."""
+        return self.chat_response(
+            model, prompt, system=system, max_tokens=max_tokens, temperature=temperature
+        ).text

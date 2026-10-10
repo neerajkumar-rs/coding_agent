@@ -28,7 +28,14 @@ from agent_config import (
     parse_and_recalculate,
     save_agent_config,
 )
-from ollama_client import OllamaError, OllamaSupervisorClient
+from ollama_client import (
+    TEMPERATURE_CODE,
+    TEMPERATURE_PLAN,
+    OllamaError,
+    OllamaSupervisorClient,
+    OllamaTruncatedError,
+    strip_think_blocks,
+)
 from sandbox import ExecutionSandbox
 from scanner import WorkspaceScanner
 from workspace_staging import WorkspaceStagingManager
@@ -122,13 +129,12 @@ class DeployRequest(BaseModel):
 # -----------------------------------------------------------------------------
 
 def extract_think_and_content(raw_text: str) -> tuple[str, str]:
-    """Separate <think>...</think> chain-of-thought blocks from final payload."""
-    think_match = re.search(r"<think>(.*?)</think>", raw_text, re.DOTALL | re.IGNORECASE)
-    if think_match:
-        reasoning = think_match.group(1).strip()
-        content = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL | re.IGNORECASE).strip()
-        return reasoning, content
-    return "", raw_text.strip()
+    """Separate <think>...</think> chain-of-thought blocks from final payload.
+
+    Delegates to the LLM layer's stripper, which also handles unterminated
+    trailing <think> blocks. Returns (reasoning, answer).
+    """
+    return strip_think_blocks(raw_text)
 
 
 def parse_tasks_json(raw_text: str) -> list[dict[str, Any]]:
@@ -275,7 +281,11 @@ async def agent_plan(payload: PlanRequest) -> PlanResponse:
             system_prompt=system_prompt,
             model_name=state.config.planner_model,
             config=state.config,
+            temperature=TEMPERATURE_PLAN,
         )
+    except OllamaTruncatedError as exc:
+        logger.error(f"Planning generation truncated: {exc}")
+        raise HTTPException(status_code=502, detail=f"Planner response truncated (retryable): {exc}")
     except Exception as exc:
         logger.error(f"Planning generation failed: {exc}")
         raise HTTPException(status_code=502, detail=f"Planner model failed: {exc}")
@@ -381,14 +391,22 @@ async def agent_step(payload: StepRequest) -> dict[str, Any]:
             system_prompt=system_prompt,
             model_name=state.config.coder_model,
             config=state.config,
+            temperature=TEMPERATURE_CODE,
         ):
             generated_chunks.append(chunk)
+    except OllamaTruncatedError as exc:
+        logger.error(f"Coder generation truncated: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Coder response truncated (retryable, use a smaller scope): {exc}",
+        )
     except Exception as exc:
         logger.error(f"Coder generation failed: {exc}")
         raise HTTPException(status_code=502, detail=f"Coder model failed: {exc}")
 
     raw_code = "".join(generated_chunks)
-    extracted_code = extract_code_block(raw_code, target_file)
+    _, clean_code = strip_think_blocks(raw_code)
+    extracted_code = extract_code_block(clean_code, target_file)
 
     # Deferred Staging: write exclusively into .agent_staging/
     staged_path = state.staging.stage_file(target_file, extracted_code)

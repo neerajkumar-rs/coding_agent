@@ -1,26 +1,45 @@
-"""Four-role, retry-bounded vibe-coding pipeline."""
+"""Retry-bounded agentic coding pipeline (Thinker -> Coder -> Validator).
+
+Phase 1 hardening:
+- No Writer/Fetcher theatre: the pipeline never creates tasks.md, summary.txt
+  or taskN_code.txt inside the workspace. Run metadata lives in
+  ``.agent_runs/<run_id>/{state.json,events.jsonl,tasks.md}`` (git-ignored).
+- No silent scaffolding: if the coder returns nothing usable the attempt FAILS
+  with a clear reason (``_fallback_files``/``_scaffold`` are gone).
+- Run budgets: max wall time, max total LLM calls, max attempts per task (2),
+  and a no-progress rule (two consecutive attempts with the same diagnostic
+  hash -> the task is stopped and marked ``needs_human``).
+"""
 
 from __future__ import annotations
 
-import os
+import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
+from uuid import uuid4
 
-from ollama_client import OllamaEngine
-
+from ollama_client import (
+    TEMPERATURE_CODE,
+    TEMPERATURE_PLAN,
+    OllamaEngine,
+    OllamaTruncatedError,
+)
 
 # Native local Ollama models supporting strict VRAM limits (RTX 3050 4GB ceiling)
 THINKER_MODEL = "deepseek-r1:1.5b"
 DEBUGGER_MODEL = THINKER_MODEL
 CODER_MODEL = "qwen2.5-coder:3b"
 MAX_RETRIES = 3
+MAX_ATTEMPTS_PER_TASK = 2
 MAX_SPEC_WORDS = 300
-MAX_INPUT_CHARS = 120_000
 THINKER_INPUT_CHARS = 16_000
 CODER_SPEC_CHARS = 8_000
 MAX_LOG_CHARS = 8_000
@@ -30,15 +49,29 @@ WORKSPACE_FILE_SUFFIXES = ALLOWED_TARGET_SUFFIXES | {".json", ".md", ".txt"}
 MAX_WORKSPACE_FILES = 60
 MAX_WORKSPACE_CONTEXT_CHARS = 12_000
 MAX_FILE_SNIPPET_CHARS = 3_000
-TASK_PLAN_FILENAME = "tasks.md"
-SUMMARY_FILENAME = "summary.txt"
 MAX_TASKS = 12
+RUNS_DIR_NAME = ".agent_runs"
 VALIDATION_TIMEOUT_SECONDS = int(os.getenv("VIBE_VALIDATION_TIMEOUT_SECONDS", "300"))
+
+DEFAULT_MAX_WALL_SECONDS = float(os.getenv("VIBE_MAX_WALL_SECONDS", "900"))
+DEFAULT_MAX_LLM_CALLS = int(os.getenv("VIBE_MAX_LLM_CALLS", "40"))
+
+
+class BudgetExhausted(RuntimeError):
+    """Raised when a run budget (wall time / LLM calls) is exceeded."""
+
+
+@dataclass
+class RunBudgets:
+    max_wall_seconds: float = DEFAULT_MAX_WALL_SECONDS
+    max_llm_calls: int = DEFAULT_MAX_LLM_CALLS
+    max_attempts_per_task: int = MAX_ATTEMPTS_PER_TASK
 
 
 @dataclass
 class RunResult:
     status: str
+    run_id: str = ""
     target_file: str = ""
     files: list[str] = field(default_factory=list)
     specification: str = ""
@@ -48,6 +81,43 @@ class RunResult:
     stderr: str = ""
     llm_validation: str = ""
     errors: list[str] = field(default_factory=list)
+    needs_human: list[str] = field(default_factory=list)
+    llm_calls: int = 0
+    elapsed_seconds: float = 0.0
+
+
+class _RunJournal:
+    """Persists run metadata under .agent_runs/<run_id>/ (never in workspace root)."""
+
+    def __init__(self, workspace: Path, run_id: str | None = None) -> None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.run_id = run_id or f"{stamp}-{uuid4().hex[:6]}"
+        self.run_dir = workspace / RUNS_DIR_NAME / self.run_id
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.state_path = self.run_dir / "state.json"
+        self.events_path = self.run_dir / "events.jsonl"
+        self.tasks_path = self.run_dir / "tasks.md"
+
+    def write_task_plan(self, tasks: list[dict[str, str]]) -> None:
+        lines = ["# Agent run task plan", "", "Tasks are processed sequentially.", ""]
+        for task in tasks:
+            lines.extend(
+                [
+                    f"## TASK {task['number']}: {task['name']} [{task['status']}]",
+                    task["spec"][:CODER_SPEC_CHARS],
+                    "",
+                ]
+            )
+        self.tasks_path.write_text("\n".join(lines), encoding="utf-8")
+
+    def save_state(self, state: dict[str, Any]) -> None:
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    def emit_event(self, event: dict[str, Any]) -> None:
+        record = {"ts": datetime.now(timezone.utc).isoformat(), **event}
+        with open(self.events_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 class VibeOrchestrator:
@@ -55,11 +125,40 @@ class VibeOrchestrator:
         self,
         engine: OllamaEngine | None = None,
         workspace: Path | str = ".",
-        max_retries: int = MAX_RETRIES,
+        max_retries: int = MAX_ATTEMPTS_PER_TASK,
+        budgets: RunBudgets | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.engine = engine or OllamaEngine(workspace_root=self.workspace)
-        self.max_retries = max(1, min(max_retries, MAX_RETRIES))
+        if budgets is None:
+            budgets = RunBudgets(max_attempts_per_task=max_retries)
+        budgets.max_attempts_per_task = max(1, min(budgets.max_attempts_per_task, MAX_RETRIES))
+        self.budgets = budgets
+        self._llm_calls = 0
+        self._start = 0.0
+
+    # ------------------------------------------------------------------
+    # Budget-guarded LLM access
+    # ------------------------------------------------------------------
+
+    def _chat(self, model: str, prompt: str, *, max_tokens: int, temperature: float) -> str:
+        if self._llm_calls >= self.budgets.max_llm_calls:
+            raise BudgetExhausted(
+                f"max total LLM calls exceeded ({self.budgets.max_llm_calls})"
+            )
+        self._llm_calls += 1
+        return self.engine.chat(model, prompt, max_tokens=max_tokens, temperature=temperature)
+
+    def _check_wall_time(self) -> None:
+        elapsed = time.monotonic() - self._start
+        if elapsed > self.budgets.max_wall_seconds:
+            raise BudgetExhausted(
+                f"max wall time exceeded ({self.budgets.max_wall_seconds:.0f}s)"
+            )
+
+    # ------------------------------------------------------------------
+    # Main pipeline
+    # ------------------------------------------------------------------
 
     def run(
         self,
@@ -77,100 +176,214 @@ class VibeOrchestrator:
             raise ValueError("request must not be empty")
         report("preparing workspace and safety checks")
         self._set_workspace(workspace_dir)
-        report("tool • workspace.list_files: scanning the selected workspace")
-        workspace_context = self._workspace_context(user_request, report)
-        report("tool • workspace.list_files: scan complete")
-        report("stage 1/4 • thinker: breaking request into sequential tasks")
-        plan = self._think(user_request[:THINKER_INPUT_CHARS], workspace_context)
-        tasks = self._parse_tasks(plan)
-        plan_path = self.workspace / TASK_PLAN_FILENAME
-        self._write_task_plan(plan_path, tasks)
-        report(f"tool • filesystem.write_file: {plan_path} ({len(tasks)} tasks)")
-        result = RunResult("running", specification=plan)
-        all_files: list[str] = []
+        self._llm_calls = 0
+        self._start = time.monotonic()
+        journal = _RunJournal(self.workspace)
+        result = RunResult("running", run_id=journal.run_id)
+        journal.emit_event({"event": "run_started", "run_id": journal.run_id, "request": user_request[:500]})
+        journal.save_state({"run_id": journal.run_id, "status": "running", "request": user_request})
 
-        for task_number, task in enumerate(tasks, 1):
-            task_spec = task["spec"]
-            task_name = task["name"]
-            report(f"task {task_number}/{len(tasks)} • {task_name}")
-            task_passed = False
-            for attempt in range(1, self.max_retries + 1):
-                result.attempts += 1
-                report(
-                    f"task {task_number} • stage 2/4 coder • attempt {attempt}"
+        try:
+            report("tool • workspace.list_files: scanning the selected workspace")
+            workspace_context = self._workspace_context(user_request, report)
+            report("stage 1/3 • thinker: breaking request into sequential tasks")
+            plan = self._think(user_request[:THINKER_INPUT_CHARS], workspace_context)
+            tasks = self._parse_tasks(plan)
+            journal.write_task_plan(tasks)
+            journal.emit_event({"event": "plan_ready", "tasks": len(tasks)})
+            result.specification = plan
+
+            for task_number, task in enumerate(tasks, 1):
+                self._check_wall_time()
+                report(f"task {task_number}/{len(tasks)} • {task['name']}")
+                journal.emit_event(
+                    {"event": "task_started", "task": task_number, "name": task["name"]}
                 )
-                files = self._code(task_spec)
+                outcome = self._run_task(
+                    task_number, task, test_command, journal, report, result
+                )
+                journal.write_task_plan(tasks)
+                journal.save_state(
+                    {
+                        "run_id": journal.run_id,
+                        "status": result.status if outcome != "complete" else "running",
+                        "tasks": tasks,
+                        "llm_calls": self._llm_calls,
+                    }
+                )
+                if outcome == "complete":
+                    report(f"task {task_number} complete • moving to next task")
+                    continue
+                if outcome == "needs_human":
+                    result.status = "needs_human"
+                    journal.emit_event(
+                        {"event": "task_needs_human", "task": task_number, "name": task["name"]}
+                    )
+                    return self._finalize(result, journal)
+                result.status = "failed"
+                return self._finalize(result, journal)
+
+            result.status = "completed"
+            report("all tasks complete • validated code is ready")
+        except BudgetExhausted as exc:
+            result.status = "budget_exhausted"
+            result.errors.append(str(exc))
+            journal.emit_event({"event": "budget_exhausted", "reason": str(exc)})
+            report(f"run stopped: {exc}")
+        return self._finalize(result, journal)
+
+    def _finalize(self, result: RunResult, journal: _RunJournal) -> RunResult:
+        result.llm_calls = self._llm_calls
+        result.elapsed_seconds = round(time.monotonic() - self._start, 3)
+        journal.save_state(
+            {
+                "run_id": journal.run_id,
+                "status": result.status,
+                "attempts": result.attempts,
+                "llm_calls": result.llm_calls,
+                "elapsed_seconds": result.elapsed_seconds,
+                "files": result.files,
+                "needs_human": result.needs_human,
+                "errors": result.errors,
+            }
+        )
+        journal.emit_event(
+            {
+                "event": "run_finished",
+                "run_id": journal.run_id,
+                "status": result.status,
+                "llm_calls": result.llm_calls,
+                "seconds": result.elapsed_seconds,
+            }
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # One task: coder -> validate (deterministic) -> LLM judge, bounded
+    # ------------------------------------------------------------------
+
+    def _run_task(
+        self,
+        task_number: int,
+        task: dict[str, str],
+        test_command: list[str] | None,
+        journal: _RunJournal,
+        report: Callable[[str], None],
+        result: RunResult,
+    ) -> str:
+        task_spec = task["spec"]
+        previous_diag_hash: str | None = None
+
+        for attempt in range(1, self.budgets.max_attempts_per_task + 1):
+            self._check_wall_time()
+            result.attempts += 1
+            report(f"task {task_number} • coder • attempt {attempt}")
+            journal.emit_event(
+                {"event": "attempt_started", "task": task_number, "attempt": attempt}
+            )
+
+            # --- Coder (truncation is retryable with a smaller budget, never a FAIL;
+            #     unusable output FAILS the attempt with a clear reason — no scaffolds)
+            files: dict[str, str] | None = None
+            coder_error: str | None = None
+            spec_chars = CODER_SPEC_CHARS
+            for _trunc_retry in range(2):
+                try:
+                    files = self._code(task_spec[:spec_chars])
+                    coder_error = None
+                    break
+                except OllamaTruncatedError as exc:
+                    report(f"task {task_number} • {exc}; retrying with reduced spec")
+                    journal.emit_event(
+                        {
+                            "event": "response_truncated",
+                            "task": task_number,
+                            "attempt": attempt,
+                            "action": "retry_with_reduced_spec",
+                        }
+                    )
+                    spec_chars = max(spec_chars // 2, 1_000)
+                except ValueError as exc:
+                    coder_error = str(exc)
+                    break
+
+            if files is None:
+                diagnostics = coder_error or (
+                    "coder response truncated even after reducing the spec budget"
+                )
+                local_passed, llm_passed = False, False
+                stdout, stderr = "", diagnostics
+            else:
                 total_size = sum(len(content) for content in files.values())
                 if total_size > MAX_GENERATED_CODE_CHARS:
                     raise ValueError("generated task output exceeds the configured safety limit")
-                report(f"task {task_number} • stage 3/4 writer • writing generated files")
-                artifact_name, artifact_path = self._write_task_outputs(
-                    task_number, task_name, files, report
-                )
-                report(f"task {task_number} • fetcher: retrieving {artifact_path}")
-                fetched_artifact = self._fetch_file(artifact_path)
-                report(f"task {task_number} • stage 4/4 validator: reading task files and summary")
-                task_files = self._read_generated_files(files, report)
-                summary = self._read_summary(report)
-                empty_files = [
-                    name for name, content in task_files.items() if not content.strip()
-                ]
-                summary_valid = self._summary_has_files(summary, files)
-                if empty_files:
-                    local_passed = False
-                    stdout = ""
-                    stderr = "FILE EMPTY: " + ", ".join(empty_files)
-                    llm_passed = False
-                    llm_feedback = "FAIL\nExplicit file empty signal: " + ", ".join(empty_files)
-                elif not summary_valid:
-                    local_passed = False
-                    stdout = ""
-                    stderr = f"{SUMMARY_FILENAME} does not list every generated file"
-                    llm_passed = False
-                    llm_feedback = "FAIL\nWriter summary does not match generated files."
-                else:
-                    local_passed, stdout, stderr = self._validate(
-                        task_files, test_command
-                    )
-                    validation_files = dict(task_files)
-                    validation_files[artifact_name] = fetched_artifact
-                    validation_files[SUMMARY_FILENAME] = summary
-                    llm_passed, llm_feedback = self._llm_validate(
-                        task_spec, validation_files
-                    )
-                result.llm_validation = llm_feedback
-                result.files = list(
-                    dict.fromkeys(all_files + list(files) + [artifact_name, SUMMARY_FILENAME])
-                )
-                result.code = "\n\n".join(task_files.values())
-                result.stdout, result.stderr = stdout, stderr
-                if local_passed and llm_passed:
-                    task_passed = True
-                    all_files.extend(list(files) + [artifact_name, SUMMARY_FILENAME])
-                    task["status"] = "complete"
-                    self._write_task_plan(plan_path, tasks)
-                    report(f"task {task_number} complete • moving to next task")
-                    break
-                diagnostics = (
-                    stdout + "\n" + stderr + "\nLLM VALIDATION:\n" + llm_feedback
-                ).strip()[-MAX_LOG_CHARS:]
-                result.errors.append(f"Task {task_number}: {diagnostics}")
-                task["status"] = "failed"
-                self._write_task_plan(plan_path, tasks)
-                if attempt < self.max_retries:
-                    report(f"task {task_number} failed • thinker is refining this task")
-                    task_spec = self._debug(task_spec, diagnostics)
-                    task["spec"] = task_spec
-                    self._write_task_plan(plan_path, tasks)
-            if not task_passed:
-                result.status = "failed"
-                result.specification = "\n\n".join(t["spec"] for t in tasks)
-                return result
 
-        result.specification = "\n\n".join(t["spec"] for t in tasks)
-        result.status = "completed"
-        report("all tasks complete • validated code is ready")
-        return result
+                for relative_name, content in files.items():
+                    target = self._safe_target(relative_name)
+                    report(f"tool • filesystem.write_file: {target}")
+                    self._write_file(target, content)
+                result.files = list(dict.fromkeys(result.files + list(files)))
+                result.code = "\n\n".join(files.values())
+
+                empty_files = [name for name, content in files.items() if not content.strip()]
+                if empty_files:
+                    local_passed, llm_passed = False, False
+                    stdout, stderr = "", "FILE EMPTY: " + ", ".join(empty_files)
+                    llm_feedback = ""
+                else:
+                    local_passed, stdout, stderr = self._validate(files, test_command)
+                    if local_passed:
+                        report(f"task {task_number} • validator: LLM review")
+                        llm_passed, llm_feedback = self._llm_validate(task_spec, files)
+                        result.llm_validation = llm_feedback
+                    else:
+                        llm_passed, llm_feedback = False, ""
+                result.stdout, result.stderr = stdout, stderr
+                diagnostics = (
+                    stdout + "\n" + stderr + ("\nLLM VALIDATION:\n" + llm_feedback if llm_feedback else "")
+                ).strip()[-MAX_LOG_CHARS:]
+
+                if local_passed and llm_passed:
+                    task["status"] = "complete"
+                    journal.emit_event(
+                        {"event": "task_complete", "task": task_number, "attempt": attempt}
+                    )
+                    return "complete"
+
+            # --- Attempt failed: no-progress detection + debugger refinement
+            result.errors.append(f"Task {task_number} attempt {attempt}: {diagnostics[:500]}")
+            task["status"] = "failed"
+            journal.emit_event(
+                {
+                    "event": "attempt_failed",
+                    "task": task_number,
+                    "attempt": attempt,
+                    "diagnostics": diagnostics[:1_000],
+                }
+            )
+            diag_hash = hashlib.sha256(
+                " ".join(diagnostics.split()).encode("utf-8")
+            ).hexdigest()
+            if previous_diag_hash is not None and diag_hash == previous_diag_hash:
+                report(f"task {task_number} • no progress between attempts; needs human")
+                journal.emit_event(
+                    {"event": "no_progress", "task": task_number, "diagnostic_hash": diag_hash}
+                )
+                task["status"] = "needs_human"
+                result.needs_human.append(task["name"])
+                return "needs_human"
+            previous_diag_hash = diag_hash
+
+            if attempt < self.budgets.max_attempts_per_task:
+                report(f"task {task_number} failed • thinker is refining this task")
+                task_spec = self._debug(task_spec, diagnostics)
+                task["spec"] = task_spec
+
+        return "failed"
+
+    # ------------------------------------------------------------------
+    # Roles (thinker / coder / debugger / validator)
+    # ------------------------------------------------------------------
 
     def _think(self, request_text: str, workspace_context: str) -> str:
         prompt = (
@@ -184,7 +397,9 @@ class VibeOrchestrator:
             f"WORKSPACE:\n{self.workspace}\n\nEXISTING FILE CONTEXT:\n"
             f"{workspace_context}\n\nREQUEST:\n{request_text}"
         )
-        spec = self.engine.chat(THINKER_MODEL, prompt, max_tokens=900)
+        spec = self._chat(
+            THINKER_MODEL, prompt, max_tokens=900, temperature=TEMPERATURE_PLAN
+        )
         return spec[:CODER_SPEC_CHARS]
 
     def _parse_tasks(self, plan: str) -> list[dict[str, str]]:
@@ -202,92 +417,105 @@ class VibeOrchestrator:
             return tasks
         return [{"number": "1", "name": "primary implementation", "spec": plan, "status": "pending"}]
 
-    def _write_task_plan(self, path: Path, tasks: list[dict[str, str]]) -> None:
-        lines = ["# Vibe coding task plan", "", "Tasks are processed sequentially.", ""]
-        for task in tasks:
-            lines.extend(
-                [
-                    f"## TASK {task['number']}: {task['name']} [{task['status']}]",
-                    task["spec"][:CODER_SPEC_CHARS],
-                    "",
-                ]
+    def _code(self, specification: str) -> dict[str, str]:
+        prompt = (
+            "You are a pure code generator. Use ONLY this specification. Return "
+            "one JSON object with this shape: {\"filename\": \"relative/path.ext\", "
+            "\"description\": \"brief purpose\", \"code\": \"complete file contents\"}. "
+            "If multiple files are required, return {\"files\": [objects with those "
+            "three fields]}. Return JSON only, use relative paths, and do not invent "
+            "requirements.\n\nSPECIFICATION:\n"
+            + specification
+        )
+        response = self._chat(
+            CODER_MODEL, prompt, max_tokens=1800, temperature=TEMPERATURE_CODE
+        )
+        try:
+            parsed = json.loads(response.strip().strip("`"))
+            objects = (
+                parsed.get("files", [])
+                if isinstance(parsed, dict) and "files" in parsed
+                else [parsed]
             )
-        self._write_file(path, "\n".join(lines))
-
-    def _read_generated_files(
-        self, files: dict[str, str], report: Callable[[str], None]
-    ) -> dict[str, str]:
-        result: dict[str, str] = {}
-        for name in files:
-            path = self._safe_target(name)
-            report(f"tool • filesystem.read_file: {path}")
-            result[name] = path.read_text(encoding="utf-8", errors="replace")[:12000]
-        return result
-
-    def _write_task_outputs(
-        self,
-        task_number: int,
-        task_name: str,
-        files: dict[str, str],
-        report: Callable[[str], None],
-    ) -> tuple[str, Path]:
-        """Writer role: persist Coder output and append a machine-readable summary."""
-        for relative_name, content in files.items():
-            target = self._safe_target(relative_name)
-            report(f"tool • filesystem.write_file: {target}")
-            self._write_file(target, content)
-
-        artifact_name = f"task{task_number}_code.txt"
-        artifact_path = self.workspace / artifact_name
-        report(f"tool • filesystem.write_file: {artifact_path}")
-        self._write_file(artifact_path, self._task_artifact(task_number, task_name, files))
-
-        summary_path = self.workspace / SUMMARY_FILENAME
-        entries: list[dict[str, object]] = []
-        if summary_path.exists():
-            try:
-                existing = summary_path.read_text(encoding="utf-8")
-                entries = [json.loads(line) for line in existing.splitlines() if line.strip()]
-            except (OSError, json.JSONDecodeError) as exc:
-                raise ValueError(f"cannot read existing {SUMMARY_FILENAME}: {exc}") from exc
-        entries.append(
-            {
-                "task": task_number,
-                "summary": f"Generated files: {', '.join(files)}",
-            }
-        )
-        report(f"tool • filesystem.write_file: {summary_path}")
-        self._write_file(
-            summary_path,
-            "\n".join(json.dumps(entry, sort_keys=True) for entry in entries) + "\n",
-        )
-        return artifact_name, artifact_path
-
-    def _read_summary(self, report: Callable[[str], None]) -> str:
-        summary_path = self.workspace / SUMMARY_FILENAME
-        report(f"tool • filesystem.read_file: {summary_path}")
-        try:
-            lines = [
-                json.loads(line)
-                for line in summary_path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"invalid {SUMMARY_FILENAME}: {exc}") from exc
-        if not lines:
-            raise ValueError(f"{SUMMARY_FILENAME} is empty")
-        return "\n".join(json.dumps(line, sort_keys=True) for line in lines)
-
-    def _summary_has_files(self, summary: str, files: dict[str, str]) -> bool:
-        """Ensure Validator is checking the same files that Writer reported."""
-        try:
-            entries = [json.loads(line) for line in summary.splitlines() if line.strip()]
+            if objects and all(isinstance(item, dict) for item in objects):
+                json_files: dict[str, str] = {}
+                for item in objects:
+                    name = str(item.get("filename", "")).replace("\\", "/").strip()
+                    content = item.get("code")
+                    if not name or not isinstance(content, str):
+                        raise ValueError("Coder JSON objects require filename and code")
+                    if name in json_files or name.startswith("/") or ".." in name.split("/"):
+                        raise ValueError(f"unsafe or duplicate generated file path: {name}")
+                    if Path(name).suffix.lower() not in ALLOWED_TARGET_SUFFIXES:
+                        raise ValueError(f"unsupported generated file type: {name}")
+                    json_files[name] = content if content.endswith("\n") else content + "\n"
+                if json_files:
+                    return json_files
         except json.JSONDecodeError:
-            return False
-        if not entries or not isinstance(entries[-1], dict):
-            return False
-        latest_summary = str(entries[-1].get("summary", ""))
-        return all(name in latest_summary for name in files)
+            pass
+        matches = re.findall(
+            r"```FILE:\s*([^\r\n`]+?)(?:```|\r?\n)(.*?)(?:```|$)",
+            response,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if not matches:
+            raise ValueError(
+                "coder returned no usable files (no JSON object or ```FILE: blocks found); "
+                f"response excerpt: {response[:200]!r}"
+            )
+        files: dict[str, str] = {}
+        for name, content in matches:
+            # Some models accidentally attach the closing fence to the
+            # filename (`FILE:pages/index.html```). Never treat fence markup
+            # as part of the path.
+            safe_name = name.split("```", 1)[0].strip().strip("`").replace("\\", "/")
+            safe_name = re.sub(r"^FILE:\s*", "", safe_name, flags=re.IGNORECASE)
+            safe_name = safe_name.rstrip("`").strip()
+            if safe_name in files or safe_name.startswith("/") or ".." in safe_name.split("/"):
+                raise ValueError(f"unsafe or duplicate generated file path: {name}")
+            if Path(safe_name).suffix.lower() not in ALLOWED_TARGET_SUFFIXES:
+                raise ValueError(f"unsupported generated file type: {name}")
+            if not content.strip():
+                raise ValueError(f"coder produced an empty file: {safe_name}")
+            files[safe_name] = content.strip() + "\n"
+        return files
+
+    def _debug(self, specification: str, diagnostics: str) -> str:
+        prompt = (
+            "You are a debugging context parser. Update the Markdown specification "
+            "under 300 words using ONLY the existing specification and test logs. "
+            "Keep signatures and logic rules; state the minimal correction. No code.\n\n"
+            f"SPECIFICATION:\n{specification}\n\nTEST LOG:\n{diagnostics}"
+        )
+        return " ".join(
+            self._chat(DEBUGGER_MODEL, prompt, max_tokens=900, temperature=TEMPERATURE_PLAN).split()[
+                :MAX_SPEC_WORDS
+            ]
+        )
+
+    def _llm_validate(
+        self, specification: str, files: dict[str, str]
+    ) -> tuple[bool, str]:
+        bundled_files = "\n\n".join(
+            f"FILE: {name}\n{content[:12000]}" for name, content in files.items()
+        )[:24000]
+        prompt = (
+            "You are the validation agent. Compare the generated files against "
+            "the specification. Check required behavior, syntax-level problems, "
+            "file references, and obvious runtime defects. Do not rewrite code. "
+            "Respond exactly with PASS or FAIL on the first line, followed by a "
+            "short reason. Choose FAIL for any required behavior that is missing.\n\n"
+            f"SPECIFICATION:\n{specification}\n\nGENERATED FILES:\n{bundled_files}"
+        )
+        feedback = self._chat(
+            DEBUGGER_MODEL, prompt, max_tokens=700, temperature=TEMPERATURE_PLAN
+        )
+        first_line = feedback.splitlines()[0].strip().upper() if feedback else ""
+        return first_line == "PASS", feedback[-MAX_LOG_CHARS:]
+
+    # ------------------------------------------------------------------
+    # Workspace helpers
+    # ------------------------------------------------------------------
 
     def _workspace_context(
         self, request_text: str, report: Callable[[str], None]
@@ -340,134 +568,6 @@ class VibeOrchestrator:
     def _write_file(self, target: Path, content: str) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-
-    def _fetch_file(self, path: Path) -> str:
-        return path.read_text(encoding="utf-8", errors="replace")[:MAX_GENERATED_CODE_CHARS]
-
-    def _task_artifact(
-        self, task_number: int, task_name: str, files: dict[str, str]
-    ) -> str:
-        sections = [
-            f"# Task {task_number}: {task_name}",
-            "",
-            "Generated files for Writer output. Fetcher retrieved this file for validation.",
-            "",
-        ]
-        for name, content in files.items():
-            sections.extend([f"## FILE: {name}", "```", content, "```", ""])
-        return "\n".join(sections)
-
-    def _code(self, specification: str) -> dict[str, str]:
-        prompt = (
-            "You are a pure code generator. Use ONLY this specification. Return "
-            "one JSON object with this shape: {\"filename\": \"relative/path.ext\", "
-            "\"description\": \"brief purpose\", \"code\": \"complete file contents\"}. "
-            "If multiple files are required, return {\"files\": [objects with those "
-            "three fields]}. Return JSON only, use relative paths, and do not invent "
-            "requirements.\n\nSPECIFICATION:\n"
-            + specification[:CODER_SPEC_CHARS]
-        )
-        response = self.engine.chat(CODER_MODEL, prompt, max_tokens=1800)
-        try:
-            parsed = json.loads(response.strip().strip("`"))
-            objects = (
-                parsed.get("files", [])
-                if isinstance(parsed, dict) and "files" in parsed
-                else [parsed]
-            )
-            if objects and all(isinstance(item, dict) for item in objects):
-                json_files: dict[str, str] = {}
-                for item in objects:
-                    name = str(item.get("filename", "")).replace("\\", "/").strip()
-                    content = item.get("code")
-                    if not name or not isinstance(content, str):
-                        raise ValueError("Coder JSON objects require filename and code")
-                    if name in json_files or name.startswith("/") or ".." in name.split("/"):
-                        raise ValueError(f"unsafe or duplicate generated file path: {name}")
-                    if Path(name).suffix.lower() not in ALLOWED_TARGET_SUFFIXES:
-                        raise ValueError(f"unsupported generated file type: {name}")
-                    json_files[name] = content if content.endswith("\n") else content + "\n"
-                if json_files:
-                    return json_files
-        except json.JSONDecodeError:
-            pass
-        matches = re.findall(
-            r"```FILE:\s*([^\r\n`]+?)(?:```|\r?\n)(.*?)(?:```|$)",
-            response,
-            re.DOTALL | re.IGNORECASE,
-        )
-        if not matches:
-            return self._fallback_files(specification)
-        files: dict[str, str] = {}
-        for name, content in matches:
-            # Some models accidentally attach the closing fence to the
-            # filename (`FILE:pages/index.html```). Never treat fence markup
-            # as part of the path.
-            safe_name = name.split("```", 1)[0].strip().strip("`").replace("\\", "/")
-            safe_name = re.sub(r"^FILE:\s*", "", safe_name, flags=re.IGNORECASE)
-            safe_name = safe_name.rstrip("`").strip()
-            if safe_name in files or safe_name.startswith("/") or ".." in safe_name.split("/"):
-                raise ValueError(f"unsafe or duplicate generated file path: {name}")
-            if Path(safe_name).suffix.lower() not in ALLOWED_TARGET_SUFFIXES:
-                raise ValueError(f"unsupported generated file type: {name}")
-            files[safe_name] = content.strip() + "\n" if content.strip() else self._scaffold(safe_name)
-        return files
-
-    def _fallback_files(self, specification: str) -> dict[str, str]:
-        paths = re.findall(
-            r"(?:files?|path|output)\s*:\s*([^\r\n,]+)",
-            specification,
-            re.IGNORECASE,
-        )
-        safe_paths = [path.strip().strip("`") for path in paths]
-        safe_paths = [
-            path for path in safe_paths if Path(path).suffix.lower() in ALLOWED_TARGET_SUFFIXES
-        ]
-        if not safe_paths:
-            safe_paths = ["generated.py"]
-        return {path: self._scaffold(path) for path in safe_paths[:8]}
-
-    def _scaffold(self, relative_name: str) -> str:
-        suffix = Path(relative_name).suffix.lower()
-        if suffix == ".html":
-            return (
-                "<!doctype html>\n<html lang=\"en\">\n<head>\n"
-                "  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-                "  <title>Generated page</title>\n</head>\n<body>\n"
-                "  <main><h1>Generated page</h1></main>\n</body>\n</html>\n"
-            )
-        if suffix == ".css":
-            return "/* Generated stylesheet */\n:root { color-scheme: light; }\n"
-        if suffix == ".js":
-            return "\"use strict\";\n// Generated script\n"
-        return '"""Generated module."""\n'
-
-    def _debug(self, specification: str, diagnostics: str) -> str:
-        prompt = (
-            "You are a debugging context parser. Update the Markdown specification "
-            "under 300 words using ONLY the existing specification and test logs. "
-            "Keep signatures and logic rules; state the minimal correction. No code.\n\n"
-            f"SPECIFICATION:\n{specification}\n\nTEST LOG:\n{diagnostics}"
-        )
-        return " ".join(self.engine.chat(DEBUGGER_MODEL, prompt, max_tokens=900).split()[:MAX_SPEC_WORDS])
-
-    def _llm_validate(
-        self, specification: str, files: dict[str, str]
-    ) -> tuple[bool, str]:
-        bundled_files = "\n\n".join(
-            f"FILE: {name}\n{content[:12000]}" for name, content in files.items()
-        )[:24000]
-        prompt = (
-            "You are the validation agent. Compare the generated files against "
-            "the specification. Check required behavior, syntax-level problems, "
-            "file references, and obvious runtime defects. Do not rewrite code. "
-            "Respond exactly with PASS or FAIL on the first line, followed by a "
-            "short reason. Choose FAIL for any required behavior that is missing.\n\n"
-            f"SPECIFICATION:\n{specification}\n\nGENERATED FILES:\n{bundled_files}"
-        )
-        feedback = self.engine.chat(DEBUGGER_MODEL, prompt, max_tokens=700)
-        first_line = feedback.splitlines()[0].strip().upper() if feedback else ""
-        return first_line == "PASS", feedback[-MAX_LOG_CHARS:]
 
     def _safe_target(self, target_file: str) -> Path:
         candidate = (self.workspace / target_file).resolve()
