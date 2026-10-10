@@ -31,15 +31,30 @@ class AgentConfig:
     # Sandbox allowlist: only these named command vectors may run for
     # validation. Free-form shell is never executed.
     allowed_commands: list[str] | None = None  # defaults to ["py_compile"]
+    # Role map written by /benchmark apply: {"planner": {"model": ...}, ...}
+    roles: dict[str, dict[str, Any]] | None = None
+    # Unknown keys from .agent are preserved verbatim on save (round-trip).
+    extra: dict[str, Any] | None = None
+
+    _KNOWN_KEYS = {
+        "planner_model", "coder.5b_or_3b", "coder_5b_or_3b", "coder_model",
+        "max_context_tokens", "keep_alive", "allowed_commands", "roles",
+    }
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "planner_model": self.planner_model,
-            "coder.5b_or_3b": self.coder_5b_or_3b,
-            "max_context_tokens": self.max_context_tokens,
-            "keep_alive": self.keep_alive,
-            "allowed_commands": self.allowed_commands or ["py_compile"],
-        }
+        data: dict[str, Any] = dict(self.extra or {})
+        data.update(
+            {
+                "planner_model": self.planner_model,
+                "coder.5b_or_3b": self.coder_5b_or_3b,
+                "max_context_tokens": self.max_context_tokens,
+                "keep_alive": self.keep_alive,
+                "allowed_commands": self.allowed_commands or ["py_compile"],
+            }
+        )
+        if self.roles:
+            data["roles"] = self.roles
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AgentConfig:
@@ -54,17 +69,33 @@ class AgentConfig:
         keep_alive = str(data.get("keep_alive") or DEFAULT_KEEP_ALIVE)
         raw_allowed = data.get("allowed_commands")
         allowed = [str(a) for a in raw_allowed] if isinstance(raw_allowed, list) else None
+        roles = data.get("roles") if isinstance(data.get("roles"), dict) else None
+        extra = {k: v for k, v in data.items() if k not in cls._KNOWN_KEYS}
         return cls(
             planner_model=planner,
             coder_5b_or_3b=coder,
             max_context_tokens=ctx,
             keep_alive=keep_alive,
             allowed_commands=allowed,
+            roles=roles,
+            extra=extra or None,
         )
 
     @property
     def coder_model(self) -> str:
         return self.coder_5b_or_3b
+
+    def get_role_config(self, role: str) -> dict[str, Any]:
+        """Merged settings for a role: role overrides layered on config defaults."""
+        base: dict[str, Any] = {
+            "model": self.planner_model if role in ("planner", "validator") else self.coder_model,
+            "num_ctx": self.max_context_tokens,
+            "num_predict": 2048,
+            "temperature": 0.2 if role in ("planner", "validator") else 0.1,
+            "keep_alive": self.keep_alive,
+        }
+        overrides = (self.roles or {}).get(role, {})
+        return {**base, **{k: v for k, v in overrides.items() if v is not None}}
 
 
 def detect_system_ram_gb() -> float:

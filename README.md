@@ -246,6 +246,42 @@ The workspace root itself only ever receives the **requested target files**
 
 ---
 
+## Benchmarking
+
+Compare candidate models per role (planner / coder / validator) on real probes.
+Reports land in `<workspace>\.agent_runs\bench\` (JSON + Markdown).
+
+```powershell
+# Headless from the shell (starts/reuses Ollama, NO FastAPI):
+.\env\Scripts\python.exe tui.py --benchmark --quick
+.\env\Scripts\python.exe tui.py --workspace E:\proj --benchmark --quick --coexist
+.\env\Scripts\python.exe tui.py --benchmark --compare validator=deepseek-r1:1.5b,lfm2.5-thinking --repeat 3
+
+# Or directly:
+.\env\Scripts\python.exe bench.py --workspace . --quick
+```
+
+Inside the TUI (GPU-locked against plan/step so a benchmark never overlaps
+inference on the 4 GB card):
+
+```
+/benchmark                                  all roles from .agent
+/benchmark --quick
+/benchmark --roles validator --repeat 3
+/benchmark --compare planner=deepseek-r1:1.5b,lfm2.5-thinking
+/benchmark --plan-mode two-stage
+/benchmark --coexist
+/benchmark last                             print the newest report
+/benchmark apply                            write recommended models into
+                                            .agent "roles" (asks y/N first)
+```
+
+Missing models are skipped with an `ollama pull <name>` hint. Models are
+unloaded (`keep_alive=0`) when the benchmark finishes. Ctrl-C cancels the
+benchmark and returns to the prompt without touching services.
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Purpose |

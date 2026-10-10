@@ -44,12 +44,29 @@ except ImportError as exc:
 # Config — override via environment variables
 # ---------------------------------------------------------------------------
 FASTAPI_HOST = "127.0.0.1"
-FASTAPI_PORT = int(os.getenv("VIBE_PORT", "8000"))
+FASTAPI_PORT = int(os.getenv("VIBE_PORT", "8000"))  # may fall forward 8001..8010
 FASTAPI_BASE = f"http://{FASTAPI_HOST}:{FASTAPI_PORT}"
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "127.0.0.1")
 OLLAMA_PORT = int(os.getenv("OLLAMA_PORT", "11434"))
 OLLAMA_BASE = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}"
+
+
+def _set_fastapi_port(port: int) -> None:
+    """Repoint every FastAPI URL at *port* (busy-port fallback)."""
+    global FASTAPI_PORT, FASTAPI_BASE, HEALTH_URL, PLAN_URL, STEP_URL
+    global STATUS_URL, DEPLOY_URL, INIT_URL, RUN_URL, CANCEL_URL, EVENTS_URL
+    FASTAPI_PORT = port
+    FASTAPI_BASE = f"http://{FASTAPI_HOST}:{port}"
+    HEALTH_URL = FASTAPI_BASE + "/health"
+    PLAN_URL = FASTAPI_BASE + "/agent/plan"
+    STEP_URL = FASTAPI_BASE + "/agent/step"
+    STATUS_URL = FASTAPI_BASE + "/workspace/status"
+    DEPLOY_URL = FASTAPI_BASE + "/agent/deploy"
+    INIT_URL = FASTAPI_BASE + "/workspace/init"
+    RUN_URL = FASTAPI_BASE + "/agent/run"
+    CANCEL_URL = FASTAPI_BASE + "/agent/cancel"
+    EVENTS_URL = FASTAPI_BASE + "/agent/events"
 
 OLLAMA_EXE = shutil.which("ollama") or str(
     Path.home() / "AppData" / "Local" / "Programs" / "Ollama" / "ollama.exe"
@@ -60,16 +77,8 @@ REQUIRED_MODELS = [
     "qwen2.5-coder:3b",   # coder    — exact or fuzzy
 ]
 
-HEALTH_URL      = FASTAPI_BASE + "/health"
-OLLAMA_TAGS_URL = OLLAMA_BASE  + "/api/tags"
-PLAN_URL        = FASTAPI_BASE + "/agent/plan"
-STEP_URL        = FASTAPI_BASE + "/agent/step"
-STATUS_URL      = FASTAPI_BASE + "/workspace/status"
-DEPLOY_URL      = FASTAPI_BASE + "/agent/deploy"
-INIT_URL        = FASTAPI_BASE + "/workspace/init"
-RUN_URL         = FASTAPI_BASE + "/agent/run"
-CANCEL_URL      = FASTAPI_BASE + "/agent/cancel"
-EVENTS_URL      = FASTAPI_BASE + "/agent/events"
+OLLAMA_TAGS_URL = OLLAMA_BASE + "/api/tags"
+_set_fastapi_port(FASTAPI_PORT)  # initializes HEALTH_URL/PLAN_URL/... consistently
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 LOG_DIR = PROJECT_ROOT / ".agent_logs"
@@ -82,16 +91,73 @@ _owned_procs: list[subprocess.Popen] = []
 _log_handles: list               = []
 _shutdown_done                   = False
 _ollama_reused                   = False  # True when Ollama was already running
+_cli_workspace: str | None       = None   # --workspace skips the picker
+_cli_yes: bool                   = False  # --yes auto-answers prompts
+# GPU safety: one lock shared by submit() and /benchmark — a benchmark never
+# overlaps a plan/step on the 4 GB GPU.
+_gpu_lock: asyncio.Lock | None   = None
+
+
+def _get_gpu_lock() -> asyncio.Lock:
+    global _gpu_lock
+    if _gpu_lock is None:
+        _gpu_lock = asyncio.Lock()
+    return _gpu_lock
 
 
 # ---------------------------------------------------------------------------
 # Process utilities
 # ---------------------------------------------------------------------------
 
-def _pids_on_port(port: int) -> list[int]:
-    """Return PIDs listening on *port*, cross-platform (netstat on Windows,
-    lsof/ss fallback elsewhere)."""
+# PIDs that must never be terminated: 0 (System Idle), 4 (System), ourselves.
+_NEVER_KILL_PIDS = {0, 4}
+
+
+def _parse_netstat_listeners(output: str, port: int) -> list[int]:
+    """Parse `netstat -ano` output: only LISTENING rows whose LOCAL address
+    ends in exactly :<port> (':80001' must not match 8000). PID 0/4 filtered."""
     pids: set[int] = set()
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() not in ("TCP", "TCP6"):
+            continue
+        local, state, pid_str = parts[1], parts[3].upper(), parts[-1]
+        if state != "LISTENING":
+            continue
+        # Local address is the LAST :port segment (handles 127.0.0.1:8000,
+        # 0.0.0.0:8000, [::]:8000) with an exact port match.
+        if local.rsplit(":", 1)[-1] != str(port):
+            continue
+        if pid_str.isdigit():
+            pid = int(pid_str)
+            if pid not in _NEVER_KILL_PIDS and pid != os.getpid():
+                pids.add(pid)
+    return sorted(pids)
+
+
+def _pids_on_port(port: int) -> list[int]:
+    """Return PIDs LISTENING on *port* (psutil if available, else netstat /
+    lsof / ss). Never returns 0, 4, or our own PID."""
+    try:
+        import psutil  # optional dependency
+
+        found: set[int] = set()
+        for conn in psutil.net_connections(kind="tcp"):
+            if (
+                conn.status == "LISTEN"
+                and conn.laddr
+                and conn.laddr.port == port
+                and conn.pid
+                and conn.pid not in _NEVER_KILL_PIDS
+                and conn.pid != os.getpid()
+            ):
+                found.add(conn.pid)
+        return sorted(found)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
     if sys.platform == "win32":
         try:
             out = subprocess.check_output(
@@ -100,64 +166,158 @@ def _pids_on_port(port: int) -> list[int]:
             )
         except Exception:
             return []
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) >= 5 and parts[0].upper() == "TCP":
-                local = parts[1].rsplit(":", 1)
-                if len(local) == 2 and local[1] == str(port) and parts[-1].isdigit():
-                    pids.add(int(parts[-1]))
-        return sorted(pids)
-    # POSIX: try lsof, then ss
+        return _parse_netstat_listeners(out, port)
+
+    # POSIX: lsof (listeners only), then ss
     try:
         out = subprocess.check_output(
-            ["lsof", "-ti", f":{port}"], text=True, stderr=subprocess.DEVNULL, timeout=5
+            ["lsof", "-nP", "-iTCP", f":{port}", "-sTCP:LISTEN", "-t"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5,
         )
-        return sorted({int(p) for p in out.split() if p.strip().isdigit()})
+        return sorted(
+            {int(p) for p in out.split() if p.strip().isdigit()
+             and int(p) not in _NEVER_KILL_PIDS and int(p) != os.getpid()}
+        )
     except Exception:
         pass
+    pids: set[int] = set()
     try:
         out = subprocess.check_output(
             ["ss", "-ltnp"], text=True, stderr=subprocess.DEVNULL, timeout=5
         )
         for line in out.splitlines():
-            if f":{port} " in line and "pid=" in line:
+            parts = line.split()
+            if len(parts) >= 4 and parts[3].rsplit(":", 1)[-1] == str(port) and "pid=" in line:
                 for token in line.split(","):
                     if token.startswith("pid="):
-                        pids.add(int(token.split("=")[1]))
+                        pid = int(token.split("=")[1])
+                        if pid not in _NEVER_KILL_PIDS and pid != os.getpid():
+                            pids.add(pid)
     except Exception:
         pass
     return sorted(pids)
 
 
-def _terminate_pid(pid: int) -> None:
-    """Terminate a single PID, cross-platform."""
-    if pid == os.getpid():
-        return
+def terminate_pid(pid: int) -> bool:
+    """Best-effort terminate. NEVER raises; returns True if a kill was issued.
+
+    Order: psutil -> taskkill (Windows) -> os.kill. FileNotFoundError
+    (missing powershell/taskkill), PermissionError and OSError are caught.
+    """
+    if pid in _NEVER_KILL_PIDS or pid == os.getpid() or pid <= 0:
+        console.print(f"  [yellow]!! refusing to terminate PID {pid}[/yellow]")
+        return False
+    try:
+        import psutil
+
+        try:
+            proc = psutil.Process(pid)
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except psutil.TimeoutExpired:
+                proc.kill()
+            return True
+        except psutil.NoSuchProcess:
+            return True  # already gone
+    except ImportError:
+        pass
+    except Exception as exc:
+        console.print(f"  [yellow]!! psutil terminate failed for PID {pid}: {exc}[/yellow]")
+
     if sys.platform == "win32":
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {pid} -Force"],
-            capture_output=True, check=False,
+        taskkill = shutil.which("taskkill") or str(
+            Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32" / "taskkill.exe"
         )
+        try:
+            result = subprocess.run(
+                [taskkill, "/PID", str(pid), "/T", "/F"],
+                capture_output=True, check=False, timeout=10,
+            )
+            return result.returncode == 0
+        except (FileNotFoundError, PermissionError, OSError) as exc:
+            console.print(f"  [yellow]!! taskkill failed for PID {pid}: {exc}[/yellow]")
     else:
         try:
             os.kill(pid, signal.SIGTERM)
-        except OSError:
+            return True
+        except (PermissionError, OSError) as exc:
+            console.print(f"  [yellow]!! os.kill failed for PID {pid}: {exc}[/yellow]")
+    return False
+
+
+def _port_owner_is_our_controller(port: int) -> bool:
+    """GET /health on *port*: True when it answers as THIS controller."""
+    try:
+        data = _http_get(f"http://{FASTAPI_HOST}:{port}/health", timeout=2)
+        return data.get("status") == "online" and "agent_profile" in data
+    except Exception:
+        return False
+
+
+def _pid_image_name(pid: int) -> str:
+    """Best-effort process image name (for the kill-confirmation prompt)."""
+    try:
+        import psutil
+
+        return psutil.Process(pid).name()
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        try:
+            out = subprocess.check_output(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                text=True, stderr=subprocess.DEVNULL, timeout=5,
+            )
+            return out.split('","')[0].strip('"')
+        except Exception:
             pass
+    return "unknown"
 
 
-def _kill_port(port: int, label: str) -> None:
-    """Kill foreign PIDs on *port* — used ONLY for the FastAPI port, never
-    for Ollama (a running Ollama is reused, not killed)."""
-    victims = [p for p in _pids_on_port(port) if p != os.getpid()]
-    if not victims:
-        return
-    console.print(f"  [yellow]!! Killing {len(victims)} stray {label} process(es) on :{port} -> PIDs {victims}[/yellow]")
-    for pid in victims:
-        _terminate_pid(pid)
+def _kill_port(port: int, label: str, assume_yes: bool = False) -> bool:
+    """Handle foreign PIDs LISTENING on *port*.
+
+    Returns True when the port is (or became) free, or is owned by our own
+    already-running controller (which we then reuse). Never kills Ollama;
+    never kills PID 0/4; asks y/N (default N) before killing anything else.
+    """
+    pids = _pids_on_port(port)
+    if not pids:
+        return True
+
+    # Our own controller already serving? Reuse it like the running Ollama.
+    if label == "FastAPI" and _port_owner_is_our_controller(port):
+        console.print(
+            f"  [bright_green]✓ Reusing already-running controller on :{port} "
+            f"(PIDs {pids}; not owned, not killed)[/bright_green]"
+        )
+        return True
+
+    for pid in pids:
+        name = _pid_image_name(pid)
+        if name.lower().startswith("ollama"):
+            console.print(
+                f"  [yellow]!! :{port} is held by Ollama (PID {pid}); will NOT kill it[/yellow]"
+            )
+            return False
+        kill = assume_yes
+        if not assume_yes:
+            try:
+                kill = Prompt.ask(
+                    f"  [yellow]Port :{port} is used by {name} (PID {pid}). Kill it?[/yellow]",
+                    choices=["y", "n"], default="n",
+                ) == "y"
+            except Exception:
+                kill = False
+        if kill:
+            terminate_pid(pid)
+
     for _ in range(10):
         if not _pids_on_port(port):
-            break
-        time.sleep(0.3)
+            return True
+        time.sleep(0.5)
+    return not _pids_on_port(port)
 
 
 def _spawn(args: list[str], log_name: str, **popen_kwargs) -> subprocess.Popen:
@@ -209,10 +369,7 @@ def _shutdown(reason: str = "exit") -> None:
             try:
                 proc.wait(timeout=4)
             except subprocess.TimeoutExpired:
-                subprocess.run(
-                    ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {proc.pid} -Force"],
-                    capture_output=True, check=False,
-                )
+                terminate_pid(proc.pid)
     _owned_procs.clear()
     for fh in _log_handles:
         try:
@@ -344,9 +501,10 @@ def _start_fastapi() -> subprocess.Popen:
     )
 
 
-def start_all_services() -> None:
-    """Reuse a running Ollama (never kill ollama.exe we did not spawn), then
-    spawn FastAPI as an owned child. Only the FastAPI port is reclaimed."""
+def start_all_services(assume_yes: bool = False) -> None:
+    """Reuse a running Ollama (never kill ollama.exe we did not spawn), reuse
+    an already-running controller, else start FastAPI as an owned child.
+    Busy FastAPI port falls forward to the next free port (8001..8010)."""
     console.print("\n[bold bright_cyan]Starting services...[/bold bright_cyan]")
 
     # 1. Ollama: reuse if the API already answers; otherwise start our own.
@@ -366,9 +524,31 @@ def start_all_services() -> None:
             raise RuntimeError("Ollama did not respond within 20 s")
         console.print("  [bright_green]✓ Ollama API ready[/bright_green]")
 
-    # 2. FastAPI port: reclaim from stray controllers, then start ours.
-    _kill_port(FASTAPI_PORT, "FastAPI")
+    # 2. FastAPI: reuse our controller if it answers; reclaim or fall forward.
+    if _port_owner_is_our_controller(FASTAPI_PORT):
+        console.print(
+            f"  [bright_green]✓ Reusing already-running controller on :{FASTAPI_PORT}[/bright_green]"
+        )
+        return
+    if not _kill_port(FASTAPI_PORT, "FastAPI", assume_yes=assume_yes):
+        fallback = _next_free_port(FASTAPI_PORT)
+        if fallback is None:
+            raise RuntimeError(
+                f"Ports {FASTAPI_PORT}..8010 are all busy; free one or use --port"
+            )
+        console.print(
+            f"  [yellow]!! :{FASTAPI_PORT} busy — falling forward to :{fallback}[/yellow]"
+        )
+        _set_fastapi_port(fallback)
     _start_fastapi()
+
+
+def _next_free_port(start: int) -> int | None:
+    """First port in start..8010 with no LISTENING owner."""
+    for candidate in range(start + 1, 8011):
+        if not _pids_on_port(candidate):
+            return candidate
+    return None
 
     # 6. Wait for FastAPI
     with Progress(
@@ -407,6 +587,107 @@ async def post_json(url: str, payload: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Workspace picker + persisted TUI state
+# ---------------------------------------------------------------------------
+
+TUI_STATE_PATH = Path(__file__).resolve().parent / ".agent_tui_state.json"
+
+
+def _load_tui_state() -> dict:
+    """Tolerate missing/corrupt state file."""
+    try:
+        data = json.loads(TUI_STATE_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_tui_state(state: dict) -> None:
+    """Atomic write: tmp file then replace."""
+    tmp = TUI_STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp.replace(TUI_STATE_PATH)
+
+
+def _remember_workspace(path: str) -> None:
+    state = _load_tui_state()
+    state["last_workspace"] = path
+    recent = [path] + [p for p in state.get("recent", []) if p != path]
+    state["recent"] = recent[:5]
+    _save_tui_state(state)
+
+
+def _valid_workspace(path: str | None) -> str | None:
+    """Resolve a candidate; return the resolved path only if it is a dir."""
+    if not path:
+        return None
+    try:
+        resolved = Path(str(path).strip().strip('"')).expanduser().resolve()
+        return str(resolved) if resolved.is_dir() else None
+    except Exception:
+        return None
+
+
+def pick_workspace(assume_yes: bool = False) -> str:
+    """Rich menu: 1) last used  2) current directory  3) custom path...
+
+    Default = 1 when valid else 2. Custom paths are created on confirmation.
+    """
+    state = _load_tui_state()
+    last = _valid_workspace(state.get("last_workspace"))
+    current = str(Path.cwd())
+
+    options: list[tuple[str, str]] = []
+    if last:
+        options.append(("1", f"Last used workspace: {last}"))
+    options.append(("2", f"Current directory: {current}"))
+    options.append(("3", "Custom path..."))
+
+    default = "1" if last else "2"
+    console.print(Panel(
+        "\n".join(f"  [bright_cyan]{key})[/bright_cyan] {label}" for key, label in options),
+        title="Choose workspace", border_style="bright_blue",
+    ))
+
+    choice = default
+    if not assume_yes:
+        valid = {k for k, _ in options}
+        choice = Prompt.ask("Workspace", choices=sorted(valid), default=default)
+
+    chosen: str | None = None
+    if choice == "1" and last:
+        chosen = last
+    elif choice == "2":
+        chosen = current
+    else:
+        while True:
+            raw = Prompt.ask("Workspace path").strip().strip('"')
+            candidate = Path(raw).expanduser()
+            if candidate.is_dir():
+                chosen = str(candidate.resolve())
+                break
+            if not candidate.exists():
+                create = assume_yes or Prompt.ask(
+                    f"[yellow]{candidate} does not exist. Create it?[/yellow]",
+                    choices=["y", "n"], default="y",
+                ) == "y"
+                if create:
+                    try:
+                        candidate.mkdir(parents=True, exist_ok=True)
+                        chosen = str(candidate.resolve())
+                        break
+                    except OSError as exc:
+                        console.print(f"[red]Could not create: {exc}[/red]")
+                        continue
+            console.print("[red]Not a valid directory — try again.[/red]")
+
+    _remember_workspace(chosen)
+    return chosen
+
+
+# ---------------------------------------------------------------------------
 # Banner & UI helpers
 # ---------------------------------------------------------------------------
 
@@ -416,7 +697,8 @@ def show_banner() -> None:
             "[bold bright_cyan]OLLAMA MASTER CONTROLLER[/bold bright_cyan]\n"
             "[bright_magenta]Sequential VRAM Fencing | RTX 3050 4 GB ceiling[/bright_magenta]\n"
             "[dim]deepseek-r1:1.5b (Planner)  |  qwen2.5-coder:3b (Coder)[/dim]\n"
-            "[dim]All services owned by this process -- Ctrl-C kills everything[/dim]",
+            "[dim]Reuses running Ollama · only own children are stopped on exit[/dim]\n"
+            "[dim]CLI: --workspace PATH · --port N · --yes · --benchmark [bench args][/dim]",
             border_style="bright_blue",
             box=box.DOUBLE,
         )
@@ -441,6 +723,7 @@ def show_help() -> None:
         Panel(
             "/help        show commands\n"
             "/run         autonomous run through agent_core (plan → code → verify → deploy)\n"
+            "/benchmark   benchmark role models (--quick, --roles, --compare, apply, last)\n"
             "/status      show service health + staged diff\n"
             "/workspace   change the active workspace path\n"
             "/deploy      push staged files into active workspace\n"
@@ -460,6 +743,15 @@ def show_help() -> None:
 # ---------------------------------------------------------------------------
 
 async def submit(request_text: str, workspace_dir: str) -> None:
+    lock = _get_gpu_lock()
+    if lock.locked():
+        console.print("[yellow]GPU busy (benchmark running?) — try again when it finishes.[/yellow]")
+        return
+    async with lock:
+        await _submit_locked(request_text, workspace_dir)
+
+
+async def _submit_locked(request_text: str, workspace_dir: str) -> None:
     try:
         # ── Initialise workspace context ──────────────────────────────────
         await post_json(INIT_URL, {"root_path": workspace_dir})
@@ -635,6 +927,130 @@ def _read_latest_run_state(workspace_dir: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# /benchmark slash command
+# ---------------------------------------------------------------------------
+
+_last_bench_report: dict | None = None  # most recent in-session report
+
+
+def _bench_reports_dir(workspace: str) -> Path:
+    return Path(workspace) / ".agent_runs" / "bench"
+
+
+def _show_last_bench_report(workspace: str) -> None:
+    bench_dir = _bench_reports_dir(workspace)
+    reports = sorted(bench_dir.glob("bench-*.md"), reverse=True) if bench_dir.is_dir() else []
+    if not reports:
+        console.print("[yellow]No benchmark reports yet — run /benchmark first.[/yellow]")
+        return
+    newest = reports[0]
+    console.print(Panel(
+        newest.read_text(encoding="utf-8", errors="replace")[:4000],
+        title=f"Latest report: {newest.name}", border_style="bright_blue",
+    ))
+
+
+def _print_bench_table(report: dict) -> None:
+    table = Table(title="Benchmark results", box=box.ROUNDED, border_style="bright_blue")
+    table.add_column("Role", style="bright_cyan")
+    table.add_column("Model")
+    table.add_column("OK", width=6)
+    table.add_column("Secs", justify="right")
+    table.add_column("Score", justify="right")
+    table.add_column("Error", style="dim", max_width=40)
+    for r in report.get("results", []):
+        ok = "[bright_green]yes[/bright_green]" if r.get("ok") else "[red]no[/red]"
+        table.add_row(
+            r.get("role", ""), r.get("model", ""), ok,
+            f"{r.get('seconds', 0):.2f}", f"{r.get('score', 0):.1f}",
+            r.get("error", ""),
+        )
+    console.print(table)
+    best = report.get("best_per_role", {})
+    if best:
+        console.print("[bold]Best per role:[/bold]")
+        for role, model in best.items():
+            console.print(f"  [bright_cyan]{role}[/bright_cyan] → [white]{model}[/white]")
+    verdict = report.get("coexist_verdict")
+    if verdict:
+        console.print(f"[dim]Coexist: {verdict}[/dim]")
+
+
+async def _apply_bench_roles(workspace: str) -> None:
+    """Write best-per-role models into .agent under 'roles' after y/N."""
+    global _last_bench_report
+    if not _last_bench_report or not _last_bench_report.get("best_per_role"):
+        console.print("[yellow]No benchmark results to apply — run /benchmark first.[/yellow]")
+        return
+    best = _last_bench_report["best_per_role"]
+    console.print("[bold]Recommended models:[/bold]")
+    for role, model in best.items():
+        console.print(f"  {role} → [white]{model}[/white]")
+    confirm = Prompt.ask("Write these into .agent under 'roles'?", choices=["y", "n"], default="n")
+    if confirm != "y":
+        console.print("[dim]Not applied.[/dim]")
+        return
+
+    import json as _json
+
+    agent_path = Path(workspace) / ".agent"
+    data: dict = {}
+    if agent_path.exists():
+        try:
+            data = _json.loads(agent_path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    roles = data.get("roles", {})
+    for role, model in best.items():
+        existing = roles.get(role, {}) if isinstance(roles.get(role), dict) else {}
+        roles[role] = {**existing, "model": model}
+    data["roles"] = roles
+    agent_path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+    console.print("[bright_green]✓ roles written to .agent[/bright_green]")
+
+
+async def run_benchmark_slash(arg_string: str, workspace: str) -> None:
+    """/benchmark [args] — GPU-locked, asyncio-responsive, Ctrl-C safe."""
+    global _last_bench_report
+    import bench
+    import shlex
+
+    args = shlex.split(arg_string) if arg_string.strip() else []
+    if args and args[0] == "last":
+        _show_last_bench_report(workspace)
+        return
+    if args and args[0] == "apply":
+        await _apply_bench_roles(workspace)
+        return
+
+    lock = _get_gpu_lock()
+    if lock.locked():
+        console.print("[yellow]GPU busy with another operation — try again when it finishes.[/yellow]")
+        return
+
+    bench_argv = ["--workspace", workspace, *args]
+    console.print("[dim]Benchmark unloads models when done (keep_alive=0).[/dim]")
+    async with lock:
+        try:
+            report, exit_code = await asyncio.to_thread(bench.run, bench_argv)
+        except asyncio.CancelledError:
+            console.print("[yellow]Benchmark cancelled — models unloaded, services untouched.[/yellow]")
+            return
+        except KeyboardInterrupt:
+            console.print("[yellow]Benchmark cancelled.[/yellow]")
+            return
+    _last_bench_report = report
+    if exit_code == 2:
+        console.print("[bold red]Ollama unreachable — start it first.[/bold red]")
+        return
+    _print_bench_table(report)
+    bench_dir = _bench_reports_dir(workspace)
+    reports = sorted(bench_dir.glob("bench-*.*"), reverse=True) if bench_dir.is_dir() else []
+    for path in reports[:2]:
+        console.print(f"[dim]report: {path}[/dim]")
+
+
+# ---------------------------------------------------------------------------
 # Main TUI loop
 # ---------------------------------------------------------------------------
 
@@ -719,7 +1135,7 @@ async def main() -> None:
         pass
 
     # ── Step 5: interactive loop ───────────────────────────────────────────
-    workspace = display_workspace(str(PROJECT_ROOT))
+    workspace = display_workspace(_cli_workspace or pick_workspace(assume_yes=_cli_yes))
     console.print("[dim]Type /help for commands. Enter a coding request to begin.[/dim]")
 
     try:
@@ -738,8 +1154,7 @@ async def main() -> None:
                 show_banner()
 
             elif command == "/workspace":
-                workspace = Prompt.ask("New workspace path", default=workspace).strip().strip('"')
-                workspace = display_workspace(workspace)
+                workspace = display_workspace(pick_workspace(assume_yes=False))
 
             elif command == "/models":
                 try:
@@ -777,6 +1192,10 @@ async def main() -> None:
                 except Exception as exc:
                     console.print(f"[red]{exc}[/red]")
 
+            elif command.startswith("/benchmark"):
+                arg_string = text.strip()[len("/benchmark"):].strip()
+                await run_benchmark_slash(arg_string, workspace)
+
             elif command == "/logs":
                 for log_file in ("planner.log", "coder.log", "sandbox.log",
                                  "ollama_service.log", "fastapi_service.log"):
@@ -795,5 +1214,58 @@ async def main() -> None:
         _shutdown("TUI closed")
 
 
-if __name__ == "__main__":
+# ---------------------------------------------------------------------------
+# CLI arguments
+# ---------------------------------------------------------------------------
+
+def _parse_cli(argv: list[str]) -> "argparse.Namespace":
+    """parse_known_args: unknown args are forwarded to bench."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="tui.py", description="Ollama agent TUI launcher")
+    parser.add_argument("--workspace", default=None, help="skip the workspace picker")
+    parser.add_argument("--port", type=int, default=None, help="FastAPI port override")
+    parser.add_argument("--yes", action="store_true", help="auto-answer prompts with defaults")
+    parser.add_argument(
+        "--benchmark", action="store_true",
+        help="headless: start/reuse Ollama only, run benchmark, print, exit",
+    )
+    known, unknown = parser.parse_known_args(argv)
+    known.bench_args = unknown  # forwarded to bench.run()
+    return known
+
+
+async def _benchmark_headless(args: "argparse.Namespace") -> int:
+    """--benchmark mode: Ollama only (NO FastAPI), run bench, exit."""
+    import bench
+
+    workspace = args.workspace or str(PROJECT_ROOT)
+    # Ollama only — reuse if up, else start our own.
+    global _ollama_reused
+    _ollama_reused = _check_ollama_running().ok
+    if not _ollama_reused:
+        _start_ollama()
+        if not _wait_for_http(OLLAMA_TAGS_URL, timeout=20):
+            console.print("[bold red]Ollama unreachable — benchmark aborted[/bold red]")
+            return 2
+    bench_argv = ["--workspace", workspace, *args.bench_args]
+    report, exit_code = await asyncio.to_thread(bench.run, bench_argv)
+    return exit_code
+
+
+def cli() -> None:
+    args = _parse_cli(sys.argv[1:])
+    global _cli_workspace, _cli_yes
+    _cli_workspace = args.workspace
+    _cli_yes = args.yes
+    if args.port is not None:
+        _set_fastapi_port(args.port)
+    if args.benchmark:
+        exit_code = asyncio.run(_benchmark_headless(args))
+        _shutdown("benchmark done")
+        raise SystemExit(exit_code)
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    cli()
