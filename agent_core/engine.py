@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent_core import auditor, coder, context, planner
+from agent_core.context import ContextBudget
 from agent_core.llm_gateway import LLMGateway
 from agent_core.run_state import (
     STATUS_BUDGET_EXHAUSTED,
@@ -180,8 +181,13 @@ class Engine:
 
         try:
             report("tool • workspace.list_files: scanning the selected workspace")
+            # Planner gets repo map + snippets within 85% of the context window,
+            # reserving room for the plan itself.
+            plan_budget = ContextBudget(
+                self.config.max_context_tokens, reserve_output_tokens=planner.MAX_PLAN_TOKENS
+            )
             ws_context = context.build_workspace_context(
-                self.workspace, request.prompt, report
+                self.workspace, request.prompt, report, budget=plan_budget
             )
             report("stage 1/3 • planner: breaking request into sequential tasks")
             tasks, raw_plan = self._plan(request.prompt[:THINKER_INPUT_CHARS], ws_context)
@@ -298,7 +304,7 @@ class Engine:
             spec_chars = CODER_SPEC_CHARS
             for _trunc_retry in range(2):
                 try:
-                    files = coder.generate_files(self, self.config.coder_model, task_spec[:spec_chars])
+                    files = self._generate_task_files(task, task_spec[:spec_chars], staging)
                     coder_error = None
                     break
                 except OllamaTruncatedError as exc:
@@ -419,6 +425,54 @@ class Engine:
     @property
     def supports_structured(self) -> bool:
         return bool(getattr(self.llm, "supports_structured", False))
+
+    def _generate_task_files(
+        self, task: dict[str, Any], task_spec: str, staging: StagingArea
+    ) -> dict[str, str]:
+        """Edit-aware coder call: existing targets are shown to the model
+        (token-budgeted) and SEARCH/REPLACE blocks are applied; new files
+        arrive as full fenced blocks. Returns {relative_name: content}."""
+        # Resolve which targets already exist (staging first, then workspace).
+        existing: dict[str, str] = {}
+        target_files = [str(f) for f in task.get("target_files", []) if str(f).strip()]
+        budget = ContextBudget(
+            self.config.max_context_tokens, reserve_output_tokens=coder.MAX_CODE_TOKENS
+        )
+        # Spec itself must fit; existing file contents share the rest.
+        remaining_chars = budget.input_char_limit - len(task_spec) - 2_000
+        for name in target_files:
+            if remaining_chars <= 0:
+                break
+            staged_content = staging.read_staged(name)
+            if staged_content is not None:
+                source = staged_content
+            else:
+                path = staging.workspace / name
+                if not path.is_file():
+                    continue
+                try:
+                    source = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+            existing[name] = source[:remaining_chars]
+            remaining_chars -= len(existing[name])
+
+        file_edits = coder.generate_file_edits(
+            self, self.config.coder_model, task_spec, existing or None
+        )
+        materialized: dict[str, str] = {}
+        for file_edit in file_edits:
+            base = existing.get(file_edit.path)
+            if base is None:
+                staged_content = staging.read_staged(file_edit.path)
+                if staged_content is not None:
+                    base = staged_content
+                else:
+                    candidate = staging.workspace / file_edit.path
+                    if candidate.is_file():
+                        base = candidate.read_text(encoding="utf-8", errors="replace")
+            materialized[file_edit.path] = coder.apply_file_edit(base, file_edit)
+        return materialized
 
     def text(self, model: str, prompt: str, **kwargs: Any) -> str:
         return self._llm_text(model, prompt, **kwargs)

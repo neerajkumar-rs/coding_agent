@@ -29,9 +29,10 @@ class FakeOllama(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         payload = json.loads(self.rfile.read(length))
         prompt = payload.get("prompt", "")
-        if "validation" in prompt.lower():
+        lower = prompt.lower()
+        if "auditor" in lower:
             content = "<think>checking spec compliance</think>PASS\nGenerated files satisfy the specification."
-        elif "pure code generator" in prompt.lower():
+        elif "pure code generator" in lower or "precise code editor" in lower:
             content = "```FILE: generated.py\n\ndef greet(name: str) -> str:\n    return f'Hello, {name}!'\n```"
         else:
             content = "<think>planning</think>## TASK 1: create greeting\n- files: generated.py\n- logic: def greet(name: str) -> str"
