@@ -11,6 +11,7 @@ trace and no hidden stages.
 from __future__ import annotations
 
 import json
+import os
 import py_compile
 import re
 import time
@@ -157,16 +158,107 @@ MAX_TASK_RETRIES = 2  # retries AFTER the first attempt
 VALIDATE_FILE_HEAD_LINES = 60
 
 
+FILE_QUESTION_HINTS = (
+    "what is in my", "what's in my", "whats in my", "list files", "list the files",
+    "which files", "what files", "show files", "show me the files",
+    "which language", "what language", "summarize my files", "summarise my files",
+    "describe my files", "my workspace", "my project", "in this dir", "in my dir",
+    "in this folder", "in this directory",
+)
+CODE_VERBS = (
+    "create", "write", "make", "build", "add", "fix", "implement",
+    "generate", "update", "modify", "refactor",
+)
+
+
 def classify_request(user_request: str) -> str:
-    """Rules-only ROUTE: QUESTION or CODE_TASK (no LLM involved)."""
+    """Rules-only ROUTE: QUESTION / FILE_QUESTION / CODE_TASK / UNCLEAR.
+    No model call is involved. Files are only ever created for CODE_TASK."""
     r = user_request.strip().lower()
+    if not r:
+        return "UNCLEAR"
     has_ext = bool(re.search(r"\b\w+\.(py|html?|css|js|json|md|txt)\b", r))
-    code = any(h in r for h in CODE_HINTS)
-    if code or has_ext:
+    has_verb = any(v in r for v in CODE_VERBS)
+    if has_verb or has_ext:
         return "CODE_TASK"
+    if any(h in r for h in FILE_QUESTION_HINTS):
+        return "FILE_QUESTION"
     if any(h in r for h in QUESTION_HINTS) or r.endswith("?"):
         return "QUESTION"
+    # A bare statement with no verb, no file, and no question mark tells us
+    # nothing — ask instead of guessing.
+    if len(r.split()) < 4:
+        return "UNCLEAR"
     return "CODE_TASK"
+
+
+# ---------------------------------------------------------------------------
+# FILE_QUESTION: deterministic workspace facts (depth-2 tree + per-file stats)
+# ---------------------------------------------------------------------------
+
+FILE_Q_SKIP_DIRS = {".git", ".agent_staging", ".agent_runs", ".agent_logs",
+                    "node_modules", "__pycache__", "env", ".venv", "venv"}
+FILE_Q_MAX_ENTRIES = 200
+FILE_Q_MAX_DETAIL = 20
+FILE_Q_HEAD_LINES = 30
+TEXT_SUFFIXES = set(LANGUAGE_BY_SUFFIX) | {".txt", ".toml", ".yml", ".yaml", ".cfg", ".ini"}
+
+
+def _file_language(path: Path) -> str:
+    return LANGUAGE_BY_SUFFIX.get(path.suffix.lower(), "text")
+
+
+def build_file_facts(workspace: Path) -> dict[str, Any]:
+    """Deterministic scan: tree (depth 2) + per-text-file stats and heads."""
+    workspace = Path(workspace).resolve()
+    tree_lines: list[str] = []
+    details: list[dict[str, Any]] = []
+    count = 0
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = sorted(d for d in dirs if d not in FILE_Q_SKIP_DIRS and not d.startswith("."))
+        rel_root = Path(root).relative_to(workspace)
+        depth = len(rel_root.parts)
+        if depth > 2:
+            continue
+        indent = "  " * depth
+        tree_lines.append(f"{indent}{rel_root.name if rel_root.name else '.'}/")
+        for name in sorted(files):
+            if count >= FILE_Q_MAX_ENTRIES:
+                break
+            if name.startswith(".") or name.endswith(".pyc"):
+                continue
+            count += 1
+            path = Path(root) / name
+            rel = path.relative_to(workspace).as_posix()
+            tree_lines.append(f"{indent}  {name}")
+            if path.suffix.lower() not in TEXT_SUFFIXES:
+                continue  # skip binaries
+            if len(details) >= FILE_Q_MAX_DETAIL:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            details.append({
+                "name": rel,
+                "language": _file_language(path),
+                "lines": text.count("\n") + 1,
+                "size": path.stat().st_size,
+                "head": "\n".join(text.splitlines()[:FILE_Q_HEAD_LINES]),
+            })
+    return {"tree": "\n".join(tree_lines), "files": details}
+
+
+def format_file_table(facts: dict[str, Any]) -> str:
+    """Deterministic table: name, language, lines, size."""
+    rows = [f"{'FILE':<40}{'LANGUAGE':<12}{'LINES':>7}{'SIZE':>9}"]
+    for f in facts["files"]:
+        size = f["size"]
+        size_str = f"{size} B" if size < 1024 else f"{size / 1024:.1f} KB"
+        rows.append(f"{f['name']:<40}{f['language']:<12}{f['lines']:>7}{size_str:>9}")
+    if len(rows) == 1:
+        rows.append("(no text files found)")
+    return "\n".join(rows)
 
 
 def _language_of(path: str) -> str:
@@ -308,15 +400,59 @@ async def run_pipeline(
 
     if route == "QUESTION":
         t0 = time.monotonic()
+        # Depth-1 file tree as context; the workspace name itself never
+        # enters the prompt.
+        facts = build_file_facts(workspace)
+        depth1 = "\n".join(
+            line for line in facts["tree"].splitlines() if not line.startswith("  ")
+        )
         raw = await generate(
             coder_model,
-            "Answer concisely and accurately.\n\nQUESTION: " + user_request,
+            "Answer concisely and accurately. The user's directory contains:\n"
+            + depth1 + "\n\nQUESTION: " + user_request,
             system="You are a precise technical assistant.",
             temperature=TEMPERATURE_PLAN,
         )
         _, answer = strip_think_blocks(raw)
         record("ANSWER", "ok", time.monotonic() - t0)
         return {"answer": answer.strip(), "trace": trace}
+
+    if route == "FILE_QUESTION":
+        t0 = time.monotonic()
+        facts = build_file_facts(workspace)
+        table = format_file_table(facts)
+        wants_prose = any(
+            w in user_request.lower() for w in ("explain", "summarize", "summarise", "describe")
+        )
+        if wants_prose and facts["files"]:
+            # ONE model call, facts only — never invent files, never name the
+            # workspace. The deterministic table is included in the answer.
+            facts_block = "\n".join(
+                f"- {f['name']} ({f['language']}, {f['lines']} lines):\n{f['head']}"
+                for f in facts["files"]
+            )
+            raw = await generate(
+                coder_model,
+                "Describe only the files listed. Do not invent files.\n\n"
+                + facts_block + "\n\nREQUEST: " + user_request,
+                system="You describe only the files you are shown.",
+                temperature=TEMPERATURE_PLAN,
+            )
+            _, prose = strip_think_blocks(raw)
+            answer = table + "\n\n" + prose.strip()
+        else:
+            answer = table
+        record("ANSWER", "ok", time.monotonic() - t0,
+               f"{len(facts['files'])} files scanned")
+        return {"answer": answer, "trace": trace}
+
+    if route == "UNCLEAR":
+        record("ANSWER", "ok", 0.0, "needs clarification")
+        return {
+            "answer": "Could you tell me a bit more — should I create or change "
+                      "code (which file/feature), or answer a question?",
+            "trace": trace,
+        }
 
     # ------------------------------------------------------------------ PLAN
     t0 = time.monotonic()
