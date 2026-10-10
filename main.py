@@ -525,39 +525,43 @@ async def agent_step(payload: StepRequest) -> dict[str, Any]:
 
 @app.post("/agent/run")
 async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
-    """Autonomous one-shot run through the single agent_core pipeline.
+    """THE request pipeline: ROUTE -> PLAN -> CODE -> CHECK -> VALIDATE -> SUMMARY.
 
-    Everything (planning, coding, staging, verification, audit, deploy) is
-    executed by agent_core.engine.Engine in a worker thread; the process-wide
-    LLM lock serializes GPU access across concurrent requests/workspaces.
+    Returns {summary, staged_files, failed_tasks, trace} for code tasks or
+    {answer, trace} for questions. Never auto-deploys: the TUI shows diffs
+    and asks before deploying (only files that passed CHECK are staged).
     """
-    from agent_core.engine import RunRequest, get_engine
+    from orchestrator import run_pipeline
 
-    workspace = payload.workspace_dir or state.workspace_root
-    engine = get_engine(workspace)
+    state.ensure_workspace(payload.workspace_dir)
 
-    def _run() -> dict[str, Any]:
-        report = engine.run(
-            RunRequest(
-                prompt=payload.prompt,
-                auto_deploy=payload.auto_deploy,
-            )
+    async def _generate(model: str, prompt: str, system: str = "", temperature: float = 0.2) -> str:
+        return await state.ollama.generate(
+            prompt=prompt, system_prompt=system, model_name=model,
+            config=state.config, temperature=temperature,
         )
-        return {
-            "status": report.status,
-            "run_id": report.run_id,
-            "files": report.files,
-            "deployed_files": report.deployed_files,
-            "attempts": report.attempts,
-            "llm_calls": report.llm_calls,
-            "elapsed_seconds": report.elapsed_seconds,
-            "errors": report.errors,
-            "needs_human": report.needs_human,
-            "audits": report.audits,
-        }
+
+    async def _unload(model: str) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                await client.post(
+                    f"{state.ollama.base_url}/api/generate",
+                    json={"model": model, "prompt": "", "keep_alive": 0, "stream": False},
+                )
+        except Exception as exc:
+            logger.warning(f"model unload failed for {model}: {exc}")
 
     try:
-        return await asyncio.to_thread(_run)
+        return await run_pipeline(
+            payload.prompt,
+            state.workspace_root,
+            generate=_generate,
+            planner_model=state.config.planner_model,
+            coder_model=state.config.coder_model,
+            unload=_unload,
+        )
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error(f"agent run failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))

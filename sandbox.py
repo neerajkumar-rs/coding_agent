@@ -228,9 +228,43 @@ class ExecutionSandbox:
         custom_command: str | None = None,
         timeout: float = 30.0,
     ) -> dict[str, Any]:
-        """Execute the generated validation script in an isolated subprocess boundary."""
-        script_path, cmd = self.generate_validation_script(target_rel_path, custom_command)
+        """Validate a staged file.
+
+        Non-Python files (and no custom command) are checked IN-PROCESS via
+        check_plausible_content — no subprocess, no sys.path edits (the old
+        generated-script approach failed with "No module named 'sandbox'"
+        whenever the workspace was not the controller directory).
+        """
         start_time = time.time()
+        if not target_rel_path.endswith(".py") and not custom_command:
+            staged_abs = self.staging_manager.get_staged_file_path(target_rel_path)
+            content = (
+                staged_abs.read_text(encoding="utf-8", errors="replace")
+                if staged_abs.is_file()
+                else ""
+            )
+            error = check_plausible_content(target_rel_path, content)
+            duration_s = round(time.time() - start_time, 3)
+            success = error is None
+            stdout = "[SANDBOX] Content plausibility check passed." if success else ""
+            stderr = "" if success else f"[SANDBOX] {error}"
+            self.staging_manager.log_sandbox(
+                command=f"in-process plausibility: {target_rel_path}",
+                exit_code=0 if success else 1,
+                stdout=stdout,
+                stderr=stderr,
+                duration_s=duration_s,
+            )
+            return {
+                "success": success,
+                "exit_code": 0 if success else 1,
+                "stdout": stdout,
+                "stderr": stderr,
+                "script_path": "",
+                "duration_s": duration_s,
+            }
+
+        script_path, cmd = self.generate_validation_script(target_rel_path, custom_command)
 
         logger.info(f"Running sandbox diagnostic via: {' '.join(cmd)}")
         try:

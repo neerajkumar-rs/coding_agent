@@ -1,15 +1,29 @@
-"""Compatibility shim. The real pipeline lives in ``agent_core.engine``.
+"""Compatibility shim + the single server-side pipeline.
 
 ``VibeOrchestrator`` keeps its Phase 1 constructor and ``run()`` signature so
-existing callers and tests keep working, but all work is delegated to
-``agent_core.engine.Engine`` — there is exactly one pipeline now.
+existing callers and tests keep working, delegating to agent_core's Engine.
+
+``run_pipeline`` is THE request pipeline used by POST /agent/run:
+ROUTE -> PLAN -> CODE -> CHECK -> VALIDATE -> SUMMARY, with a per-stage
+trace and no hidden stages.
 """
 
 from __future__ import annotations
 
+import json
+import py_compile
+import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
+
+from agent_core.coder import ALLOWED_TARGET_SUFFIXES, parse_coder_output, apply_file_edit
+from agent_core.run_state import RUNS_DIR_NAME
+from agent_core.staging import safe_target
+from ollama_client import TEMPERATURE_CODE, TEMPERATURE_PLAN, strip_think_blocks
+from sandbox import check_plausible_content
+from workspace_staging import WorkspaceStagingManager
 
 from agent_core.engine import (
     DEFAULT_MAX_LLM_CALLS,
@@ -116,3 +130,440 @@ class VibeOrchestrator:
             llm_calls=report.llm_calls,
             elapsed_seconds=report.elapsed_seconds,
         )
+
+
+# ===========================================================================
+# THE request pipeline: ROUTE -> PLAN -> CODE -> CHECK -> VALIDATE -> SUMMARY
+# ===========================================================================
+
+LANGUAGE_BY_SUFFIX = {
+    ".py": "python", ".html": "html", ".css": "css",
+    ".js": "javascript", ".json": "json", ".md": "markdown",
+}
+
+QUESTION_HINTS = (
+    "what ", "why ", "how ", "explain", "difference", " vs ", " versus ",
+    "who ", "when ", "which ", "is it ", "are there", "can you explain",
+)
+CODE_HINTS = (
+    "create", "make", "build", "write", "implement", "add", "fix",
+    "refactor", "generate", "update", "modify", "site", "page", "app",
+    "script", "function", "endpoint", "html", "css", "blog",
+)
+PLACEHOLDER_STEMS = {"your_code", "example", "foo", "untitled", "file", "code", "test"}
+WEB_HINTS = ("html", "css", "website", "web page", "webpage", "site", "blog", "landing", "page")
+
+MAX_TASK_RETRIES = 2  # retries AFTER the first attempt
+VALIDATE_FILE_HEAD_LINES = 60
+
+
+def classify_request(user_request: str) -> str:
+    """Rules-only ROUTE: QUESTION or CODE_TASK (no LLM involved)."""
+    r = user_request.strip().lower()
+    has_ext = bool(re.search(r"\b\w+\.(py|html?|css|js|json|md|txt)\b", r))
+    code = any(h in r for h in CODE_HINTS)
+    if code or has_ext:
+        return "CODE_TASK"
+    if any(h in r for h in QUESTION_HINTS) or r.endswith("?"):
+        return "QUESTION"
+    return "CODE_TASK"
+
+
+def _language_of(path: str) -> str:
+    return LANGUAGE_BY_SUFFIX.get(Path(path).suffix.lower(), "text")
+
+
+def _valid_plan_task(task: dict[str, Any]) -> str | None:
+    """Return a rejection reason, or None when the plan task is acceptable."""
+    path = str(task.get("path", "")).strip().replace("\\", "/")
+    desc = str(task.get("description", "")).strip()
+    if not path:
+        return "empty path"
+    stem = Path(path).stem.lower()
+    if stem in PLACEHOLDER_STEMS:
+        return f"placeholder filename: {path}"
+    suffix = Path(path).suffix.lower()
+    if suffix not in ALLOWED_TARGET_SUFFIXES | {".json", ".md"}:
+        return f"unsupported file type: {path}"
+    if len(desc.split()) < 8:
+        return f"description under 8 words: {desc!r}"
+    # Extension/language mismatch: description names a DIFFERENT language.
+    lang_words = {".html": ("html",), ".css": ("css",), ".js": ("javascript", "js"), ".py": ("python",)}
+    mentioned = {lang for words in lang_words.values() for lang in words if f" {lang} " in f" {desc.lower()} "}
+    own = set(lang_words.get(suffix, ()))
+    if mentioned and not (mentioned & own):
+        return f"extension/language mismatch: {path} vs {sorted(mentioned)}"
+    return None
+
+
+def _fallback_plan(user_request: str) -> list[dict[str, str]]:
+    """Deterministic plan when the planner fails validation twice."""
+    lower = user_request.lower()
+    if any(h in lower for h in WEB_HINTS):
+        return [
+            {"path": "index.html", "action": "create",
+             "description": "Main HTML5 page structure that links the stylesheet and script files and presents the content sections."},
+            {"path": "style.css", "action": "create",
+             "description": "Stylesheet with layout, typography, colors and responsive rules for the page structure."},
+            {"path": "script.js", "action": "create",
+             "description": "JavaScript providing the dynamic content and interactions requested for the page."},
+        ]
+    words = user_request.split()
+    desc = "Python implementation for the request: " + " ".join(words[:40])
+    if len(desc.split()) < 8:
+        desc += " with clear structure and entry point"
+    return [{"path": "app.py", "action": "create", "description": desc}]
+
+
+def _parse_plan_json(text: str) -> list[dict[str, Any]]:
+    """Extract a JSON task array from planner output (think already stripped)."""
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if not match:
+        return []
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [t for t in data if isinstance(t, dict)]
+
+
+def _extract_code(raw: str) -> str:
+    """Longest fenced block, or the stripped raw text when no fences exist."""
+    matches = re.findall(r"```(?:\w+)?\n(.*?)```", raw, re.DOTALL)
+    if matches:
+        return max(matches, key=len).rstrip() + "\n"
+    return raw.strip() + "\n"
+
+
+def _check_generated(rel_path: str, content: str) -> str | None:
+    """Per-file deterministic CHECK, in-process. Returns error or None.
+
+    Content problems return a string; an exception escaping this function is
+    an infra error (checker crashed) and aborts WITHOUT a coder retry.
+    """
+    suffix = Path(rel_path).suffix.lower()
+    if suffix == ".py":
+        import os
+        import tempfile
+
+        fd, tmp_name = tempfile.mkstemp(suffix=".py")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            # cfile=os.devnull keeps __pycache__ out of the workspace.
+            py_compile.compile(tmp_name, cfile=os.devnull, doraise=True)
+        except py_compile.PyCompileError as exc:
+            return f"py_compile failed: {exc.msg}"
+        finally:
+            Path(tmp_name).unlink(missing_ok=True)
+        return None
+    return check_plausible_content(rel_path, content)
+
+
+def _check_html_links(
+    rel_path: str, content: str, planned_paths: set[str], workspace: Path
+) -> str | None:
+    """Every local href/src must resolve to a planned or existing file."""
+    if Path(rel_path).suffix.lower() != ".html":
+        return None
+    bad_links: list[str] = []
+    for ref in re.findall(r'(?:href|src)="([^"]+)"', content):
+        if ref.startswith(("#", "mailto:", "data:")) or "://" in ref:
+            continue
+        ref_path = ref.split("#", 1)[0].split("?", 1)[0].strip()
+        if not ref_path:
+            continue
+        resolved = (Path(rel_path).parent / ref_path).as_posix().lstrip("./")
+        if resolved not in planned_paths and not (workspace / resolved).is_file():
+            bad_links.append(ref)
+    if bad_links:
+        return f"html links do not resolve to existing files: {bad_links}"
+    return None
+
+
+async def run_pipeline(
+    user_request: str,
+    workspace: str | Path,
+    *,
+    generate: Callable[..., Awaitable[str]],
+    planner_model: str,
+    coder_model: str,
+    unload: Callable[[str], Awaitable[None]] | None = None,
+) -> dict[str, Any]:
+    """ROUTE -> PLAN -> CODE -> CHECK -> VALIDATE -> SUMMARY.
+
+    ``generate(model, prompt, system=..., temperature=...) -> str`` is the
+    only LLM access (think-stripped by the caller's layer or stripped here).
+    Returns {summary, staged_files, failed_tasks, trace} for code tasks, or
+    {answer, trace} for questions.
+    """
+    workspace = Path(workspace).resolve()
+    staging = WorkspaceStagingManager(workspace)
+    trace: list[dict[str, Any]] = []
+
+    def record(stage: str, status: str, seconds: float, note: str = "") -> None:
+        trace.append({"stage": stage, "status": status,
+                      "seconds": round(seconds, 1), "note": note})
+
+    # ------------------------------------------------------------------ ROUTE
+    t0 = time.monotonic()
+    route = classify_request(user_request)
+    record("ROUTE", "ok", time.monotonic() - t0, route)
+
+    if route == "QUESTION":
+        t0 = time.monotonic()
+        raw = await generate(
+            coder_model,
+            "Answer concisely and accurately.\n\nQUESTION: " + user_request,
+            system="You are a precise technical assistant.",
+            temperature=TEMPERATURE_PLAN,
+        )
+        _, answer = strip_think_blocks(raw)
+        record("ANSWER", "ok", time.monotonic() - t0)
+        return {"answer": answer.strip(), "trace": trace}
+
+    # ------------------------------------------------------------------ PLAN
+    t0 = time.monotonic()
+    plan_prompt = (
+        "You are a software planner. Return ONLY a JSON array of tasks, each "
+        '{"path": "relative/file.ext", "action": "create"|"edit", '
+        '"description": "what to build, at least 8 words"}. '
+        "Use real filenames (no placeholders like your_code or example). "
+        "Every description must be at least 8 words and match the file's "
+        "language. No code, JSON only.\n\nREQUEST: " + user_request
+    )
+    tasks: list[dict[str, Any]] = []
+    last_rejects: list[str] = []
+    for plan_attempt in range(2):
+        prompt = plan_prompt
+        if last_rejects:
+            prompt += "\n\nPrevious plan was rejected: " + "; ".join(last_rejects)
+        raw = await generate(
+            planner_model, prompt,
+            system="You output only strict JSON task arrays.",
+            temperature=TEMPERATURE_PLAN,
+        )
+        _, clean = strip_think_blocks(raw)
+        candidates = _parse_plan_json(clean)
+        tasks, last_rejects = [], []
+        for candidate in candidates:
+            reason = _valid_plan_task(candidate)
+            if reason:
+                last_rejects.append(reason)
+            else:
+                tasks.append(
+                    {
+                        "path": str(candidate["path"]).strip().replace("\\", "/"),
+                        "action": str(candidate.get("action", "create")).lower(),
+                        "description": str(candidate["description"]).strip(),
+                    }
+                )
+        if tasks:
+            break
+        if plan_attempt == 0 and not last_rejects:
+            last_rejects = ["planner returned no parseable JSON task array"]
+    if not tasks:
+        tasks = _fallback_plan(user_request)
+        record("PLAN", "ok", time.monotonic() - t0,
+               f"deterministic fallback ({len(tasks)} tasks)")
+    else:
+        record("PLAN", "ok", time.monotonic() - t0, f"{len(tasks)} tasks")
+
+    planned_paths = {t["path"] for t in tasks}
+
+    # ------------------------------------------------------------------ CODE
+    t_code = time.monotonic()
+    generated: dict[str, str] = {}
+    failed_tasks: list[dict[str, str]] = []
+    check_seconds = 0.0
+    infra_error: str | None = None
+
+    for task in tasks:
+        path, desc = task["path"], task["description"]
+        language = _language_of(path)
+        extra = ""
+        if Path(path).name.lower() == "index.html":
+            links = [
+                p for p in ("style.css", "script.js") if p in planned_paths
+            ]
+            if links:
+                extra = (
+                    "\nThe HTML MUST reference "
+                    + " and ".join(links)
+                    + " with <link>/<script> tags using those exact filenames."
+                )
+        code_prompt = (
+            f"Implement exactly one file.\n"
+            f"ORIGINAL USER REQUEST: {user_request}\n"
+            f"PLANNED FILES: {', '.join(sorted(planned_paths))}\n"
+            f"TARGET FILE: {path}\n"
+            f"TASK: {desc}\n"
+            f"LANGUAGE: {language}\n"
+            f"Return ONLY the complete file contents inside one "
+            f"```{language} fenced block. No commentary.{extra}"
+        )
+        content: str | None = None
+        error: str | None = None
+        for attempt in range(1 + MAX_TASK_RETRIES):
+            prompt = code_prompt
+            if error:
+                prompt += (
+                    f"\n\nPREVIOUS ATTEMPT FAILED THIS CHECK:\n{error}\n"
+                    "Fix exactly this and return the full corrected file."
+                )
+            raw = await generate(
+                coder_model, prompt,
+                system=f"You output only complete {language} files in one fenced block.",
+                temperature=TEMPERATURE_CODE,
+            )
+            _, clean = strip_think_blocks(raw)
+            content = _extract_code(clean)
+
+            c0 = time.monotonic()
+            try:
+                error = _check_generated(path, content)
+            except Exception as exc:  # infra error: checker itself crashed
+                infra_error = f"CHECK infrastructure error on {path}: {exc}"
+                check_seconds += time.monotonic() - c0
+                break
+            check_seconds += time.monotonic() - c0
+            if error is None:
+                break
+
+        if infra_error:
+            failed_tasks.append({"path": path, "error": infra_error})
+            break  # abort: never retry coder on infra errors
+        if error is not None or content is None:
+            failed_tasks.append(
+                {"path": path, "error": error or "no content generated"}
+            )
+            continue
+        safe_target(workspace, path)  # raises on escape/protected
+        staging.stage_file(path, content)
+        generated[path] = content
+
+    # Cross-file CHECK: html links resolve against the FULL generated set
+    # (sibling files exist only after every task has been coded).
+    if not infra_error:
+        for name in [n for n in generated if n.endswith(".html")]:
+            link_error = _check_html_links(name, generated[name], planned_paths, workspace)
+            if link_error:
+                staging.get_staged_file_path(name).unlink(missing_ok=True)
+                generated.pop(name)
+                failed_tasks.append({"path": name, "error": link_error})
+
+    record("CODE", "ok" if generated else ("failed" if failed_tasks else "ok"),
+           time.monotonic() - t_code,
+           f"{len(generated)} coded, {len(failed_tasks)} failed")
+    record("CHECK", "failed" if (failed_tasks or infra_error) else "ok",
+           check_seconds,
+           infra_error or f"{len(generated)} passed, {len(failed_tasks)} failed")
+
+    # --------------------------------------------------------------- VALIDATE
+    validate_note = ""
+    validate_problems: list[str] = []
+    validator_summary = ""
+    t0 = time.monotonic()
+    validate_failed = False
+    if not generated:
+        record("VALIDATE", "skipped", 0.0, "nothing passed CHECK")
+    else:
+        try:
+            if unload is not None:
+                await unload(coder_model)
+            head_sections = []
+            for name, content in generated.items():
+                head = "\n".join(content.splitlines()[:VALIDATE_FILE_HEAD_LINES])
+                head_sections.append(f"FILE: {name}\n{head}")
+            validate_prompt = (
+                "Review whether the generated files satisfy the request. "
+                "Reply with ONLY JSON: "
+                '{"satisfies_request": true|false, "problems": ["..."], '
+                '"summary": "one sentence"}' + "\n\n"
+                f"REQUEST: {user_request}\n"
+                f"FILES: {', '.join(sorted(generated))}\n\n"
+                + "\n\n".join(head_sections)
+            )
+            raw = await generate(
+                planner_model, validate_prompt,
+                system="You are a strict reviewer outputting only JSON.",
+                temperature=TEMPERATURE_PLAN,
+            )
+            _, clean = strip_think_blocks(raw)
+            match = re.search(r"\{.*\}", clean, re.DOTALL)
+            data = json.loads(match.group(0)) if match else {}
+            validate_problems = [str(p) for p in data.get("problems", [])]
+            validator_summary = str(data.get("summary", ""))
+
+            if data.get("satisfies_request") is False:
+                # ONE fix pass through the coder, then re-run CHECK.
+                fix_prompt = (
+                    "Fix the reported problems. Return every corrected file as "
+                    "```FILE: path blocks with full contents.\n"
+                    f"PROBLEMS: {json.dumps(validate_problems)}\n"
+                    f"REQUEST: {user_request}\n\n"
+                    + "\n\n".join(
+                        f"FILE: {n}\n```\n{c}\n```" for n, c in generated.items()
+                    )
+                )
+                raw_fix = await generate(
+                    coder_model, fix_prompt,
+                    system="You output only corrected FILE blocks.",
+                    temperature=TEMPERATURE_CODE,
+                )
+                _, clean_fix = strip_think_blocks(raw_fix)
+                try:
+                    for file_edit in parse_coder_output(clean_fix):
+                        base = generated.get(file_edit.path)
+                        fixed = apply_file_edit(base, file_edit)
+                        fix_error = _check_generated(file_edit.path, fixed)
+                        if fix_error is None:
+                            staging.stage_file(file_edit.path, fixed)
+                            generated[file_edit.path] = fixed
+                        else:
+                            validate_problems.append(
+                                f"{file_edit.path}: fix failed CHECK ({fix_error})"
+                            )
+                except ValueError:
+                    validate_problems.append("fix pass returned unusable output")
+                validate_note = "fix pass applied" if not validate_problems else "problems remain"
+            else:
+                validate_note = "satisfies request"
+            record("VALIDATE", "ok", time.monotonic() - t0, validate_note)
+        except Exception as exc:
+            validate_failed = True
+            record("VALIDATE", "failed", time.monotonic() - t0, str(exc)[:300])
+
+    # ---------------------------------------------------------------- SUMMARY
+    t0 = time.monotonic()
+    what = validator_summary or f"Implementation for: {user_request[:200]}"
+    file_list = sorted(generated)
+    how_to_run = []
+    if any(f.endswith(".html") for f in file_list):
+        html_file = next(f for f in file_list if f.endswith(".html"))
+        how_to_run.append(f"open {html_file} in a browser")
+    if any(f.endswith(".py") for f in file_list):
+        py_file = next(f for f in file_list if f.endswith(".py"))
+        how_to_run.append(f"run: python {py_file}")
+    known_issues = list(validate_problems)
+    known_issues += [f"{t['path']}: {t['error']}" for t in failed_tasks]
+
+    summary_lines = [
+        ("UNVERIFIED — validation could not run. " if validate_failed else "") + what,
+        "",
+        "Files: " + (", ".join(file_list) if file_list else "(none passed CHECK)"),
+        "How to run: " + ("; ".join(how_to_run) if how_to_run else "see file contents"),
+        "Known issues: " + ("; ".join(known_issues) if known_issues else "none"),
+    ]
+    summary = "\n".join(summary_lines)
+    record("SUMMARY", "ok", time.monotonic() - t0,
+           "UNVERIFIED" if validate_failed else "")
+
+    return {
+        "summary": summary,
+        "staged_files": file_list,
+        "failed_tasks": failed_tasks,
+        "trace": trace,
+    }

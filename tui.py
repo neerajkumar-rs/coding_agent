@@ -806,49 +806,53 @@ async def submit(request_text: str, workspace_dir: str) -> None:
         await _submit_locked(request_text, workspace_dir)
 
 
+EXPECTED_STAGES = ["ROUTE", "PLAN", "CODE", "CHECK", "VALIDATE", "SUMMARY"]
+
+
+def _print_trace(trace: list[dict]) -> None:
+    """One line: 'ROUTE ok 0.0s | PLAN ok 12.3s | ...'.
+    A stage missing from the trace prints as SKIPPED in red — a missing
+    stage can never go unnoticed."""
+    parts: list[str] = []
+    seen = {t.get("stage") for t in trace}
+    for entry in trace:
+        stage = entry.get("stage", "?")
+        status = entry.get("status", "ok")
+        seconds = entry.get("seconds", 0.0)
+        color = "bright_green" if status == "ok" else ("yellow" if status == "skipped" else "red")
+        parts.append(f"[{color}]{stage} {status} {seconds:.1f}s[/{color}]")
+    for stage in EXPECTED_STAGES:
+        if stage not in seen:
+            parts.append(f"[red]{stage} SKIPPED[/red]")
+    console.print(" | ".join(parts))
+
+
 async def _submit_locked(request_text: str, workspace_dir: str) -> None:
     try:
         # ── Initialise workspace context ──────────────────────────────────
         await post_json(INIT_URL, {"root_path": workspace_dir})
 
-        # ── Plan ──────────────────────────────────────────────────────────
-        console.print("[dim]⏳ Planner (deepseek-r1:1.5b) thinking...[/dim]")
-        with Progress(SpinnerColumn(), TextColumn("[dim]Planning..."), transient=True, console=console) as p:
+        # ── ONE call: ROUTE -> PLAN -> CODE -> CHECK -> VALIDATE -> SUMMARY ──
+        console.print("[dim]⏳ Running pipeline (ROUTE → PLAN → CODE → CHECK → VALIDATE → SUMMARY)...[/dim]")
+        with Progress(SpinnerColumn(), TextColumn("[dim]Pipeline running..."), transient=True, console=console) as p:
             p.add_task("", total=None)
-            plan = await post_json(PLAN_URL, {"prompt": request_text, "workspace_dir": workspace_dir})
+            result = await post_json(RUN_URL, {"prompt": request_text, "workspace_dir": workspace_dir})
 
-        tasks = plan.get("tasks", [])
-        console.print(f"[bold bright_cyan]>> {len(tasks)} task(s) planned[/bold bright_cyan]  "
-                      f"[dim](model: {plan.get('model_used', '?')})[/dim]")
-        for t in tasks:
-            console.print(f"  [bright_cyan]{t['id']}[/bright_cyan] [{t['action'].upper()}] "
-                          f"[white]{t['file']}[/white] — {t['description']}")
+        # 1. Trace
+        _print_trace(result.get("trace", []))
 
-        # ── Step through each task ────────────────────────────────────────
-        for t in tasks:
-            console.print(f"\n[dim]⏳ Coder executing task {t['id']}: {t['file']}...[/dim]")
-            with Progress(SpinnerColumn(), TextColumn(f"[dim]Task {t['id']}..."), transient=True, console=console) as p:
-                p.add_task("", total=None)
-                step = await post_json(STEP_URL, {"task": t, "workspace_dir": workspace_dir})
+        # 2a. Question path: print the answer and stop.
+        if "answer" in result:
+            console.print(Panel(result["answer"], title="Answer", border_style="bright_green"))
+            return
 
-            diag    = step.get("diagnostic", {})
-            success = diag.get("success", False)
-            color   = "bright_green" if success else "bright_red"
-            icon    = "OK" if success else "FAIL"
-            console.print(
-                f"  [{color}]{icon} Task {t['id']} — sandbox exit {diag.get('exit_code', '?')} "
-                f"({diag.get('duration_s', 0):.1f}s)[/{color}]"
-            )
-            if not success:
-                console.print(
-                    Panel(
-                        (diag.get("stderr") or diag.get("stdout") or "no output")[:600],
-                        title=f"Sandbox error — {t['file']}",
-                        border_style="red",
-                    )
-                )
+        # 2b. Summary
+        console.print(Panel(result.get("summary", "(no summary)"),
+                            title="Summary", border_style="bright_blue"))
+        for failed in result.get("failed_tasks", []):
+            console.print(f"[red]FAILED: {failed['path']} — {failed['error']}[/red]")
 
-        # ── Diff review ───────────────────────────────────────────────────
+        # 3. Staged diffs (only files that passed CHECK are staged)
         diff_status = await post_json(STATUS_URL, {"workspace_dir": workspace_dir})
         if diff_status.get("has_changes"):  # noqa: E501
             n = diff_status["staged_count"]
@@ -867,9 +871,10 @@ async def _submit_locked(request_text: str, workspace_dir: str) -> None:
                         border_style="yellow",
                     )
                 )
+            # 4. Deploy prompt — default N
             answer = Prompt.ask(
                 "[bold bright_green]Deploy to workspace?[/bold bright_green]",
-                choices=["y", "n"], default="y",
+                choices=["y", "n"], default="n",
             )
             if answer == "y":
                 res = await post_json(DEPLOY_URL, {"workspace_dir": workspace_dir})
@@ -911,54 +916,8 @@ def _render_run_table(tasks: dict[str, dict], status: str, llm_calls: int) -> Ta
 
 
 async def run_autonomous(request_text: str, workspace_dir: str) -> None:
-    """POST /agent/run while live-rendering the task table from run state."""
-    await post_json(INIT_URL, {"root_path": workspace_dir})
-
-    run_task = asyncio.create_task(
-        post_json(RUN_URL, {"prompt": request_text, "workspace_dir": workspace_dir})
-    )
-
-    tasks: dict[str, dict] = {}
-    run_status = "running"
-    llm_calls = 0
-    with Live(_render_run_table(tasks, run_status, llm_calls),
-              console=console, refresh_per_second=2) as live:
-        while not run_task.done():
-            try:
-                state_data = await asyncio.to_thread(
-                    _read_latest_run_state, workspace_dir
-                )
-                if state_data:
-                    for t in state_data.get("tasks", []):
-                        key = str(t.get("number", "?"))
-                        tasks[key] = {
-                            "name": t.get("name", ""),
-                            "status": t.get("status", "pending"),
-                            "attempts": t.get("attempts", 0),
-                        }
-                    run_status = state_data.get("status", run_status)
-                    llm_calls = state_data.get("llm_calls", llm_calls)
-                    live.update(_render_run_table(tasks, run_status, llm_calls))
-            except Exception:
-                pass
-            await asyncio.sleep(1)
-
-    result = run_task.result()
-    run_status = result.get("status", "unknown")
-    llm_calls = result.get("llm_calls", llm_calls)
-    live.update(_render_run_table(tasks, run_status, llm_calls))
-
-    color = "bright_green" if run_status == "completed" else "bright_red"
-    console.print(
-        f"\n[{color}]Run {run_status}[/{color}] — "
-        f"files: {result.get('files', [])}, "
-        f"deployed: {result.get('deployed_files', [])}, "
-        f"elapsed: {result.get('elapsed_seconds', 0)}s"
-    )
-    for err in result.get("errors", [])[:3]:
-        console.print(Panel(err, title="error", border_style="red"))
-    for nh in result.get("needs_human", []):
-        console.print(f"[magenta]needs human: {nh}[/magenta]")
+    """/run — same single /agent/run pipeline as a typed request."""
+    await submit(request_text, workspace_dir)
 
 
 def _read_latest_run_state(workspace_dir: str) -> dict | None:
