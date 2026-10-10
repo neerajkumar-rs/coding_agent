@@ -1,0 +1,672 @@
+"""Single-command launcher: kills any stray Ollama/FastAPI, owns both as child
+processes, runs a safety preflight, then opens the interactive chat TUI.
+
+Usage:
+    python tui.py
+
+On exit (Ctrl-C or /quit) all child processes are terminated.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import atexit
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import NamedTuple
+
+try:
+    from rich import box
+    from rich.console import Console
+    from rich.json import JSON
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from rich.prompt import Prompt
+    from rich.table import Table
+    from rich.text import Text
+except ImportError as exc:
+    raise SystemExit("Run:  pip install rich") from exc
+
+
+# ---------------------------------------------------------------------------
+# Config — override via environment variables
+# ---------------------------------------------------------------------------
+FASTAPI_HOST = "127.0.0.1"
+FASTAPI_PORT = int(os.getenv("VIBE_PORT", "8000"))
+FASTAPI_BASE = f"http://{FASTAPI_HOST}:{FASTAPI_PORT}"
+
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "127.0.0.1")
+OLLAMA_PORT = int(os.getenv("OLLAMA_PORT", "11434"))
+OLLAMA_BASE = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}"
+
+OLLAMA_EXE = shutil.which("ollama") or str(
+    Path.home() / "AppData" / "Local" / "Programs" / "Ollama" / "ollama.exe"
+)
+
+REQUIRED_MODELS = [
+    "deepseek-r1:1.5b",   # planner  — resolved via fuzzy match
+    "qwen2.5-coder:3b",   # coder    — exact or fuzzy
+]
+
+HEALTH_URL      = FASTAPI_BASE + "/health"
+OLLAMA_TAGS_URL = OLLAMA_BASE  + "/api/tags"
+PLAN_URL        = FASTAPI_BASE + "/agent/plan"
+STEP_URL        = FASTAPI_BASE + "/agent/step"
+STATUS_URL      = FASTAPI_BASE + "/workspace/status"
+DEPLOY_URL      = FASTAPI_BASE + "/agent/deploy"
+INIT_URL        = FASTAPI_BASE + "/workspace/init"
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+LOG_DIR = PROJECT_ROOT / ".agent_logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+console = Console()
+
+# Registry of child processes owned by this TUI session
+_owned_procs: list[subprocess.Popen] = []
+_log_handles: list               = []
+_shutdown_done                   = False
+
+
+# ---------------------------------------------------------------------------
+# Process utilities
+# ---------------------------------------------------------------------------
+
+def _pids_on_port(port: int) -> list[int]:
+    """Return PIDs listening on *port* (Windows netstat)."""
+    try:
+        out = subprocess.check_output(
+            ["netstat", "-ano", "-p", "tcp"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5,
+        )
+    except Exception:
+        return []
+    pids: set[int] = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0].upper() == "TCP":
+            local = parts[1].rsplit(":", 1)
+            if len(local) == 2 and local[1] == str(port) and parts[-1].isdigit():
+                pids.add(int(parts[-1]))
+    return sorted(pids)
+
+
+def _kill_port(port: int, label: str) -> None:
+    """Kill every foreign PID on *port*."""
+    own = os.getpid()
+    victims = [p for p in _pids_on_port(port) if p != own]
+    if not victims:
+        return
+    console.print(f"  [yellow]!! Killing {len(victims)} stray {label} process(es) on :{port} -> PIDs {victims}[/yellow]")
+    for pid in victims:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {pid} -Force"],
+            capture_output=True, check=False,
+        )
+    # Brief wait for port to free
+    for _ in range(10):
+        if not _pids_on_port(port):
+            break
+        time.sleep(0.3)
+
+
+def _kill_proc_by_name(exe_name: str) -> None:
+    """Kill all processes whose image name matches *exe_name* (case-insensitive)."""
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FO", "CSV", "/NH"], text=True, stderr=subprocess.DEVNULL, timeout=5
+        )
+    except Exception:
+        return
+    own = os.getpid()
+    for line in out.splitlines():
+        parts = [p.strip('"') for p in line.split('","')]
+        if len(parts) < 2:
+            continue
+        img, pid_str = parts[0], parts[1]
+        if img.lower() == exe_name.lower():
+            try:
+                pid = int(pid_str)
+            except ValueError:
+                continue
+            if pid == own:
+                continue
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {pid} -Force"],
+                capture_output=True, check=False,
+            )
+
+
+def _spawn(args: list[str], log_name: str, **popen_kwargs) -> subprocess.Popen:
+    """Spawn a child process owned by this TUI and redirect its output to a log file."""
+    log_path = LOG_DIR / log_name
+    fh = log_path.open("a", encoding="utf-8")
+    _log_handles.append(fh)
+    proc = subprocess.Popen(
+        args,
+        stdout=fh,
+        stderr=subprocess.STDOUT,
+        cwd=str(PROJECT_ROOT),
+        env=os.environ.copy(),
+        **popen_kwargs,
+    )
+    _owned_procs.append(proc)
+    return proc
+
+
+def _wait_for_http(url: str, timeout: float = 30.0, interval: float = 0.5) -> bool:
+    """Poll *url* until it returns HTTP 200 or *timeout* seconds elapse."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=2) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(interval)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Shutdown
+# ---------------------------------------------------------------------------
+
+def _shutdown(reason: str = "exit") -> None:
+    global _shutdown_done
+    if _shutdown_done:
+        return
+    _shutdown_done = True
+    console.print(f"\n[dim][STOP] Shutdown ({reason}) -- terminating child processes...[/dim]")
+    for proc in _owned_procs:
+        if proc.poll() is None:
+            proc.terminate()
+    for proc in _owned_procs:
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {proc.pid} -Force"],
+                    capture_output=True, check=False,
+                )
+    _owned_procs.clear()
+    for fh in _log_handles:
+        try:
+            fh.close()
+        except Exception:
+            pass
+    _log_handles.clear()
+
+
+atexit.register(_shutdown, "atexit")
+
+try:
+    signal.signal(signal.SIGTERM, lambda *_: (_shutdown("SIGTERM"), sys.exit(0)))
+except (OSError, ValueError):
+    pass  # Not supported on all platforms / in threads
+
+
+# ---------------------------------------------------------------------------
+# Preflight safety checks
+# ---------------------------------------------------------------------------
+
+class CheckResult(NamedTuple):
+    label: str
+    ok: bool
+    detail: str
+
+
+def _check_ollama_binary() -> CheckResult:
+    if OLLAMA_EXE and Path(OLLAMA_EXE).exists():
+        return CheckResult("Ollama binary", True, OLLAMA_EXE)
+    found = shutil.which("ollama")
+    if found:
+        return CheckResult("Ollama binary", True, found)
+    return CheckResult("Ollama binary", False, "not found on PATH — install from https://ollama.ai")
+
+
+def _check_ollama_running() -> CheckResult:
+    try:
+        with urllib.request.urlopen(OLLAMA_TAGS_URL, timeout=3) as r:
+            if r.status == 200:
+                return CheckResult("Ollama API", True, OLLAMA_TAGS_URL)
+    except Exception:
+        pass
+    return CheckResult("Ollama API", False, f"{OLLAMA_TAGS_URL} not responding")
+
+
+def _check_required_models() -> CheckResult:
+    try:
+        with urllib.request.urlopen(OLLAMA_TAGS_URL, timeout=5) as r:
+            data = json.loads(r.read())
+    except Exception as exc:
+        return CheckResult("Required models", False, f"cannot query tags: {exc}")
+
+    installed = [m.get("name", "") for m in data.get("models", [])]
+    missing: list[str] = []
+    for req in REQUIRED_MODELS:
+        # fuzzy: req prefix must appear in any installed name
+        req_base = req.split(":")[0].lower()
+        if not any(req_base in m.lower() for m in installed):
+            missing.append(req)
+
+    if missing:
+        pull_cmds = "  ".join(f"ollama pull {m}" for m in missing)
+        return CheckResult(
+            "Required models", False,
+            f"Missing: {missing}\n     Pull with:  {pull_cmds}"
+        )
+    return CheckResult("Required models", True, f"installed: {installed}")
+
+
+def _check_fastapi_port_free() -> CheckResult:
+    pids = _pids_on_port(FASTAPI_PORT)
+    if pids:
+        return CheckResult(
+            f"Port {FASTAPI_PORT} (FastAPI)", False,
+            f"occupied by PIDs {pids} — will be killed"
+        )
+    return CheckResult(f"Port {FASTAPI_PORT} (FastAPI)", True, "free")
+
+
+def _run_preflight_table() -> bool:
+    """Run all checks, render a Rich table, return True only if all pass."""
+    checks = [
+        _check_ollama_binary(),
+        _check_ollama_running(),
+        _check_required_models(),
+        _check_fastapi_port_free(),
+    ]
+    table = Table(title="Preflight checks", box=box.ROUNDED, border_style="bright_blue")
+    table.add_column("Check", style="bright_cyan", width=26)
+    table.add_column("Status", width=8)
+    table.add_column("Detail", style="dim")
+
+    all_ok = True
+    for c in checks:
+        icon   = "[bold bright_green]  PASS[/bold bright_green]" if c.ok else "[bold red]  FAIL[/bold red]"
+        detail = c.detail if c.ok else f"[red]{c.detail}[/red]"
+        table.add_row(c.label, icon, detail)
+        if not c.ok:
+            all_ok = False
+
+    console.print(table)
+    return all_ok
+
+
+# ---------------------------------------------------------------------------
+# Service startup
+# ---------------------------------------------------------------------------
+
+def _start_ollama() -> subprocess.Popen:
+    exe = OLLAMA_EXE if (OLLAMA_EXE and Path(OLLAMA_EXE).exists()) else shutil.which("ollama")
+    if not exe:
+        raise RuntimeError("ollama executable not found — cannot start")
+    env = os.environ.copy()
+    env["OLLAMA_HOST"] = f"{OLLAMA_HOST}:{OLLAMA_PORT}"
+    console.print(f"  [dim]→ ollama serve  (port {OLLAMA_PORT})[/dim]")
+    return _spawn([exe, "serve"], "ollama_service.log", env=env)
+
+
+def _start_fastapi() -> subprocess.Popen:
+    console.print(f"  [dim]→ uvicorn main:app  (port {FASTAPI_PORT})[/dim]")
+    return _spawn(
+        [sys.executable, "-m", "uvicorn", "main:app",
+         "--host", FASTAPI_HOST, "--port", str(FASTAPI_PORT)],
+        "fastapi_service.log",
+    )
+
+
+def start_all_services() -> None:
+    """Kill stray processes, then spawn Ollama + FastAPI as owned children."""
+    console.print("\n[bold bright_cyan]Starting services...[/bold bright_cyan]")
+
+    # 1. Kill any orphan Ollama instances
+    _kill_port(OLLAMA_PORT, "Ollama")
+    _kill_proc_by_name("ollama.exe")
+
+    # 2. Kill anything sitting on the FastAPI port
+    _kill_port(FASTAPI_PORT, "FastAPI")
+
+    # 3. Start Ollama as child process
+    _start_ollama()
+
+    # 4. Wait for Ollama to accept connections
+    with Progress(
+        SpinnerColumn(), TextColumn("[dim]Waiting for Ollama API..."), transient=True, console=console
+    ) as prog:
+        prog.add_task("", total=None)
+        ok = _wait_for_http(OLLAMA_TAGS_URL, timeout=20)
+    if not ok:
+        _shutdown("Ollama failed to start")
+        raise RuntimeError("Ollama did not respond within 20 s")
+    console.print("  [bright_green]✓ Ollama API ready[/bright_green]")
+
+    # 5. Start FastAPI as child process
+    _start_fastapi()
+
+    # 6. Wait for FastAPI
+    with Progress(
+        SpinnerColumn(), TextColumn("[dim]Waiting for FastAPI..."), transient=True, console=console
+    ) as prog:
+        prog.add_task("", total=None)
+        ok = _wait_for_http(HEALTH_URL, timeout=20)
+    if not ok:
+        _shutdown("FastAPI failed to start")
+        raise RuntimeError("FastAPI did not respond within 20 s")
+    console.print("  [bright_green]✓ FastAPI controller ready[/bright_green]")
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+def _http_get(url: str, timeout: float = 5) -> dict:
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def _http_post(url: str, payload: dict, timeout: float = 600) -> dict:
+    data = json.dumps(payload).encode()
+    req  = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+async def get_json(url: str) -> dict:
+    return await asyncio.to_thread(_http_get, url)
+
+
+async def post_json(url: str, payload: dict) -> dict:
+    return await asyncio.to_thread(_http_post, url, payload)
+
+
+# ---------------------------------------------------------------------------
+# Banner & UI helpers
+# ---------------------------------------------------------------------------
+
+def show_banner() -> None:
+    console.print(
+        Panel.fit(
+            "[bold bright_cyan]OLLAMA MASTER CONTROLLER[/bold bright_cyan]\n"
+            "[bright_magenta]Sequential VRAM Fencing | RTX 3050 4 GB ceiling[/bright_magenta]\n"
+            "[dim]deepseek-r1:1.5b (Planner)  |  qwen2.5-coder:3b (Coder)[/dim]\n"
+            "[dim]All services owned by this process -- Ctrl-C kills everything[/dim]",
+            border_style="bright_blue",
+            box=box.DOUBLE,
+        )
+    )
+
+
+def display_workspace(path: str) -> str:
+    resolved = str(Path(path).expanduser().resolve())
+    console.print(
+        Panel(
+            f"[bold bright_cyan]Active Workspace[/bold bright_cyan]\n"
+            f"[white]{resolved}[/white]\n"
+            "[dim]Generated code → .agent_staging/ · deployed on /deploy[/dim]",
+            border_style="bright_cyan",
+        )
+    )
+    return resolved
+
+
+def show_help() -> None:
+    console.print(
+        Panel(
+            "/help        show commands\n"
+            "/status      show service health + staged diff\n"
+            "/workspace   change the active workspace path\n"
+            "/deploy      push staged files into active workspace\n"
+            "/logs        tail planner · coder · sandbox logs\n"
+            "/models      list installed Ollama models\n"
+            "/clear       clear screen\n"
+            "/quit        stop all services and exit",
+            title="Commands",
+            border_style="bright_cyan",
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Submit pipeline
+# ---------------------------------------------------------------------------
+
+async def submit(request_text: str, workspace_dir: str) -> None:
+    try:
+        # ── Initialise workspace context ──────────────────────────────────
+        await post_json(INIT_URL, {"root_path": workspace_dir})
+
+        # ── Plan ──────────────────────────────────────────────────────────
+        console.print("[dim]⏳ Planner (deepseek-r1:1.5b) thinking...[/dim]")
+        with Progress(SpinnerColumn(), TextColumn("[dim]Planning..."), transient=True, console=console) as p:
+            p.add_task("", total=None)
+            plan = await post_json(PLAN_URL, {"prompt": request_text, "workspace_dir": workspace_dir})
+
+        tasks = plan.get("tasks", [])
+        console.print(f"[bold bright_cyan]>> {len(tasks)} task(s) planned[/bold bright_cyan]  "
+                      f"[dim](model: {plan.get('model_used', '?')})[/dim]")
+        for t in tasks:
+            console.print(f"  [bright_cyan]{t['id']}[/bright_cyan] [{t['action'].upper()}] "
+                          f"[white]{t['file']}[/white] — {t['description']}")
+
+        # ── Step through each task ────────────────────────────────────────
+        for t in tasks:
+            console.print(f"\n[dim]⏳ Coder executing task {t['id']}: {t['file']}...[/dim]")
+            with Progress(SpinnerColumn(), TextColumn(f"[dim]Task {t['id']}..."), transient=True, console=console) as p:
+                p.add_task("", total=None)
+                step = await post_json(STEP_URL, {"task_id": t["id"], "workspace_dir": workspace_dir})
+
+            diag    = step.get("diagnostic", {})
+            success = diag.get("success", False)
+            color   = "bright_green" if success else "bright_red"
+            icon    = "OK" if success else "FAIL"
+            console.print(
+                f"  [{color}]{icon} Task {t['id']} — sandbox exit {diag.get('exit_code', '?')} "
+                f"({diag.get('duration_s', 0):.1f}s)[/{color}]"
+            )
+            if not success:
+                console.print(
+                    Panel(
+                        (diag.get("stderr") or diag.get("stdout") or "no output")[:600],
+                        title=f"Sandbox error — {t['file']}",
+                        border_style="red",
+                    )
+                )
+
+        # ── Diff review ───────────────────────────────────────────────────
+        diff_status = await post_json(STATUS_URL, {"workspace_dir": workspace_dir})
+        if diff_status.get("has_changes"):  # noqa: E501
+            n = diff_status["staged_count"]
+            a = diff_status["total_additions"]
+            d = diff_status["total_deletions"]
+            console.print(
+                f"\n[yellow]STAGED: {n} file(s)  "
+                f"[bright_green]+{a}[/bright_green] / [red]-{d}[/red][/yellow]"
+            )
+            for diff_obj in diff_status.get("diffs", []):
+                console.print(
+                    Panel(
+                        diff_obj["diff"][:2000] or "(binary / empty diff)",
+                        title=f"[{'bright_green' if diff_obj['action']=='create' else 'yellow'}]"
+                              f"{diff_obj['action'].upper()}  {diff_obj['file']}[/]",
+                        border_style="yellow",
+                    )
+                )
+            answer = Prompt.ask(
+                "[bold bright_green]Deploy to workspace?[/bold bright_green]",
+                choices=["y", "n"], default="y",
+            )
+            if answer == "y":
+                res = await post_json(DEPLOY_URL, {"workspace_dir": workspace_dir})
+                console.print(f"[bold bright_green]DEPLOYED: {res.get('message')}[/bold bright_green]")
+                for f in res.get("deployed_files", []):
+                    console.print(f"  [dim]↳ {f}[/dim]")
+        else:
+            console.print("[dim]No staged changes.[/dim]")
+
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")
+        console.print(f"[bold red]HTTP {exc.code}:[/bold red] {body[:400]}")
+    except Exception as exc:
+        console.print(f"[bold red]Pipeline error:[/bold red] {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Main TUI loop
+# ---------------------------------------------------------------------------
+
+async def main() -> None:
+    show_banner()
+
+    # ── Step 1: preflight ─────────────────────────────────────────────────
+    console.print("\n[bold bright_cyan]── Preflight checks ──[/bold bright_cyan]")
+    preflight_ok = _run_preflight_table()
+    if not preflight_ok:
+        fatal = [c for c in [
+            _check_ollama_binary(),
+            _check_required_models(),
+        ] if not c.ok]
+        if fatal:
+            console.print(
+                "[bold red]Fatal preflight failure — fix the issues above and retry.[/bold red]"
+            )
+            return
+        console.print("[yellow]Non-fatal failures — continuing with service startup...[/yellow]")
+
+    # ── Step 2: start services ────────────────────────────────────────────
+    try:
+        start_all_services()
+    except RuntimeError as exc:
+        console.print(f"[bold red]Service startup failed:[/bold red] {exc}")
+        return
+
+    # ── Step 3: post-startup health table ─────────────────────────────────
+    console.print()
+    table = Table(title="Service health", box=box.ROUNDED, border_style="bright_blue")
+    table.add_column("Service",  style="bright_cyan", width=24)
+    table.add_column("PID",      width=8)
+    table.add_column("Status",   width=10)
+    table.add_column("Endpoint", style="dim")
+
+    ollama_proc  = _owned_procs[0] if len(_owned_procs) > 0 else None
+    fastapi_proc = _owned_procs[1] if len(_owned_procs) > 1 else None
+
+    for label, proc, url, port in [
+        ("Ollama serve",    ollama_proc,  OLLAMA_TAGS_URL, OLLAMA_PORT),
+        ("FastAPI ctrl",    fastapi_proc, HEALTH_URL,      FASTAPI_PORT),
+    ]:
+        pid_str = str(proc.pid) if proc else "—"
+        try:
+            _http_get(url, timeout=3)
+            status = "[bright_green]READY[/bright_green]"
+        except Exception:
+            status = "[red]OFFLINE[/red]"
+        table.add_row(label, pid_str, status, url)
+
+    console.print(table)
+    console.print(
+        Panel(
+            "[bold bright_green]All services running under this process tree.[/bold bright_green]\n"
+            "[dim]Ctrl-C or /quit will terminate Ollama + FastAPI cleanly.[/dim]",
+            border_style="bright_green",
+        )
+    )
+
+    # ── Step 4: check required models are actually present ─────────────────
+    try:
+        tags_data = _http_get(OLLAMA_TAGS_URL)
+        installed = [m.get("name", "") for m in tags_data.get("models", [])]
+        missing   = [
+            r for r in REQUIRED_MODELS
+            if not any(r.split(":")[0].lower() in m.lower() for m in installed)
+        ]
+        if missing:
+            console.print(
+                Panel(
+                    "[yellow]The following models are not pulled yet:[/yellow]\n"
+                    + "\n".join(f"  ollama pull {m}" for m in missing),
+                    border_style="yellow",
+                    title="⚠  Missing models",
+                )
+            )
+    except Exception:
+        pass
+
+    # ── Step 5: interactive loop ───────────────────────────────────────────
+    workspace = display_workspace(str(PROJECT_ROOT))
+    console.print("[dim]Type /help for commands. Enter a coding request to begin.[/dim]")
+
+    try:
+        while True:
+            text    = Prompt.ask("\n[bold bright_green]you[/bold bright_green]")
+            command = text.strip().lower()
+
+            if command in {"/quit", "/exit", "q"}:
+                break
+
+            elif command == "/help":
+                show_help()
+
+            elif command == "/clear":
+                console.clear()
+                show_banner()
+
+            elif command == "/workspace":
+                workspace = Prompt.ask("New workspace path", default=workspace).strip().strip('"')
+                workspace = display_workspace(workspace)
+
+            elif command == "/models":
+                try:
+                    data   = await get_json(OLLAMA_TAGS_URL)
+                    models = [m.get("name", "") for m in data.get("models", [])]
+                    console.print(Panel("\n".join(models) or "(none)", title="Installed Ollama models", border_style="bright_blue"))
+                except Exception as exc:
+                    console.print(f"[red]Could not list models: {exc}[/red]")
+
+            elif command == "/status":
+                try:
+                    health = await get_json(HEALTH_URL)
+                    console.print(JSON(json.dumps(health)))
+                    diff   = await post_json(STATUS_URL, {"workspace_dir": workspace})
+                    console.print(JSON(json.dumps({k: v for k, v in diff.items() if k != "diffs"})))
+                except Exception as exc:
+                    console.print(f"[red]{exc}[/red]")
+
+            elif command == "/deploy":
+                try:
+                    res = await post_json(DEPLOY_URL, {"workspace_dir": workspace})
+                    console.print(JSON(json.dumps(res)))
+                except Exception as exc:
+                    console.print(f"[red]{exc}[/red]")
+
+            elif command == "/logs":
+                for log_file in ("planner.log", "coder.log", "sandbox.log",
+                                 "ollama_service.log", "fastapi_service.log"):
+                    p = LOG_DIR / log_file
+                    if p.exists():
+                        tail = p.read_text(encoding="utf-8", errors="replace")[-1500:]
+                        console.print(Panel(tail, title=log_file, border_style="bright_blue"))
+
+            elif text.strip():
+                console.print(Panel(text, title="[bright_green]you[/bright_green]", border_style="bright_green"))
+                await submit(text, workspace)
+
+    except KeyboardInterrupt:
+        console.print("\n[dim]Keyboard interrupt received.[/dim]")
+    finally:
+        _shutdown("TUI closed")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
