@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -47,6 +48,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("master_controller")
 
+LANGUAGE_BY_SUFFIX = {
+    ".py": "python",
+    ".html": "html",
+    ".css": "css",
+    ".js": "javascript",
+    ".json": "json",
+    ".md": "markdown",
+    ".txt": "text",
+}
+
 app = FastAPI(
     title="Local LLM Master Controller",
     description="High-performance deterministic supervisor for local Ollama token-efficient agentic workflows.",
@@ -75,6 +86,15 @@ class ControllerState:
         self.task_queue.clear()
         self.executed_task_ids.clear()
         logger.info(f"Workspace rebound to: {self.workspace_root}")
+
+    def ensure_workspace(self, root_path: str | Path | None) -> None:
+        """Rebind ONLY when the resolved path actually differs — sending the
+        same workspace_dir on consecutive calls must NOT wipe the task queue."""
+        if root_path is None:
+            return
+        resolved = Path(str(root_path).strip().strip('"')).resolve()
+        if resolved != self.workspace_root:
+            self.rebind_workspace(resolved)
 
 
 state = ControllerState()
@@ -147,13 +167,28 @@ def extract_think_and_content(raw_text: str) -> tuple[str, str]:
     return strip_think_blocks(raw_text)
 
 
+SOURCE_SUFFIXES = {".py", ".html", ".css", ".js", ".json", ".md"}
+
+
 def parse_tasks_json(raw_text: str) -> list[dict[str, Any]]:
-    """Extract and strictly validate task queue matching the required schema."""
+    """Extract and strictly validate task queue matching the required schema.
+
+    Tasks whose target is not a source file type (tasks.md, summary.txt,
+    taskN_code.txt, images, etc.) are rejected — the planner never plans
+    around leftover junk artifacts.
+    """
     _, content = extract_think_and_content(raw_text)
 
     # Search for json block in markdown
     json_block = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
     candidate_json = json_block.group(1) if json_block else content
+
+    def _valid_target(file_path: str) -> bool:
+        from scanner import is_junk_file
+
+        if is_junk_file(Path(file_path).name):
+            return False
+        return Path(file_path).suffix.lower() in SOURCE_SUFFIXES
 
     try:
         data = json.loads(candidate_json)
@@ -166,8 +201,12 @@ def parse_tasks_json(raw_text: str) -> list[dict[str, Any]]:
                 if action not in ("create", "edit"):
                     action = "edit"
                 desc = str(item.get("description", "")).strip()
+                if not _valid_target(file_path):
+                    logger.warning(f"Rejecting plan task with non-source target: {file_path}")
+                    continue
                 tasks.append({"id": task_id, "file": file_path, "action": action, "description": desc})
-            return tasks
+            if tasks:
+                return tasks
     except Exception:
         pass
 
@@ -205,12 +244,24 @@ def extract_code_block(raw_text: str, target_file: str) -> str:
 # Core Controller Endpoints
 # -----------------------------------------------------------------------------
 
+def _build_id() -> str:
+    """Hash of main.py's mtime+size — changes whenever the controller file
+    changes, so clients can detect a stale (pre-fix) server process."""
+    try:
+        st = Path(__file__).stat()
+        raw = f"{Path(__file__).name}:{st.st_mtime_ns}:{st.st_size}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:12]
+    except OSError:
+        return "unknown"
+
+
 @app.get("/health")
 async def health_check() -> dict[str, Any]:
     """Controller health check and VRAM supervisor status."""
     installed = await state.ollama.list_installed_models()
     return {
         "status": "online",
+        "build_id": _build_id(),
         "supervisor_vram": "0MB (Pure Python host)",
         "active_workspace": str(state.workspace_root),
         "agent_profile": state.config.to_dict(),
@@ -265,8 +316,7 @@ async def agent_plan(payload: PlanRequest) -> PlanResponse:
     reasoning to planner.log, and outputs strict JSON task queue matching:
     {"tasks": [{"id": 1, "file": "app.py", "action": "create"|"edit", "description": "task snippet"}]}
     """
-    if payload.workspace_dir:
-        state.rebind_workspace(payload.workspace_dir)
+    state.ensure_workspace(payload.workspace_dir)
 
     awareness = state.scanner.build_system_awareness()
 
@@ -329,8 +379,7 @@ async def agent_step(payload: StepRequest) -> dict[str, Any]:
     Pulls next item from task queue. Injects specific code context into Coder model via Ollama.
     Streams patch into .agent_staging/, runs OS-specific diagnostic script, and returns result string.
     """
-    if payload.workspace_dir:
-        state.rebind_workspace(payload.workspace_dir)
+    state.ensure_workspace(payload.workspace_dir)
 
     # Resolve target task
     task_to_run: dict[str, Any] | None = None
@@ -341,6 +390,26 @@ async def agent_step(payload: StepRequest) -> dict[str, Any]:
             if t["id"] == payload.task_id:
                 task_to_run = t
                 break
+        if task_to_run is None:
+            # Clear, specific error: is the queue empty or the id wrong?
+            if not state.task_queue:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"Task {payload.task_id} not found: the queue for "
+                        f"{state.workspace_root} is EMPTY. Call /agent/plan first, "
+                        "or send the full task object in the request."
+                    ),
+                )
+            known_ids = [t["id"] for t in state.task_queue]
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Task {payload.task_id} not found in the queue "
+                    f"(known ids: {known_ids}). It may already be executed or the "
+                    "queue was replanned."
+                ),
+            )
     else:
         # Pull next unexecuted task
         for t in state.task_queue:
@@ -368,8 +437,9 @@ async def agent_step(payload: StepRequest) -> dict[str, Any]:
     elif active_target.exists():
         existing_code = active_target.read_text(encoding="utf-8", errors="replace")
 
-    # Build coder prompt
+    # Build coder prompt — language derived from the target's real extension.
     awareness = state.scanner.build_system_awareness()
+    language = LANGUAGE_BY_SUFFIX.get(Path(target_file).suffix.lower(), "text")
     coder_prompt = (
         f"{awareness['prompt_context']}\n\n"
         f"=== CURRENT TASK ===\n"
@@ -379,18 +449,18 @@ async def agent_step(payload: StepRequest) -> dict[str, Any]:
     )
 
     if existing_code:
-        coder_prompt += f"=== EXISTING FILE CONTENTS ({target_file}) ===\n```python\n{existing_code}\n```\n\n"
+        coder_prompt += f"=== EXISTING FILE CONTENTS ({target_file}) ===\n```{language}\n{existing_code}\n```\n\n"
 
     coder_prompt += (
         f"=== INSTRUCTIONS ===\n"
-        f"Write complete, production-ready implementation code for {target_file}.\n"
-        f"Wrap the code inside a single markdown code fence (```python ... ```).\n"
+        f"Write complete, production-ready {language} implementation for {target_file}.\n"
+        f"Wrap the code inside a single markdown code fence (```{language} ... ```).\n"
         f"Do not truncate or omit lines."
     )
 
     system_prompt = (
         "You are an expert autonomous software engineer. "
-        "Output ONLY the complete python source code enclosed in ```python markdown fences."
+        f"Output ONLY the complete {language} source enclosed in markdown fences."
     )
 
     # Generate code via Coder model (streamed token-by-token internally)
@@ -567,8 +637,8 @@ async def workspace_status(payload: StatusRequest | None = None) -> dict[str, An
     Uses Python's native difflib to compare .agent_staging/ against the active
     workspace root. Returns a line-by-line git-style diff object ready for TUI/GUI change previews.
     """
-    if payload and payload.workspace_dir:
-        state.rebind_workspace(payload.workspace_dir)
+    if payload:
+        state.ensure_workspace(payload.workspace_dir)
 
     diff_data = state.staging.compute_staging_diff()
     return {
@@ -590,8 +660,8 @@ async def agent_deploy(payload: DeployRequest | None = None) -> dict[str, Any]:
     flushes the staging cache. Overwritten files are backed up under
     .agent_runs/<latest_run>/backup/ for /agent/rollback.
     """
-    if payload and payload.workspace_dir:
-        state.rebind_workspace(payload.workspace_dir)
+    if payload:
+        state.ensure_workspace(payload.workspace_dir)
 
     from agent_core.run_state import RUNS_DIR_NAME
 

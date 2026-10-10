@@ -16,6 +16,32 @@ from workspace_staging import WorkspaceStagingManager
 logger = logging.getLogger("sandbox")
 
 
+def check_plausible_content(rel_path: str, content: str) -> str | None:
+    """Non-Python plausibility check. Returns an error string, or None if OK."""
+    if not content.strip():
+        return "file is empty"
+    suffix = Path(rel_path).suffix.lower()
+    if suffix == ".json":
+        import json
+
+        try:
+            json.loads(content)
+        except json.JSONDecodeError as exc:
+            return f"invalid JSON: {exc}"
+    elif suffix == ".html":
+        lower = content.lower()
+        if "<html" not in lower and "<!doctype" not in lower:
+            return "HTML file contains neither <html> nor <!doctype"
+    elif suffix == ".css":
+        if "{" not in content or "}" not in content:
+            return "CSS file contains no rule blocks"
+    elif suffix == ".js":
+        plausible = ("function", "=>", "const ", "let ", "var ", "document.", "module")
+        if not any(token in content for token in plausible):
+            return "JS file has no recognizable JavaScript constructs"
+    return None
+
+
 class ExecutionSandbox:
     """Detects host OS, generates native validation scripts (.ps1 on win32, .sh on unix),
     and executes them within a clean subprocess boundary.
@@ -132,9 +158,16 @@ class ExecutionSandbox:
                 script_lines.append('if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }')
                 script_lines.append('Write-Host "[SANDBOX] Syntax compilation successful."')
             else:
+                # Non-Python: non-empty + plausible content via sandbox module.
                 script_lines.append(
-                    f'if (Test-Path "{staged_abs}") {{ Write-Host "[SANDBOX] File verification passed." }} else {{ Write-Error "File not found"; exit 1 }}'
+                    f'$err = & "{py_exe}" -c "import sys; sys.path.insert(0, r\'{self.workspace_root}\'); '
+                    f'from sandbox import check_plausible_content; from pathlib import Path; '
+                    f'p = Path(r\'{staged_abs}\'); '
+                    f'err = check_plausible_content(r\'{target_rel_path}\', p.read_text(encoding=\'utf-8\', errors=\'replace\') if p.is_file() else \'\'); '
+                    f'print(err or \'\'); sys.exit(1 if err else 0)"'
                 )
+                script_lines.append('if ($LASTEXITCODE -ne 0) { Write-Error $err; exit $LASTEXITCODE }')
+                script_lines.append('Write-Host "[SANDBOX] Content plausibility check passed."')
 
             script_content = "\r\n".join(script_lines) + "\r\n"
             script_path.write_text(script_content, encoding="utf-8")
@@ -169,9 +202,15 @@ class ExecutionSandbox:
                 )
                 script_lines.append('echo "[SANDBOX] Syntax compilation successful."')
             else:
+                # Non-Python: non-empty + plausible content via sandbox module.
                 script_lines.append(
-                    f'test -f "{staged_abs}" && echo "[SANDBOX] File verification passed."'
+                    f'"{py_exe}" -c "import sys; sys.path.insert(0, \'{self.workspace_root}\'); '
+                    f'from sandbox import check_plausible_content; from pathlib import Path; '
+                    f'p = Path(\'{staged_abs}\'); '
+                    f'err = check_plausible_content(\'{target_rel_path}\', p.read_text(encoding=\'utf-8\', errors=\'replace\') if p.is_file() else \'\'); '
+                    f'print(err or \'\'); sys.exit(1 if err else 0)"'
                 )
+                script_lines.append('echo "[SANDBOX] Content plausibility check passed."')
 
             script_content = "\n".join(script_lines) + "\n"
             script_path.write_text(script_content, encoding="utf-8")

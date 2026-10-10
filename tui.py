@@ -255,6 +255,59 @@ def _port_owner_is_our_controller(port: int) -> bool:
         return False
 
 
+def _local_build_id() -> str:
+    """Same hash main.py exposes via /health (mtime+size of main.py)."""
+    import hashlib
+
+    main_path = PROJECT_ROOT / "main.py"
+    try:
+        st = main_path.stat()
+        raw = f"{main_path.name}:{st.st_mtime_ns}:{st.st_size}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:12]
+    except OSError:
+        return "unknown"
+
+
+def _check_stale_controller(port: int, assume_yes: bool = False) -> bool:
+    """Compare the running controller's build_id with main.py on disk.
+
+    Returns True when it is safe to proceed (fresh server, or user declined a
+    restart and we moved on). Offers — never forces — a restart of a stale
+    controller: the old process is only killed after explicit confirmation,
+    and PID 0/4 are never touched.
+    """
+    try:
+        data = _http_get(f"http://{FASTAPI_HOST}:{port}/health", timeout=2)
+    except Exception:
+        return True  # nothing running — fine
+    if data.get("status") != "online" or "agent_profile" not in data:
+        return True  # not our controller — _kill_port handles it
+    server_build = data.get("build_id")
+    local_build = _local_build_id()
+    if not server_build or server_build == local_build:
+        return True  # fresh
+    console.print(
+        f"[yellow]!! The running controller on :{port} is STALE "
+        f"(server build {server_build} ≠ disk build {local_build}). "
+        "main.py changed since it started.[/yellow]"
+    )
+    restart = assume_yes or Prompt.ask(
+        "Restart the controller with the current code?", choices=["y", "n"], default="y"
+    ) == "y"
+    if not restart:
+        console.print("[dim]Keeping the stale controller; behaviour may be outdated.[/dim]")
+        return True
+    for pid in _pids_on_port(port):
+        if pid in (0, 4) or pid == os.getpid():
+            continue
+        terminate_pid(pid)
+    for _ in range(10):
+        if not _pids_on_port(port):
+            break
+        time.sleep(0.5)
+    return True
+
+
 def _pid_image_name(pid: int) -> str:
     """Best-effort process image name (for the kill-confirmation prompt)."""
     try:
@@ -524,7 +577,9 @@ def start_all_services(assume_yes: bool = False) -> None:
             raise RuntimeError("Ollama did not respond within 20 s")
         console.print("  [bright_green]✓ Ollama API ready[/bright_green]")
 
-    # 2. FastAPI: reuse our controller if it answers; reclaim or fall forward.
+    # 2. FastAPI: reuse our controller if it answers (and is not stale);
+    #    otherwise reclaim the port or fall forward to a free one.
+    _check_stale_controller(FASTAPI_PORT, assume_yes=assume_yes)
     if _port_owner_is_our_controller(FASTAPI_PORT):
         console.print(
             f"  [bright_green]✓ Reusing already-running controller on :{FASTAPI_PORT}[/bright_green]"
@@ -774,7 +829,7 @@ async def _submit_locked(request_text: str, workspace_dir: str) -> None:
             console.print(f"\n[dim]⏳ Coder executing task {t['id']}: {t['file']}...[/dim]")
             with Progress(SpinnerColumn(), TextColumn(f"[dim]Task {t['id']}..."), transient=True, console=console) as p:
                 p.add_task("", total=None)
-                step = await post_json(STEP_URL, {"task_id": t["id"], "workspace_dir": workspace_dir})
+                step = await post_json(STEP_URL, {"task": t, "workspace_dir": workspace_dir})
 
             diag    = step.get("diagnostic", {})
             success = diag.get("success", False)

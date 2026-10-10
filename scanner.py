@@ -25,6 +25,17 @@ IGNORED_DIRS = {
     ".agents",
 }
 
+# Junk artifacts left by the legacy orchestrator — never feed these to the planner.
+JUNK_FILE_PATTERNS = ("tasks.md", "summary.txt", "task*_code.txt")
+
+import fnmatch
+
+
+def is_junk_file(filename: str) -> bool:
+    lower = filename.lower()
+    return any(fnmatch.fnmatch(lower, pattern) for pattern in JUNK_FILE_PATTERNS)
+
+
 CONFIG_FILES = [
     "requirements.txt",
     "pyproject.toml",
@@ -69,6 +80,8 @@ class WorkspaceScanner:
                     tree.append(f"{file_indent}... (file limit reached)")
                     return tree
                 if f in IGNORED_DIRS or f.endswith(".pyc") or f == ".agent":
+                    continue
+                if is_junk_file(f):
                     continue
                 tree.append(f"{file_indent}{f}")
                 count += 1
