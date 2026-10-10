@@ -255,7 +255,7 @@ Reports land in `<workspace>\.agent_runs\bench\` (JSON + Markdown).
 # Headless from the shell (starts/reuses Ollama, NO FastAPI):
 .\env\Scripts\python.exe tui.py --benchmark --quick
 .\env\Scripts\python.exe tui.py --workspace E:\proj --benchmark --quick --coexist
-.\env\Scripts\python.exe tui.py --benchmark --compare validator=deepseek-r1:1.5b,lfm2.5-thinking --repeat 3
+.\env\Scripts\python.exe tui.py --benchmark --compare validator=deepseek-r1:1.5b,phi4-mini --repeat 3
 
 # Or directly:
 .\env\Scripts\python.exe bench.py --workspace . --quick
@@ -268,7 +268,7 @@ inference on the 4 GB card):
 /benchmark                                  all roles from .agent
 /benchmark --quick
 /benchmark --roles validator --repeat 3
-/benchmark --compare planner=deepseek-r1:1.5b,lfm2.5-thinking
+/benchmark --compare planner=deepseek-r1:1.5b,phi4-mini
 /benchmark --plan-mode two-stage
 /benchmark --coexist
 /benchmark last                             print the newest report

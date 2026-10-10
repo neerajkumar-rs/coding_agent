@@ -65,6 +65,13 @@ class AgentConfig:
             or DEFAULT_CODER_MODEL
         )
         planner = data.get("planner_model") or DEFAULT_PLANNER_MODEL
+        # Saved configs may reference removed models (e.g. lfm2.5-*): fall back
+        # to defaults instead of loading an unsupported name.
+        for removed in ("lfm", "liquid"):
+            if removed in str(planner).lower():
+                planner = DEFAULT_PLANNER_MODEL
+            if removed in str(coder).lower():
+                coder = DEFAULT_CODER_MODEL
         ctx = int(data.get("max_context_tokens", DEFAULT_CONTEXT_TOKENS))
         keep_alive = str(data.get("keep_alive") or DEFAULT_KEEP_ALIVE)
         raw_allowed = data.get("allowed_commands")

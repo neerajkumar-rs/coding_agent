@@ -24,7 +24,7 @@ class FakeOllama(BaseHTTPRequestHandler):
             body = {"models": [
                 {"name": "deepseek-r1:1.5b"},
                 {"name": "qwen2.5-coder:3b"},
-                {"name": "lfm2.5-thinking"},
+                {"name": "phi4-mini"},
             ]}
         elif self.path.endswith("/api/ps"):
             body = {"models": []}
@@ -115,13 +115,13 @@ def test_bench_compare_override(fake_ollama: str) -> None:
         save_agent_config(AgentConfig(), tmp)
         report, code = bench.run([
             "--workspace", tmp, "--quick",
-            "--compare", "validator=deepseek-r1:1.5b,lfm2.5-thinking",
+            "--compare", "validator=deepseek-r1:1.5b,phi4-mini",
             "--roles", "validator",
             "--ollama-url", fake_ollama,
         ])
         assert code == bench.EXIT_OK
         validator = [r for r in report["results"] if r["role"] == "validator"]
-        assert {r["model"] for r in validator} == {"deepseek-r1:1.5b", "lfm2.5-thinking"}
+        assert {r["model"] for r in validator} == {"deepseek-r1:1.5b", "phi4-mini"}
         assert all(r["ok"] for r in validator)
 
 
@@ -161,7 +161,7 @@ def test_apply_writes_roles_only_after_yes() -> None:
     with TemporaryDirectory() as tmp:
         save_agent_config(AgentConfig(), tmp)
         tui._last_bench_report = {
-            "best_per_role": {"planner": "lfm2.5-thinking", "coder": "qwen2.5-coder:3b"},
+            "best_per_role": {"planner": "phi4-mini", "coder": "qwen2.5-coder:3b"},
         }
         # Answer "n" -> nothing written
         with patch.object(tui.Prompt, "ask", return_value="n"):
@@ -173,7 +173,7 @@ def test_apply_writes_roles_only_after_yes() -> None:
         with patch.object(tui.Prompt, "ask", return_value="y"):
             asyncio.run(tui._apply_bench_roles(tmp))
         data = json.loads((Path(tmp) / ".agent").read_text(encoding="utf-8"))
-        assert data["roles"]["planner"]["model"] == "lfm2.5-thinking"
+        assert data["roles"]["planner"]["model"] == "phi4-mini"
         assert data["planner_model"] == "deepseek-r1:1.5b"  # preserved
         assert data["max_context_tokens"] == 4096           # preserved
 

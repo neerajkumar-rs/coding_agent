@@ -766,7 +766,7 @@ def display_workspace(path: str) -> str:
         Panel(
             f"[bold bright_cyan]Active Workspace[/bold bright_cyan]\n"
             f"[white]{resolved}[/white]\n"
-            "[dim]Generated code → .agent_staging/ · deployed on /deploy[/dim]",
+            "[dim]Generated code → .agent_staging/ · saved with /save[/dim]",
             border_style="bright_cyan",
         )
     )
@@ -777,11 +777,11 @@ def show_help() -> None:
     console.print(
         Panel(
             "/help        show commands\n"
-            "/run         autonomous run through agent_core (plan → code → verify → deploy)\n"
+            "/run         autonomous run through agent_core (plan → code → verify → save)\n"
             "/benchmark   benchmark role models (--quick, --roles, --compare, apply, last)\n"
             "/status      show service health + staged diff\n"
             "/workspace   change the active workspace path\n"
-            "/deploy      push staged files into active workspace\n"
+            "/save        save staged files into the workspace (/deploy alias)\n"
             "/cancel      cancel the in-progress run for this workspace\n"
             "/logs        tail planner · coder · sandbox logs\n"
             "/models      list installed Ollama models\n"
@@ -807,6 +807,138 @@ async def submit(request_text: str, workspace_dir: str) -> None:
 
 
 EXPECTED_STAGES = ["ROUTE", "PLAN", "CODE", "CHECK", "VALIDATE", "SUMMARY"]
+
+
+# ---------------------------------------------------------------------------
+# Header: logo + system vitals (redrawn before each prompt; cached ~2s)
+# ---------------------------------------------------------------------------
+
+# ASCII-only logo: the Windows console codepage (cp1252) cannot encode
+# box-drawing characters.
+LOGO = (
+    "[bold bright_cyan]+-------------------+[/bold bright_cyan]\n"
+    "[bold bright_cyan]|[/bold bright_cyan]  [bold bright_magenta](*) OLLAMA AGENT[/bold bright_magenta] [bold bright_cyan]|[/bold bright_cyan]\n"
+    "[bold bright_cyan]|[/bold bright_cyan]  [dim]local - 4GB GPU[/dim]  [bold bright_cyan]|[/bold bright_cyan]\n"
+    "[bold bright_cyan]+-------------------+[/bold bright_cyan]"
+)
+
+_vitals_cache: tuple[float, str] = (0.0, "")
+_last_trace: list[dict] = []  # stage timings from the latest pipeline run
+
+
+def _vital_gpu() -> str:
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi",
+             "--query-gpu=memory.used,memory.total,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            text=True, stderr=subprocess.DEVNULL, timeout=2,
+        )
+        used, total, pct = [p.strip() for p in out.splitlines()[0].split(",")]
+        return f"GPU: {used}/{total} MiB - {pct}%"
+    except Exception:
+        return "GPU: n/a"
+
+
+def _vital_loaded_model() -> str:
+    try:
+        data = _http_get(OLLAMA_BASE + "/api/ps", timeout=2)
+        models = data.get("models", [])
+        if not models:
+            return "Loaded: none"
+        m = models[0]
+        size_gb = round(int(m.get("size", 0)) / 1e9, 1)
+        return f"Loaded: {m.get('name', '?')} ({size_gb} GB)"
+    except Exception:
+        return "Loaded: n/a"
+
+
+def _vital_services() -> str:
+    ollama = "READY" if _check_ollama_running().ok else "DOWN"
+    try:
+        _http_get(HEALTH_URL, timeout=2)
+        fastapi = "READY"
+    except Exception:
+        fastapi = "DOWN"
+    return f"Ollama: {ollama} - FastAPI: {fastapi}"
+
+
+def _vital_last_run() -> str:
+    if not _last_trace:
+        return "Last run: —"
+    parts = [f"{t.get('stage', '?')} {t.get('seconds', 0):.1f}s" for t in _last_trace]
+    return "Last run: " + " ".join(parts)
+
+
+def _collect_vitals(workspace: str) -> str:
+    """Each vital in its own try/except — one failing probe never crashes the header."""
+    lines = []
+    for probe in (_vital_gpu, _vital_loaded_model, _vital_services):
+        try:
+            lines.append(probe())
+        except Exception:
+            lines.append("n/a")
+    try:
+        short = workspace
+        if len(short) > 38:
+            short = "..." + short[-35:]
+        lines.append(f"Workspace: {short}")
+    except Exception:
+        pass
+    try:
+        lines.append(_vital_last_run())
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
+def print_header(workspace: str) -> None:
+    """Compact two-column header: logo left, vitals right. Vitals cached ~2s."""
+    global _vitals_cache
+    now = time.monotonic()
+    if now - _vitals_cache[0] > 2.0 or not _vitals_cache[1]:
+        _vitals_cache = (now, _collect_vitals(workspace))
+    console.print(Panel(
+        Text.from_markup(LOGO) + Text("\n\n" + _vitals_cache[1]),
+        border_style="bright_blue", box=box.ROUNDED, expand=False,
+    ))
+
+
+def pluralize(n: int, word: str) -> str:
+    """'1 file' / '2 files'."""
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+async def _save_staged(workspace_dir: str) -> None:
+    """List every staged file with (new)/(overwrites existing file), ask
+    'Save? [y/N]' (default N), then save via the deploy endpoint."""
+    diff_status = await post_json(STATUS_URL, {"workspace_dir": workspace_dir})
+    if not diff_status.get("has_changes"):
+        console.print("[dim]No staged changes.[/dim]")
+        return
+    dest_root = str(Path(workspace_dir).resolve())
+    lines = []
+    for diff_obj in diff_status.get("diffs", []):
+        tag = "(new)" if diff_obj["action"] == "create" else "(overwrites existing file)"
+        lines.append(f"  {diff_obj['file']}  [dim]{tag}[/dim]")
+    console.print(
+        f"[yellow]Saving to {dest_root}:[/yellow]\n" + "\n".join(lines)
+    )
+    answer = Prompt.ask("[bold bright_green]Save?[/bold bright_green]",
+                        choices=["y", "N"], default="N")
+    if answer != "y":
+        console.print(
+            "[dim]Not saved. Files remain in .agent_staging/. "
+            "Type /save to save them later.[/dim]"
+        )
+        return
+    res = await post_json(DEPLOY_URL, {"workspace_dir": workspace_dir})
+    saved = res.get("deployed_files", [])
+    console.print(
+        f"[bold bright_green]Saved {pluralize(len(saved), 'file')} to {dest_root}[/bold bright_green]"
+    )
+    for f in saved:
+        console.print(f"  [dim]↳ {f}[/dim]")
 
 
 def _print_trace(trace: list[dict]) -> None:
@@ -838,8 +970,10 @@ async def _submit_locked(request_text: str, workspace_dir: str) -> None:
             p.add_task("", total=None)
             result = await post_json(RUN_URL, {"prompt": request_text, "workspace_dir": workspace_dir})
 
-        # 1. Trace
-        _print_trace(result.get("trace", []))
+        # 1. Trace (also feeds the header's "Last run" vitals)
+        global _last_trace
+        _last_trace = result.get("trace", [])
+        _print_trace(_last_trace)
 
         # 2a. Question path: print the answer and stop.
         if "answer" in result:
@@ -850,7 +984,7 @@ async def _submit_locked(request_text: str, workspace_dir: str) -> None:
         console.print(Panel(result.get("summary", "(no summary)"),
                             title="Summary", border_style="bright_blue"))
         for failed in result.get("failed_tasks", []):
-            console.print(f"[red]FAILED: {failed['path']} — {failed['error']}[/red]")
+            console.print(f"[red]NOT saved (failed): {failed['path']} — {failed['error']}[/red]")
 
         # 3. Staged diffs (only files that passed CHECK are staged)
         diff_status = await post_json(STATUS_URL, {"workspace_dir": workspace_dir})
@@ -859,7 +993,7 @@ async def _submit_locked(request_text: str, workspace_dir: str) -> None:
             a = diff_status["total_additions"]
             d = diff_status["total_deletions"]
             console.print(
-                f"\n[yellow]STAGED: {n} file(s)  "
+                f"\n[yellow]STAGED: {pluralize(n, 'file')}  "
                 f"[bright_green]+{a}[/bright_green] / [red]-{d}[/red][/yellow]"
             )
             for diff_obj in diff_status.get("diffs", []):
@@ -871,16 +1005,8 @@ async def _submit_locked(request_text: str, workspace_dir: str) -> None:
                         border_style="yellow",
                     )
                 )
-            # 4. Deploy prompt — default N
-            answer = Prompt.ask(
-                "[bold bright_green]Deploy to workspace?[/bold bright_green]",
-                choices=["y", "n"], default="n",
-            )
-            if answer == "y":
-                res = await post_json(DEPLOY_URL, {"workspace_dir": workspace_dir})
-                console.print(f"[bold bright_green]DEPLOYED: {res.get('message')}[/bold bright_green]")
-                for f in res.get("deployed_files", []):
-                    console.print(f"  [dim]↳ {f}[/dim]")
+            # 4. Save prompt — default N
+            await _save_staged(workspace_dir)
         else:
             console.print("[dim]No staged changes.[/dim]")
 
@@ -1154,7 +1280,8 @@ async def main() -> None:
 
     try:
         while True:
-            text    = Prompt.ask("\n[bold bright_green]you[/bold bright_green]")
+            print_header(workspace)
+            text    = Prompt.ask("[bold bright_green]you[/bold bright_green]")
             command = text.strip().lower()
 
             if command in {"/quit", "/exit", "q"}:
@@ -1187,10 +1314,9 @@ async def main() -> None:
                 except Exception as exc:
                     console.print(f"[red]{exc}[/red]")
 
-            elif command == "/deploy":
+            elif command in {"/save", "/deploy"}:  # /deploy kept as alias
                 try:
-                    res = await post_json(DEPLOY_URL, {"workspace_dir": workspace})
-                    console.print(JSON(json.dumps(res)))
+                    await _save_staged(workspace)
                 except Exception as exc:
                     console.print(f"[red]{exc}[/red]")
 
@@ -1219,7 +1345,6 @@ async def main() -> None:
                         console.print(Panel(tail, title=log_file, border_style="bright_blue"))
 
             elif text.strip():
-                console.print(Panel(text, title="[bright_green]you[/bright_green]", border_style="bright_green"))
                 await submit(text, workspace)
 
     except KeyboardInterrupt:
