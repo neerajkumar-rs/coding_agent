@@ -1403,7 +1403,37 @@ def cli() -> None:
         exit_code = asyncio.run(_benchmark_headless(args))
         _shutdown("benchmark done")
         raise SystemExit(exit_code)
-    asyncio.run(main())
+
+    # Prefer the Textual UI; fall back to the Rich TUI when unavailable.
+    try:
+        import textual  # noqa: F401
+
+        _textual_available = True
+    except ImportError:
+        _textual_available = False
+
+    if not _textual_available:
+        console.print("[yellow]Textual not installed — falling back to the Rich TUI "
+                      "(pip install textual for the new layout).[/yellow]")
+        asyncio.run(main())
+        return
+
+    # Textual path: start services, pick workspace, launch the app.
+    show_banner()
+    console.print("\n[bold bright_cyan]── Preflight checks ──[/bold bright_cyan]")
+    _run_preflight_table()
+    try:
+        start_all_services(assume_yes=args.yes)
+    except RuntimeError as exc:
+        console.print(f"[bold red]Service startup failed:[/bold red] {exc}")
+        return
+    workspace = args.workspace or pick_workspace(assume_yes=args.yes)
+    try:
+        from tui_textual import run_textual
+
+        run_textual(workspace)
+    finally:
+        _shutdown("TUI closed")
 
 
 if __name__ == "__main__":
