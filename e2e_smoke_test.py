@@ -87,11 +87,20 @@ def main() -> None:
             assert state["status"] == "completed", state
             assert state["llm_calls"] > 0
 
-            # Only the requested target plus benign infrastructure may exist:
-            # .agent (persisted config), .agent_runs/ (run metadata),
-            # __pycache__/ (py_compile byproduct). NO role junk files.
+            # Only the requested target plus benign git-ignored infrastructure:
+            # .agent (config), .agent_runs/ (run metadata), .agent_staging/ and
+            # .agent_logs/ (emptied by deploy), __pycache__/ (py_compile).
+            # NO role junk files anywhere in the root.
             root_entries = {p.name for p in workspace_root.iterdir()}
-            assert root_entries <= {"generated.py", ".agent", RUNS_DIR_NAME, "__pycache__"}, root_entries
+            assert root_entries <= {
+                "generated.py", ".agent", RUNS_DIR_NAME,
+                ".agent_staging", ".agent_logs", "__pycache__",
+            }, root_entries
+            # Deploy flushed the staging cache: no generated files left behind.
+            staging_leftovers = [
+                p for p in (workspace_root / ".agent_staging").rglob("*") if p.is_file()
+            ]
+            assert not staging_leftovers, staging_leftovers
 
             # Think blocks were stripped before validation/parsing
             assert "think" not in result.llm_validation.lower()[:200] or result.llm_validation.startswith("PASS")

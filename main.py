@@ -124,6 +124,12 @@ class DeployRequest(BaseModel):
     workspace_dir: str | None = Field(default=None, description="Optional workspace override")
 
 
+class RunRequestPayload(BaseModel):
+    prompt: str = Field(min_length=1, description="Full user request for an autonomous run")
+    workspace_dir: str | None = Field(default=None, description="Optional workspace override")
+    auto_deploy: bool = Field(default=True, description="Deploy staged files on success")
+
+
 # -----------------------------------------------------------------------------
 # Parsing Helpers
 # -----------------------------------------------------------------------------
@@ -441,6 +447,46 @@ async def agent_step(payload: StepRequest) -> dict[str, Any]:
         "diagnostic": diagnostic,
         "result": result_summary,
     }
+
+
+@app.post("/agent/run")
+async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
+    """Autonomous one-shot run through the single agent_core pipeline.
+
+    Everything (planning, coding, staging, verification, audit, deploy) is
+    executed by agent_core.engine.Engine in a worker thread; the process-wide
+    LLM lock serializes GPU access across concurrent requests/workspaces.
+    """
+    from agent_core.engine import RunRequest, get_engine
+
+    workspace = payload.workspace_dir or state.workspace_root
+    engine = get_engine(workspace)
+
+    def _run() -> dict[str, Any]:
+        report = engine.run(
+            RunRequest(
+                prompt=payload.prompt,
+                auto_deploy=payload.auto_deploy,
+            )
+        )
+        return {
+            "status": report.status,
+            "run_id": report.run_id,
+            "files": report.files,
+            "deployed_files": report.deployed_files,
+            "attempts": report.attempts,
+            "llm_calls": report.llm_calls,
+            "elapsed_seconds": report.elapsed_seconds,
+            "errors": report.errors,
+            "needs_human": report.needs_human,
+            "audits": report.audits,
+        }
+
+    try:
+        return await asyncio.to_thread(_run)
+    except Exception as exc:
+        logger.error(f"agent run failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/workspace/status")
