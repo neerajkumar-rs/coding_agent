@@ -1,337 +1,445 @@
-"""Textual front-end for the Ollama Agent — OpenCode-style two-column layout.
+"""Textual front-end — OpenCode-style two-column layout (layout only).
 
-Layout only. All logic (pipeline calls, slash commands, vitals probes) is
-imported from tui.py unchanged; endpoints and internal names are untouched.
+All pipeline logic, endpoints and internal names live in tui.py /
+orchestrator.py and are imported unchanged. If Textual is not importable,
+tui.cli() falls back to the Rich TUI — this module is never loaded then.
 
-Left:  scrollable chat log (RichLog) + input bar fixed at the bottom.
-Right: 30-column sidebar — logo, SYSTEM vitals, LAST RUN stage times,
-       workspace pinned at the bottom.
-Bottom: status bar with key hints (left) and active model (right).
+Layout: left = scrollable chat log + input bar fixed at the bottom (accent on
+the input's left edge). Right = fixed 30-column sidebar (SYSTEM, LAST RUN,
+workspace + wordmark pinned to the bottom). Bottom status bar: key hints on
+the left, active model on the right.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json as _json
+import time
+import urllib.request as _req
 from pathlib import Path
 
+from rich.rule import Rule
+from rich.text import Text
+from textual import work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.reactive import reactive
-from textual.widgets import Footer, Input, RichLog, Static
+from textual.widgets import Input, RichLog, Static
 
 import tui
 from tui import (
     EXPECTED_STAGES,
-    HEALTH_URL,
     INIT_URL,
     OLLAMA_BASE,
-    RUN_URL,
     STATUS_URL,
-    _check_ollama_running,
-    _http_get,
     _vital_gpu,
     _vital_loaded_model,
     _vital_services,
-    pick_workspace,
     pluralize,
-    post_json,
 )
 
+# ---------------------------------------------------------------------------
+# Style constants (the one constants block)
+# ---------------------------------------------------------------------------
 ACCENT = "bright_cyan"
+DIM = "dim"
+RED = "red"
+GREEN = "bright_green"
+COLOR_FOUR = "#4fc3f7"
+COLOR_PIE = "#ce93d8"
+WORDMARK = f"[{DIM}]<_[/][bold {COLOR_FOUR}]FOUR[/][{DIM}]_[/][bold {COLOR_PIE}]PIE[/]"
+
+QUESTION_LIKE_ROUTES = {"QUESTION", "FILE_QUESTION", "UNCLEAR"}
 
 
-def _probe(func, default: str = "n/a") -> str:
-    """Run a vitals probe; never raise."""
+# ---------------------------------------------------------------------------
+# Vitals probes — each in its own try/except, "n/a" on failure
+# ---------------------------------------------------------------------------
+
+def _probe(func) -> str:
     try:
         return func()
     except Exception:
-        return default
+        return "n/a"
 
 
-def _collect_system_lines() -> list[str]:
+def collect_system_lines() -> list[str]:
     return [_probe(_vital_gpu), _probe(_vital_loaded_model), _probe(_vital_services)]
 
 
-def _last_run_lines() -> list[tuple[str, str]]:
-    """(stage, "Xs") pairs; stages absent from the trace are dim/red."""
-    seen = {t.get("stage"): t for t in tui._last_trace}
-    lines: list[tuple[str, str]] = []
+def _route_of(trace: list[dict]) -> str:
+    for entry in trace:
+        if entry.get("stage") == "ROUTE":
+            return str(entry.get("note", ""))
+    return ""
+
+
+def trace_stage_rows(trace: list[dict]) -> list[tuple[str, str, str]]:
+    """(stage, value, color) rows. Route-aware:
+    - QUESTION/FILE_QUESTION/UNCLEAR: only the stages present, never red SKIPPED.
+    - CODE_TASK: every expected stage; missing = red SKIPPED, pipeline-skipped
+      = dim n/a.
+    """
+    route = _route_of(trace)
+    rows: list[tuple[str, str, str]] = []
+    if route in QUESTION_LIKE_ROUTES:
+        for entry in trace:
+            status = entry.get("status", "ok")
+            seconds = f"{entry.get('seconds', 0.0):.1f}s"
+            value = f"ok {seconds}" if status == "ok" else status
+            color = GREEN if status == "ok" else RED
+            rows.append((entry.get("stage", "?"), value, color))
+        return rows
+    seen = {t.get("stage"): t for t in trace}
     for stage in EXPECTED_STAGES:
         entry = seen.get(stage)
         if entry is None:
-            lines.append((stage, "skipped"))
+            rows.append((stage, "SKIPPED", RED))
+            continue
+        status = entry.get("status", "ok")
+        if status == "ok":
+            rows.append((stage, f"ok {entry.get('seconds', 0.0):.1f}s", GREEN))
+        elif status == "skipped":
+            rows.append((stage, "n/a", DIM))
         else:
-            status = entry.get("status", "ok")
-            seconds = entry.get("seconds", 0.0)
-            lines.append((stage, f"{seconds:.1f}s" if status == "ok" else status))
-    return lines
+            rows.append((stage, status, RED))
+    return rows
 
 
-class Sidebar(Static):
-    """Right-hand 30-column sidebar: logo, SYSTEM, LAST RUN, workspace."""
-
-    system_text = reactive("")
-    workspace = reactive("")
-
-    def compose(self) -> ComposeResult:
-        yield Static(f"[bold {ACCENT}]OLLAMA AGENT[/]", id="sb-logo")
-        yield Static("", id="sb-system")
-        yield Static("", id="sb-lastrun")
-        yield Static("", id="sb-workspace")
-
-    def refresh_vitals(self) -> None:
-        self.system_text = "\n".join(_collect_system_lines())
-        system = [f"[bold]SYSTEM[/]", self.system_text]
-        self.query_one("#sb-system", Static).update("\n".join(system))
-
-        run_lines = ["[bold]LAST RUN[/]"]
-        for stage, value in _last_run_lines():
-            if value == "skipped":
-                run_lines.append(f"[red]{stage} SKIPPED[/]")
-            elif value in ("failed",):
-                run_lines.append(f"[red]{stage} {value}[/]")
-            elif value == "n/a":
-                run_lines.append(f"[dim]{stage} n/a[/]")
-            else:
-                run_lines.append(f"[dim]{stage}[/] {value}")
-        if not tui._last_trace:
-            run_lines.append("[dim]n/a[/]")
-        self.query_one("#sb-lastrun", Static).update("\n".join(run_lines))
-
-        short = self.workspace
-        if len(short) > 26:
-            short = "..." + short[-23:]
-        self.query_one("#sb-workspace", Static).update(f"[dim]{short}[/]")
-
-
-class OllamaAgentApp(App):
-    """OpenCode-style TUI for the Ollama agent."""
-
-    CSS = """
-    Screen { background: $surface; }
-    #chat-col { width: 1fr; }
-    #chat { height: 1fr; border: none; padding: 0 1; }
-    #input-bar {
-        height: 3;
-        border-left: thick $primary;
-        background: $boost;
-        padding: 0 1;
-    }
-    #sidebar {
-        width: 30;
-        background: $panel;
-        padding: 1 2;
-    }
-    #sb-logo { text-align: center; padding-bottom: 1; }
-    #sb-system, #sb-lastrun { padding-bottom: 1; }
-    #sb-workspace { dock: bottom; }
-    Footer { background: $boost; }
-    """
-
-    def __init__(self, workspace: str) -> None:
-        super().__init__()
-        self.workspace = workspace
-        self._pending_save = False
-
-    def compose(self) -> ComposeResult:
-        with Horizontal():
-            with Vertical(id="chat-col"):
-                yield RichLog(id="chat", markup=True, wrap=True)
-                yield Input(placeholder="message or /command", id="input-bar")
-            yield Sidebar(id="sidebar")
-        yield Footer()
-
-    def on_mount(self) -> None:
-        self.title = "Ollama Agent"
-        self.sub_title = "Enter send · /help · Ctrl+C quit"
-        sidebar = self.query_one(Sidebar)
-        sidebar.workspace = self.workspace
-        sidebar.refresh_vitals()
-        # Background vitals refresh every 2s; never blocks input.
-        self.set_interval(2.0, sidebar.refresh_vitals)
-        self.query_one("#input-bar", Input).focus()
-        self._write(f"[dim]Workspace: {self.workspace} — type /help for commands.[/]")
-
-    # ------------------------------------------------------------------ I/O
-
-    def _write(self, markup: str) -> None:
-        self.query_one("#chat", RichLog).write(markup)
-
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        text = event.value.strip()
-        event.input.value = ""
-        if not text:
-            return
-        # User message appears exactly once.
-        self._write(f"[bold {ACCENT}]you[/] {text}")
-        command = text.lower()
-        if command in {"/quit", "/exit", "q"}:
-            self.exit()
-            return
-        if command == "/help":
-            self._write(
-                "[dim]/run · /benchmark · /save · /status · /workspace · "
-                "/cancel · /models · /logs · /clear · /quit[/]"
-            )
-            return
-        if command == "/clear":
-            self.query_one("#chat", RichLog).clear()
-            return
-        # Everything else (slash commands + requests) runs in a worker thread
-        # so the UI never freezes.
-        asyncio.create_task(self._dispatch(text))
-
-    async def _dispatch(self, text: str) -> None:
-        # A pending inline question ("Save? [y/N]") captures the next input.
-        pending = getattr(self, "_pending_answer", None)
-        if self._pending_save and pending is not None and not pending.done():
-            self._pending_save = False
-            self._pending_answer = None
-            pending.set_result(text)
-            return
-
-        command = text.lower()
-        if command == "/save" or command == "/deploy":
-            await self._save_flow()
-        elif command.startswith("/benchmark"):
-            arg_string = text.strip()[len("/benchmark"):].strip()
-            await tui.run_benchmark_slash(arg_string, self.workspace)
-        elif command == "/status":
-            try:
-                health = await asyncio.to_thread(_http_get, HEALTH_URL)
-                self._write(f"[dim]{health.get('status', '?')} — {health.get('active_workspace', '')}[/]")
-            except Exception as exc:
-                self._write(f"[red]{exc}[/]")
-        elif command == "/workspace":
-            new = await asyncio.to_thread(pick_workspace)
-            self.workspace = new
-            self.query_one(Sidebar).workspace = new
-        elif command == "/cancel":
-            try:
-                res = await post_json(tui.CANCEL_URL, {"workspace_dir": self.workspace})
-                self._write(f"[dim]{res}[/]")
-            except Exception as exc:
-                self._write(f"[red]{exc}[/]")
-        elif command == "/models":
-            try:
-                data = await asyncio.to_thread(_http_get, OLLAMA_BASE + "/api/tags")
-                names = [m.get("name", "") for m in data.get("models", [])]
-                self._write("[dim]" + ("\n".join(names) or "(none)") + "[/]")
-            except Exception as exc:
-                self._write(f"[red]{exc}[/]")
-        elif command == "/logs":
-            for line in _tail_logs():
-                self._write(line)
-        elif command == "/run":
-            self._write("[dim]Type the request directly — /run is the default pipeline.[/]")
-        else:
-            await self._pipeline_flow(text)
-
-    async def _pipeline_flow(self, request_text: str) -> None:
-        """One /agent/run call; print trace, summary, then save prompt inline."""
-        try:
-            await post_json(INIT_URL, {"root_path": self.workspace})
-            result = await asyncio.to_thread(
-                _post_json_sync, RUN_URL,
-                {"prompt": request_text, "workspace_dir": self.workspace},
-            )
-        except Exception as exc:
-            self._write(f"[red]Pipeline error: {exc}[/]")
-            return
-
-        trace = result.get("trace", [])
-        tui._last_trace = trace
-        self._write("[dim]" + _trace_line(trace) + "[/]")
-        self.query_one(Sidebar).refresh_vitals()
-
-        if "answer" in result:
-            self._write(result["answer"])
-            return
-
-        self._write(result.get("summary", "(no summary)"))
-        for failed in result.get("failed_tasks", []):
-            self._write(f"[red]NOT saved (failed): {failed['path']} — {failed['error']}[/]")
-
-        await self._save_flow()
-
-    async def _save_flow(self) -> None:
-        """Inline save confirmation in the chat log (not a modal), default N."""
-        try:
-            diff_status = await post_json(STATUS_URL, {"workspace_dir": self.workspace})
-        except Exception as exc:
-            self._write(f"[red]{exc}[/]")
-            return
-        if not diff_status.get("has_changes"):
-            self._write("[dim]No staged changes.[/]")
-            return
-        dest_root = str(Path(self.workspace).resolve())
-        lines = [f"[yellow]Saving to {dest_root}:[/]"]
-        for diff_obj in diff_status.get("diffs", []):
-            tag = "(new)" if diff_obj["action"] == "create" else "(overwrites existing file)"
-            lines.append(f"  {diff_obj['file']}  [dim]{tag}[/]")
-        self._write("\n".join(lines))
-        # Prompt line in the chat log, default N.
-        answer = await self._ask("Save? [y/N]")
-        if answer != "y":
-            self._write("[dim]Not saved. Files remain in .agent_staging/. "
-                        "Type /save to save them later.[/]")
-            return
-        res = await post_json(tui.DEPLOY_URL, {"workspace_dir": self.workspace})
-        saved = res.get("deployed_files", [])
-        self._write(f"[bold {ACCENT}]Saved {pluralize(len(saved), 'file')} to {dest_root}[/]")
-
-    async def _ask(self, question: str) -> str:
-        """Inline one-line prompt in the chat log; returns lowercase answer."""
-        self._write(f"[bold {ACCENT}]{question}[/]")
-        self._pending_save = True
-        loop = asyncio.get_event_loop()
-        future: asyncio.Future[str] = loop.create_future()
-        self._pending_answer = future
-        return (await future).strip().lower()
+def trace_line(trace: list[dict]) -> str:
+    """Single dim chat line, e.g. 'ROUTE ok 0.0s | PLAN ok 12.3s | ...'."""
+    return " | ".join(f"[{color}]{stage} {value}[/{color}]"
+                      for stage, value, color in trace_stage_rows(trace))
 
 
 def _post_json_sync(url: str, payload: dict) -> dict:
-    """Blocking POST for use inside a worker thread."""
-    import json as _json
-    import urllib.request as _req
-
     data = _json.dumps(payload).encode()
     request = _req.Request(url, data=data, headers={"Content-Type": "application/json"})
     with _req.urlopen(request, timeout=600) as r:
         return _json.loads(r.read())
 
 
-def _run_sync_print(app: "OllamaAgentApp") -> None:
-    """Worker guard (benchmark output goes to its own reports + console)."""
-    return None
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+
+class Sidebar(Static):
+    """SYSTEM, LAST RUN, then pinned to the bottom: workspace + wordmark."""
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="sb-system")
+        yield Static("", id="sb-lastrun")
+        yield Static("", id="sb-workspace")
+        wordmark = Text.from_markup(WORDMARK)
+        wordmark.no_wrap = True
+        yield Static(wordmark, id="sb-wordmark")  # LAST widget, bottom-left
+
+    def render_system(self, lines: list[str], age_seconds: int) -> None:
+        body = "\n".join(lines) + f"\n[{DIM}]updated {age_seconds}s ago[/]"
+        self.query_one("#sb-system", Static).update(f"[bold]SYSTEM[/]\n{body}")
+
+    def render_last_run(self, trace: list[dict]) -> None:
+        lines = ["[bold]LAST RUN[/]"]
+        if not trace:
+            lines.append(f"[{DIM}]n/a[/]")
+        else:
+            for stage, value, color in trace_stage_rows(trace):
+                lines.append(f"[{color}]{stage}[/{color}] [{color}]{value}[/{color}]")
+        self.query_one("#sb-lastrun", Static).update("\n".join(lines))
+
+    def render_workspace(self, workspace: str) -> None:
+        short = workspace if len(workspace) <= 26 else "..." + workspace[-23:]
+        self.query_one("#sb-workspace", Static).update(f"[{DIM}]{short}[/]")
 
 
-def _trace_line(trace: list[dict]) -> str:
-    parts = []
-    seen = {t.get("stage") for t in trace}
-    for entry in trace:
-        stage = entry.get("stage", "?")
-        status = entry.get("status", "ok")
-        seconds = entry.get("seconds", 0.0)
-        parts.append(f"{stage} {status} {seconds:.1f}s")
-    for stage in EXPECTED_STAGES:
-        if stage not in seen:
-            parts.append(f"{stage} SKIPPED")
-    return " | ".join(parts)
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+class OllamaAgentApp(App):
+    CSS = """
+    Screen { background: $surface; }
+    #chat-col { width: 1fr; }
+    #chat {
+        height: 1fr;
+        border: none;
+        padding: 0 1;
+        scrollbar-size-vertical: 2;
+        scrollbar-color: $primary;
+        scrollbar-color-hover: $primary-lighten-2;
+        scrollbar-background: $surface-darken-1;
+    }
+    #input-bar {
+        height: 3;
+        border: none;
+        border-left: thick $primary;
+        background: $boost;
+        padding: 0 1;
+    }
+    #sidebar { width: 30; background: $panel; padding: 1 2; }
+    #sb-system, #sb-lastrun { padding-bottom: 1; }
+    #sb-workspace { dock: bottom; }
+    #sb-wordmark { dock: bottom; text-align: left; padding: 0 1; }
+    #status-bar { height: 1; background: $boost; dock: bottom; }
+    #status-left { width: 1fr; padding: 0 1; color: $text-muted; }
+    #status-right { width: auto; padding: 0 1; color: $primary; }
+    """
+
+    BINDINGS = [Binding("ctrl+c", "quit", "quit")]
+
+    def __init__(self, workspace: str) -> None:
+        super().__init__()
+        self.workspace = workspace
+        self._save_pending = False
+        self._workspace_pending = False
+        self._vitals_lines: list[str] = ["n/a", "n/a", "n/a"]
+        self._vitals_at = 0.0
+        self._polling = False
+
+    def compose(self) -> ComposeResult:
+        with Horizontal():
+            with Vertical(id="chat-col"):
+                yield RichLog(id="chat", markup=True, wrap=True, auto_scroll=False)
+                yield Input(placeholder="message or /command", id="input-bar")
+            yield Sidebar(id="sidebar")
+        with Horizontal(id="status-bar"):
+            yield Static("Enter send · /help · Ctrl+C quit", id="status-left")
+            yield Static("", id="status-right")
+
+    def on_mount(self) -> None:
+        sidebar = self.query_one(Sidebar)
+        sidebar.render_workspace(self.workspace)
+        sidebar.render_last_run(list(tui._last_trace))
+        try:
+            from agent_config import load_agent_config
+
+            model = load_agent_config(self.workspace).coder_model
+        except Exception:
+            model = "qwen2.5-coder:3b"
+        self.query_one("#status-right", Static).update(f"coder: {model}")
+        self.query_one("#input-bar", Input).focus()
+        self._write(f"[{DIM}]Workspace: {self.workspace} — type /help for commands.[/]")
+        # Vitals polling every second, in a thread worker; UI never blocks.
+        self.set_interval(1.0, self._tick)
+
+    # ------------------------------------------------------------------ chat
+
+    def _write(self, markup) -> None:
+        """Write to the log; auto-scroll follows ONLY when already at bottom."""
+        chat = self.query_one("#chat", RichLog)
+        at_bottom = chat.scroll_y >= chat.max_scroll_y - 1
+        chat.write(markup)
+        if at_bottom:
+            chat.scroll_end(animate=False)
+
+    def _tick(self) -> None:
+        age = int(time.monotonic() - self._vitals_at) if self._vitals_at else 0
+        sidebar = self.query_one(Sidebar)
+        sidebar.render_system(self._vitals_lines, age)
+        sidebar.render_last_run(list(tui._last_trace))  # live as stages land
+        if not self._polling:
+            self._poll_vitals()
+
+    @work(thread=True)
+    def _poll_vitals(self) -> None:
+        self._polling = True
+        try:
+            lines = collect_system_lines()
+            self.call_from_thread(self._store_vitals, lines)
+        finally:
+            self._polling = False
+
+    def _store_vitals(self, lines: list[str]) -> None:
+        self._vitals_lines = lines
+        self._vitals_at = time.monotonic()
+
+    # ------------------------------------------------------------------ input
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        event.input.value = ""
+        if not text:
+            return
+
+        # Inline prompts capture the next input (no modal, no "you" echo).
+        if self._save_pending:
+            self._save_pending = False
+            await self._answer_save(text.lower())
+            return
+        if self._workspace_pending:
+            self._workspace_pending = False
+            self._answer_workspace(text)
+            return
+
+        # Turn separation: dim rule, then the message ONCE with accent prefix.
+        self._write(Rule(style=DIM))
+        self._write(f"[bold {ACCENT}]you[/] {text}")
+
+        command = text.lower()
+        if command in {"/quit", "/exit", "q"}:
+            self.exit()
+        elif command == "/help":
+            self._write(f"[{DIM}]/run · /benchmark · /save · /status · /workspace · "
+                        f"/cancel · /models · /logs · /clear · /quit[/]\n")
+        elif command == "/clear":
+            self.query_one("#chat", RichLog).clear()
+        elif command in {"/save", "/deploy"}:
+            self._prepare_save()
+        elif command.startswith("/benchmark"):
+            arg_string = text.strip()[len("/benchmark"):].strip()
+            asyncio.create_task(tui.run_benchmark_slash(arg_string, self.workspace))
+        elif command == "/status":
+            self._status_work()
+        elif command == "/workspace":
+            self._workspace_pending = True
+            self._write(f"[bold {ACCENT}]New workspace path:[/]")
+        elif command == "/cancel":
+            self._cancel_work()
+        elif command == "/models":
+            self._models_work()
+        elif command == "/logs":
+            self._write(_tail_logs_text())
+        elif command == "/run":
+            self._write(f"[{DIM}]Type the request directly — /run is the default pipeline.[/]")
+        else:
+            self._pipeline_work(text)
+
+    # ------------------------------------------------------------- workers
+
+    @work(thread=True)
+    def _pipeline_work(self, request_text: str) -> None:
+        try:
+            _post_json_sync(INIT_URL, {"root_path": self.workspace})
+            result = _post_json_sync(
+                tui.RUN_URL, {"prompt": request_text, "workspace_dir": self.workspace}
+            )
+        except Exception as exc:
+            self.call_from_thread(self._pipeline_error, str(exc))
+            return
+        self.call_from_thread(self._pipeline_done, result)
+
+    @work(thread=True)
+    def _status_work(self) -> None:
+        try:
+            health = _post_get_sync(tui.HEALTH_URL)
+            self.call_from_thread(
+                self._write,
+                f"[{DIM}]{health.get('status', '?')} — {health.get('active_workspace', '')}[/]",
+            )
+        except Exception as exc:
+            self.call_from_thread(self._write, f"[{RED}]{exc}[/]")
+
+    @work(thread=True)
+    def _cancel_work(self) -> None:
+        try:
+            res = _post_json_sync(tui.CANCEL_URL, {"workspace_dir": self.workspace})
+            self.call_from_thread(self._write, f"[{DIM}]{res}[/]")
+        except Exception as exc:
+            self.call_from_thread(self._write, f"[{RED}]{exc}[/]")
+
+    @work(thread=True)
+    def _models_work(self) -> None:
+        try:
+            data = _post_get_sync(OLLAMA_BASE + "/api/tags")
+            names = [m.get("name", "") for m in data.get("models", [])]
+            self.call_from_thread(self._write, f"[{DIM}]" + ("\n".join(names) or "(none)") + "[/]")
+        except Exception as exc:
+            self.call_from_thread(self._write, f"[{RED}]{exc}[/]")
+
+    @work(thread=True)
+    def _prepare_save_work(self) -> None:
+        try:
+            diff_status = _post_json_sync(STATUS_URL, {"workspace_dir": self.workspace})
+        except Exception as exc:
+            self.call_from_thread(self._write, f"[{RED}]{exc}[/]")
+            return
+        self.call_from_thread(self._show_save_prompt, diff_status)
+
+    def _prepare_save(self) -> None:
+        self._prepare_save_work()
+
+    # ------------------------------------------------------------- pipeline UI
+
+    def _pipeline_error(self, message: str) -> None:
+        self._write(f"[{RED}]Pipeline error: {message}[/]\n")
+
+    def _pipeline_done(self, result: dict) -> None:
+        trace = result.get("trace", [])
+        tui._last_trace = trace
+        self._write(f"[{DIM}]" + trace_line(trace) + "[/]")
+
+        if "answer" in result:
+            self._write(result["answer"])
+            self._write("")
+            return
+
+        self._write(result.get("summary", "(no summary)"))
+        for failed in result.get("failed_tasks", []):
+            self._write(f"[{RED}]NOT saved (failed): {failed['path']} — {failed['error']}[/]")
+        self._write("")
+        if result.get("staged_files"):
+            self._prepare_save()
+        else:
+            self._write(f"[{DIM}]No staged changes.[/]")
+
+    # ----------------------------------------------------------------- save
+
+    def _show_save_prompt(self, diff_status: dict) -> None:
+        if not diff_status.get("has_changes"):
+            self._write(f"[{DIM}]No staged changes.[/]")
+            return
+        dest_root = str(Path(self.workspace).resolve())
+        lines = [f"[yellow]Saving to {dest_root}:[/]"]
+        for diff_obj in diff_status.get("diffs", []):
+            tag = "(new)" if diff_obj["action"] == "create" else "(overwrites existing file)"
+            lines.append(f"  {diff_obj['file']}  [{DIM}]{tag}[/]")
+        lines.append(f"[bold {ACCENT}]Save? [y/N][/]")
+        self._write("\n".join(lines))
+        self._save_pending = True
+
+    async def _answer_save(self, answer: str) -> None:
+        if answer != "y":
+            self._write(f"[{DIM}]Not saved. Files remain in .agent_staging/. "
+                        f"Type /save to save them later.[/]\n")
+            return
+        dest_root = str(Path(self.workspace).resolve())
+        try:
+            res = await asyncio.to_thread(
+                _post_json_sync, tui.DEPLOY_URL, {"workspace_dir": self.workspace}
+            )
+            saved = res.get("deployed_files", [])
+            self._write(f"[bold {ACCENT}]Saved {pluralize(len(saved), 'file')} "
+                        f"to {dest_root}[/]\n")
+        except Exception as exc:
+            self._write(f"[{RED}]{exc}[/]\n")
+
+    def _answer_workspace(self, raw: str) -> None:
+        candidate = Path(raw.strip().strip('"')).expanduser()
+        if not candidate.is_dir():
+            self._write(f"[{RED}]Not a valid directory — workspace unchanged.[/]")
+            return
+        self.workspace = str(candidate.resolve())
+        tui._remember_workspace(self.workspace)
+        self.query_one(Sidebar).render_workspace(self.workspace)
+        self._write(f"[{DIM}]Workspace: {self.workspace}[/]")
 
 
-def _tail_logs() -> list[str]:
-    lines: list[str] = []
+def _post_get_sync(url: str) -> dict:
+    with _req.urlopen(url, timeout=5) as r:
+        return _json.loads(r.read())
+
+
+def _tail_logs_text() -> str:
+    parts: list[str] = []
     log_dir = Path(tui.PROJECT_ROOT) / ".agent_logs"
     for log_file in ("planner.log", "coder.log", "sandbox.log"):
         path = log_dir / log_file
         if path.exists():
             tail = path.read_text(encoding="utf-8", errors="replace")[-800:]
-            lines.append(f"[dim]--- {log_file} ---\n{tail}[/]")
-    return lines or ["[dim]No logs yet.[/]"]
+            parts.append(f"[{DIM}]--- {log_file} ---\n{tail}[/]")
+    return "\n".join(parts) if parts else f"[{DIM}]No logs yet.[/]"
 
 
 def run_textual(workspace: str) -> None:
     """Entry point used by tui.cli() when Textual is available."""
-    app = OllamaAgentApp(workspace)
-    app.run()
+    OllamaAgentApp(workspace).run()
