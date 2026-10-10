@@ -157,6 +157,10 @@ WEB_HINTS = ("html", "css", "website", "web page", "webpage", "site", "blog", "l
 
 MAX_TASK_RETRIES = 2  # retries AFTER the first attempt
 VALIDATE_FILE_HEAD_LINES = 60
+SUMMARY_FILE_HEAD_LINES = 40
+# Feature keywords the summary model may NOT invent: dropped when absent from
+# every generated file's actual content.
+SUMMARY_FEATURE_KEYWORDS = ("search", "login", "database", "dark mode", "comments")
 
 
 FILE_QUESTION_HINTS = (
@@ -402,6 +406,101 @@ def _check_html_links(
     return None
 
 
+async def _summary_prose(
+    user_request: str,
+    generated: dict[str, str],
+    generate: Callable[..., Awaitable[str]],
+    coder_model: str,
+) -> str:
+    """One coder-model call: 2-3 sentences describing ONLY features visible in
+    the first 40 lines of each file. Dropped entirely when it names a feature
+    keyword (search/login/database/dark mode/comments) absent from all files,
+    or when the call fails (the skeleton alone is returned then)."""
+    if not generated:
+        return ""
+    sections = []
+    for name, content in generated.items():
+        head = "\n".join(content.splitlines()[:SUMMARY_FILE_HEAD_LINES])
+        sections.append(f"FILE: {name}\n{head}")
+    prompt = (
+        "Describe only features visible in the code shown, in 2-3 sentences. "
+        "Do not invent features.\n\n"
+        + "\n\n".join(sections)
+        + "\n\nREQUEST: " + user_request
+    )
+    try:
+        raw = await generate(
+            coder_model, prompt,
+            system="You describe only what the code visibly does.",
+            temperature=TEMPERATURE_PLAN,
+        )
+    except Exception:
+        return ""
+    _, prose = strip_think_blocks(raw)
+    prose = prose.strip()
+    if not prose:
+        return ""
+    # Feature-keyword guard: drop prose that invents features.
+    all_content = "\n".join(generated.values()).lower()
+    for keyword in SUMMARY_FEATURE_KEYWORDS:
+        if keyword in prose.lower() and keyword not in all_content:
+            return ""
+    return prose
+
+
+def _summary_skeleton(
+    user_request: str,
+    generated: dict[str, str],
+    failed_tasks: list[dict[str, str]],
+    validate_problems: list[str],
+    validate_failed: bool,
+    total_seconds: float,
+) -> str:
+    """Deterministic part of the summary — built in code, never by a model."""
+    file_list = sorted(generated)
+    lines: list[str] = []
+    if validate_failed:
+        lines.append("UNVERIFIED — validation could not run.")
+    lines.append(
+        "Built: " + (", ".join(file_list) if file_list else "(no files passed CHECK)")
+    )
+    if failed_tasks:
+        lines.append("Failed:")
+        for t in failed_tasks:
+            lines.append(f"  NOT saved (failed): {t['path']} - {t['error']}")
+    how: list[str] = []
+    if any(f.endswith((".html", ".htm")) for f in file_list):
+        page = next(f for f in file_list if f.endswith((".html", ".htm")))
+        how.append(f"open {page} in a browser")
+    if any(f.endswith(".py") for f in file_list):
+        script = next(f for f in file_list if f.endswith(".py"))
+        how.append(f"run: python {script}")
+    lines.append("How to run: " + ("; ".join(how) if how else "see file contents"))
+    issues = list(validate_problems)
+    lines.append("Known issues: " + ("; ".join(issues) if issues else "none"))
+    lines.append(f"Total time: {total_seconds:.1f}s")
+    return "\n".join(lines)
+
+
+async def _build_summary(
+    *,
+    user_request: str,
+    generated: dict[str, str],
+    failed_tasks: list[dict[str, str]],
+    validate_problems: list[str],
+    validate_failed: bool,
+    total_seconds: float,
+    generate: Callable[..., Awaitable[str]],
+    coder_model: str,
+) -> str:
+    skeleton = _summary_skeleton(
+        user_request, generated, failed_tasks,
+        validate_problems, validate_failed, total_seconds,
+    )
+    prose = await _summary_prose(user_request, generated, generate, coder_model)
+    return (prose + "\n\n" + skeleton) if prose else skeleton
+
+
 async def run_pipeline(
     user_request: str,
     workspace: str | Path,
@@ -421,6 +520,7 @@ async def run_pipeline(
     workspace = Path(workspace).resolve()
     staging = WorkspaceStagingManager(workspace)
     trace: list[dict[str, Any]] = []
+    pipeline_start = time.monotonic()
 
     def record(stage: str, status: str, seconds: float, note: str = "") -> None:
         trace.append({"stage": stage, "status": status,
@@ -709,26 +809,17 @@ async def run_pipeline(
 
     # ---------------------------------------------------------------- SUMMARY
     t0 = time.monotonic()
-    what = validator_summary or f"Implementation for: {user_request[:200]}"
+    summary = await _build_summary(
+        user_request=user_request,
+        generated=generated,
+        failed_tasks=failed_tasks,
+        validate_problems=validate_problems,
+        validate_failed=validate_failed,
+        total_seconds=time.monotonic() - pipeline_start,
+        generate=generate,
+        coder_model=coder_model,
+    )
     file_list = sorted(generated)
-    how_to_run = []
-    if any(f.endswith(".html") for f in file_list):
-        html_file = next(f for f in file_list if f.endswith(".html"))
-        how_to_run.append(f"open {html_file} in a browser")
-    if any(f.endswith(".py") for f in file_list):
-        py_file = next(f for f in file_list if f.endswith(".py"))
-        how_to_run.append(f"run: python {py_file}")
-    known_issues = list(validate_problems)
-    known_issues += [f"{t['path']}: {t['error']}" for t in failed_tasks]
-
-    summary_lines = [
-        ("UNVERIFIED — validation could not run. " if validate_failed else "") + what,
-        "",
-        "Files: " + (", ".join(file_list) if file_list else "(none passed CHECK)"),
-        "How to run: " + ("; ".join(how_to_run) if how_to_run else "see file contents"),
-        "Known issues: " + ("; ".join(known_issues) if known_issues else "none"),
-    ]
-    summary = "\n".join(summary_lines)
     record("SUMMARY", "ok", time.monotonic() - t0,
            "UNVERIFIED" if validate_failed else "")
 

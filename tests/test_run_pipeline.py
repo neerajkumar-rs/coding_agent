@@ -103,7 +103,10 @@ def test_web_request_three_files_full_trace() -> None:
         # Staged, not deployed
         assert (Path(tmp) / ".agent_staging" / "index.html").is_file()
         assert not (Path(tmp) / "index.html").exists()
-        assert "blog site scaffold" in result["summary"].lower()
+        # Summary = deterministic skeleton (files, how-to-run, issues, time)
+        assert "index.html" in result["summary"]
+        assert "How to run:" in result["summary"]
+        assert "Total time:" in result["summary"]
 
 
 # 3. Forced-failing task -> not staged, listed as FAILED
