@@ -393,7 +393,15 @@ class OllamaAgentApp(App):
         for diff_obj in diff_status.get("diffs", []):
             tag = "(new)" if diff_obj["action"] == "create" else "(overwrites existing file)"
             lines.append(f"  {diff_obj['file']}  [{DIM}]{tag}[/]")
-        lines.append(f"[bold {ACCENT}]Save? [y/N][/]")
+        # --yes auto-approves: only CHECK-passed files are staged, so saving
+        # the staged set is exactly "approve what passed CHECK".
+        if tui._cli_yes:
+            self._write("\n".join(lines))
+            self._write(f"[{DIM}]--yes: auto-saving staged (CHECK-passed) files.[/]")
+            self._deploy_work()
+            return
+        # The literal "[y/N]" must be escaped so Rich does not eat it as markup.
+        lines.append(f"[bold {ACCENT}]Save? \\[y/N][/]")
         self._write("\n".join(lines))
         self._save_pending = True
 
@@ -402,16 +410,20 @@ class OllamaAgentApp(App):
             self._write(f"[{DIM}]Not saved. Files remain in .agent_staging/. "
                         f"Type /save to save them later.[/]\n")
             return
+        self._deploy_work()
+
+    @work(thread=True)
+    def _deploy_work(self) -> None:
         dest_root = str(Path(self.workspace).resolve())
         try:
-            res = await asyncio.to_thread(
-                _post_json_sync, tui.DEPLOY_URL, {"workspace_dir": self.workspace}
-            )
+            res = _post_json_sync(tui.DEPLOY_URL, {"workspace_dir": self.workspace})
             saved = res.get("deployed_files", [])
-            self._write(f"[bold {ACCENT}]Saved {pluralize(len(saved), 'file')} "
-                        f"to {dest_root}[/]\n")
+            self.call_from_thread(
+                self._write,
+                f"[bold {ACCENT}]Saved {pluralize(len(saved), 'file')} to {dest_root}[/]\n",
+            )
         except Exception as exc:
-            self._write(f"[{RED}]{exc}[/]\n")
+            self.call_from_thread(self._write, f"[{RED}]{exc}[/]\n")
 
     def _answer_workspace(self, raw: str) -> None:
         candidate = Path(raw.strip().strip('"')).expanduser()

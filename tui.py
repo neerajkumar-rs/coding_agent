@@ -924,8 +924,14 @@ async def _save_staged(workspace_dir: str) -> None:
     console.print(
         f"[yellow]Saving to {dest_root}:[/yellow]\n" + "\n".join(lines)
     )
-    answer = Prompt.ask("[bold bright_green]Save?[/bold bright_green]",
-                        choices=["y", "N"], default="N")
+    # --yes auto-approves: only CHECK-passed files are ever staged, so
+    # auto-approving the staged set is exactly "approve what passed CHECK".
+    if _cli_yes:
+        console.print("[dim]--yes: auto-saving staged (CHECK-passed) files.[/dim]")
+        answer = "y"
+    else:
+        answer = Prompt.ask("[bold bright_green]Save? [y/N][/bold bright_green]",
+                            choices=["y", "N"], default="N")
     if answer != "y":
         console.print(
             "[dim]Not saved. Files remain in .agent_staging/. "
