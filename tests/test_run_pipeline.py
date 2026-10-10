@@ -139,8 +139,10 @@ def test_bad_html_link_caught() -> None:
         "TARGET FILE: index.html": f"```html\n{bad_html}\n```",
     })
     with TemporaryDirectory() as tmp:
+        # Non-web phrasing: only index.html is planned (web requests now
+        # require html+css+js in the plan by rule; "notes" contains "site").
         result = _run(run_pipeline(
-            "create index.html page",
+            "create index.html holding my recipe collection",
             tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
         ))
         assert result["staged_files"] == []

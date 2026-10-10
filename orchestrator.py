@@ -140,6 +140,7 @@ class VibeOrchestrator:
 LANGUAGE_BY_SUFFIX = {
     ".py": "python", ".html": "html", ".css": "css",
     ".js": "javascript", ".json": "json", ".md": "markdown",
+    ".rs": "rust",
 }
 
 QUESTION_HINTS = (
@@ -151,7 +152,7 @@ CODE_HINTS = (
     "refactor", "generate", "update", "modify", "site", "page", "app",
     "script", "function", "endpoint", "html", "css", "blog",
 )
-PLACEHOLDER_STEMS = {"your_code", "example", "foo", "untitled", "file", "code", "test"}
+PLACEHOLDER_STEMS = {"your_code", "example", "foo", "file1", "untitled", "file", "code", "test"}
 WEB_HINTS = ("html", "css", "website", "web page", "webpage", "site", "blog", "landing", "page")
 
 MAX_TASK_RETRIES = 2  # retries AFTER the first attempt
@@ -275,17 +276,49 @@ def _valid_plan_task(task: dict[str, Any]) -> str | None:
     if stem in PLACEHOLDER_STEMS:
         return f"placeholder filename: {path}"
     suffix = Path(path).suffix.lower()
-    if suffix not in ALLOWED_TARGET_SUFFIXES | {".json", ".md"}:
+    if suffix not in ALLOWED_TARGET_SUFFIXES | {".json", ".md", ".rs"}:
         return f"unsupported file type: {path}"
     if len(desc.split()) < 8:
         return f"description under 8 words: {desc!r}"
     # Extension/language mismatch: description names a DIFFERENT language.
-    lang_words = {".html": ("html",), ".css": ("css",), ".js": ("javascript", "js"), ".py": ("python",)}
+    lang_words = {
+        ".html": ("html",), ".css": ("css",),
+        ".js": ("javascript", "js"), ".py": ("python",),
+        ".rs": ("rust", "rs"),
+    }
     mentioned = {lang for words in lang_words.values() for lang in words if f" {lang} " in f" {desc.lower()} "}
     own = set(lang_words.get(suffix, ()))
     if mentioned and not (mentioned & own):
         return f"extension/language mismatch: {path} vs {sorted(mentioned)}"
     return None
+
+
+def _valid_plan(tasks: list[dict[str, str]], user_request: str) -> list[str]:
+    """Plan-LEVEL rejection reasons (per-task rules live in _valid_plan_task)."""
+    reasons: list[str] = []
+    requested_app_py = bool(re.search(r"\bapp\.py\b", user_request.lower()))
+    for task in tasks:
+        if Path(task["path"]).name.lower() == "app.py" and not requested_app_py:
+            reasons.append("app.py planned but never requested — name files descriptively")
+    lower = user_request.lower()
+    # Completeness fires when the request EXPLICITLY spans html+css+js (or a
+    # multi-file web plan was produced): all three must be present then.
+    # A single-file page request ("create index.html") stays exempt — cross-
+    # file link checks cannot run before sibling files exist anyway.
+    mentions_all_three = all(k in lower for k in ("html", "css")) and (
+        "js" in lower or "javascript" in lower
+    )
+    is_multi_file_web = len(tasks) > 1 and any(
+        h in lower for h in WEB_HINTS
+    )
+    if mentions_all_three or is_multi_file_web:
+        suffixes = {Path(t["path"]).suffix.lower() for t in tasks}
+        missing = {".html", ".css", ".js"} - suffixes
+        if missing and ".html" not in missing:
+            reasons.append(
+                f"web app plan must include html, css and js files (missing: {sorted(missing)})"
+            )
+    return reasons
 
 
 def _fallback_plan(user_request: str) -> list[dict[str, str]]:
@@ -458,11 +491,12 @@ async def run_pipeline(
     t0 = time.monotonic()
     plan_prompt = (
         "You are a software planner. Return ONLY a JSON array of tasks, each "
-        '{"path": "relative/file.ext", "action": "create"|"edit", '
-        '"description": "what to build, at least 8 words"}. '
-        "Use real filenames (no placeholders like your_code or example). "
+        '{"path": "<relative file path>", "action": "create"|"edit", '
+        '"description": "<what to build, at least 8 words>"}. '
+        "Invent concrete, descriptive filenames from the request itself. "
         "Every description must be at least 8 words and match the file's "
-        "language. No code, JSON only.\n\nREQUEST: " + user_request
+        "language. A web page request must produce an HTML file, a CSS file "
+        "and a JavaScript file. No code, JSON only.\n\nREQUEST: " + user_request
     )
     tasks: list[dict[str, Any]] = []
     last_rejects: list[str] = []
@@ -490,6 +524,13 @@ async def run_pipeline(
                         "description": str(candidate["description"]).strip(),
                     }
                 )
+        if tasks:
+            # Plan-level rules (whole-set): app.py only when requested, web
+            # requests must cover html+css+js.
+            plan_reasons = _valid_plan(tasks, user_request)
+            if plan_reasons:
+                last_rejects.extend(plan_reasons)
+                tasks = []
         if tasks:
             break
         if plan_attempt == 0 and not last_rejects:
