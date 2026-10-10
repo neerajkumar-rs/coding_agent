@@ -28,6 +28,9 @@ class AgentConfig:
     coder_5b_or_3b: str = DEFAULT_CODER_MODEL  # Serialized as "coder.5b_or_3b"
     max_context_tokens: int = DEFAULT_CONTEXT_TOKENS
     keep_alive: str = DEFAULT_KEEP_ALIVE  # Top-level Ollama keep_alive (model residency)
+    # Sandbox allowlist: only these named command vectors may run for
+    # validation. Free-form shell is never executed.
+    allowed_commands: list[str] | None = None  # defaults to ["py_compile"]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -35,6 +38,7 @@ class AgentConfig:
             "coder.5b_or_3b": self.coder_5b_or_3b,
             "max_context_tokens": self.max_context_tokens,
             "keep_alive": self.keep_alive,
+            "allowed_commands": self.allowed_commands or ["py_compile"],
         }
 
     @classmethod
@@ -48,11 +52,14 @@ class AgentConfig:
         planner = data.get("planner_model") or DEFAULT_PLANNER_MODEL
         ctx = int(data.get("max_context_tokens", DEFAULT_CONTEXT_TOKENS))
         keep_alive = str(data.get("keep_alive") or DEFAULT_KEEP_ALIVE)
+        raw_allowed = data.get("allowed_commands")
+        allowed = [str(a) for a in raw_allowed] if isinstance(raw_allowed, list) else None
         return cls(
             planner_model=planner,
             coder_5b_or_3b=coder,
             max_context_tokens=ctx,
             keep_alive=keep_alive,
+            allowed_commands=allowed,
         )
 
     @property

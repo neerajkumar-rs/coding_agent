@@ -227,9 +227,11 @@ class Engine:
 
             result.status = STATUS_COMPLETED
             if request.auto_deploy and result.files:
-                deployed = staging.deploy()
+                deployed = staging.deploy(backup_dir=journal.backup_dir)
                 result.deployed_files = deployed
-                journal.emit_event({"event": "deployed", "files": deployed})
+                journal.emit_event(
+                    {"event": "deployed", "files": deployed, "backup_dir": str(journal.backup_dir)}
+                )
             report("all tasks complete • validated code is ready")
         except RunCancelled as exc:
             result.status = STATUS_CANCELLED

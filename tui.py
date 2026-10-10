@@ -1,10 +1,13 @@
-"""Single-command launcher: kills any stray Ollama/FastAPI, owns both as child
-processes, runs a safety preflight, then opens the interactive chat TUI.
+"""Single-command launcher: reuses a running Ollama when one is already up
+(never kills ollama.exe processes it did not spawn), starts the FastAPI
+controller as an owned child, runs a safety preflight, then opens the
+interactive chat TUI.
 
 Usage:
     python tui.py
 
-On exit (Ctrl-C or /quit) all child processes are terminated.
+On exit (Ctrl-C or /quit) only child processes spawned by this TUI are
+terminated.
 """
 
 from __future__ import annotations
@@ -75,6 +78,7 @@ console = Console()
 _owned_procs: list[subprocess.Popen] = []
 _log_handles: list               = []
 _shutdown_done                   = False
+_ollama_reused                   = False  # True when Ollama was already running
 
 
 # ---------------------------------------------------------------------------
@@ -82,68 +86,75 @@ _shutdown_done                   = False
 # ---------------------------------------------------------------------------
 
 def _pids_on_port(port: int) -> list[int]:
-    """Return PIDs listening on *port* (Windows netstat)."""
+    """Return PIDs listening on *port*, cross-platform (netstat on Windows,
+    lsof/ss fallback elsewhere)."""
+    pids: set[int] = set()
+    if sys.platform == "win32":
+        try:
+            out = subprocess.check_output(
+                ["netstat", "-ano", "-p", "tcp"],
+                text=True, stderr=subprocess.DEVNULL, timeout=5,
+            )
+        except Exception:
+            return []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0].upper() == "TCP":
+                local = parts[1].rsplit(":", 1)
+                if len(local) == 2 and local[1] == str(port) and parts[-1].isdigit():
+                    pids.add(int(parts[-1]))
+        return sorted(pids)
+    # POSIX: try lsof, then ss
     try:
         out = subprocess.check_output(
-            ["netstat", "-ano", "-p", "tcp"],
-            text=True, stderr=subprocess.DEVNULL, timeout=5,
+            ["lsof", "-ti", f":{port}"], text=True, stderr=subprocess.DEVNULL, timeout=5
         )
+        return sorted({int(p) for p in out.split() if p.strip().isdigit()})
     except Exception:
-        return []
-    pids: set[int] = set()
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) >= 5 and parts[0].upper() == "TCP":
-            local = parts[1].rsplit(":", 1)
-            if len(local) == 2 and local[1] == str(port) and parts[-1].isdigit():
-                pids.add(int(parts[-1]))
+        pass
+    try:
+        out = subprocess.check_output(
+            ["ss", "-ltnp"], text=True, stderr=subprocess.DEVNULL, timeout=5
+        )
+        for line in out.splitlines():
+            if f":{port} " in line and "pid=" in line:
+                for token in line.split(","):
+                    if token.startswith("pid="):
+                        pids.add(int(token.split("=")[1]))
+    except Exception:
+        pass
     return sorted(pids)
 
 
-def _kill_port(port: int, label: str) -> None:
-    """Kill every foreign PID on *port*."""
-    own = os.getpid()
-    victims = [p for p in _pids_on_port(port) if p != own]
-    if not victims:
+def _terminate_pid(pid: int) -> None:
+    """Terminate a single PID, cross-platform."""
+    if pid == os.getpid():
         return
-    console.print(f"  [yellow]!! Killing {len(victims)} stray {label} process(es) on :{port} -> PIDs {victims}[/yellow]")
-    for pid in victims:
+    if sys.platform == "win32":
         subprocess.run(
             ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {pid} -Force"],
             capture_output=True, check=False,
         )
-    # Brief wait for port to free
+    else:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def _kill_port(port: int, label: str) -> None:
+    """Kill foreign PIDs on *port* — used ONLY for the FastAPI port, never
+    for Ollama (a running Ollama is reused, not killed)."""
+    victims = [p for p in _pids_on_port(port) if p != os.getpid()]
+    if not victims:
+        return
+    console.print(f"  [yellow]!! Killing {len(victims)} stray {label} process(es) on :{port} -> PIDs {victims}[/yellow]")
+    for pid in victims:
+        _terminate_pid(pid)
     for _ in range(10):
         if not _pids_on_port(port):
             break
         time.sleep(0.3)
-
-
-def _kill_proc_by_name(exe_name: str) -> None:
-    """Kill all processes whose image name matches *exe_name* (case-insensitive)."""
-    try:
-        out = subprocess.check_output(
-            ["tasklist", "/FO", "CSV", "/NH"], text=True, stderr=subprocess.DEVNULL, timeout=5
-        )
-    except Exception:
-        return
-    own = os.getpid()
-    for line in out.splitlines():
-        parts = [p.strip('"') for p in line.split('","')]
-        if len(parts) < 2:
-            continue
-        img, pid_str = parts[0], parts[1]
-        if img.lower() == exe_name.lower():
-            try:
-                pid = int(pid_str)
-            except ValueError:
-                continue
-            if pid == own:
-                continue
-            subprocess.run(
-                ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {pid} -Force"],
-                capture_output=True, check=False,
-            )
 
 
 def _spawn(args: list[str], log_name: str, **popen_kwargs) -> subprocess.Popen:
@@ -314,6 +325,9 @@ def _start_ollama() -> subprocess.Popen:
         raise RuntimeError("ollama executable not found — cannot start")
     env = os.environ.copy()
     env["OLLAMA_HOST"] = f"{OLLAMA_HOST}:{OLLAMA_PORT}"
+    # 4GB VRAM ceiling: flash attention + single loaded model.
+    env.setdefault("OLLAMA_FLASH_ATTENTION", "1")
+    env.setdefault("OLLAMA_MAX_LOADED_MODELS", "1")
     console.print(f"  [dim]→ ollama serve  (port {OLLAMA_PORT})[/dim]")
     return _spawn([exe, "serve"], "ollama_service.log", env=env)
 
@@ -328,31 +342,29 @@ def _start_fastapi() -> subprocess.Popen:
 
 
 def start_all_services() -> None:
-    """Kill stray processes, then spawn Ollama + FastAPI as owned children."""
+    """Reuse a running Ollama (never kill ollama.exe we did not spawn), then
+    spawn FastAPI as an owned child. Only the FastAPI port is reclaimed."""
     console.print("\n[bold bright_cyan]Starting services...[/bold bright_cyan]")
 
-    # 1. Kill any orphan Ollama instances
-    _kill_port(OLLAMA_PORT, "Ollama")
-    _kill_proc_by_name("ollama.exe")
+    # 1. Ollama: reuse if the API already answers; otherwise start our own.
+    global _ollama_reused
+    _ollama_reused = _check_ollama_running().ok
+    if _ollama_reused:
+        console.print("  [bright_green]✓ Reusing already-running Ollama (not owned by this TUI)[/bright_green]")
+    else:
+        _start_ollama()
+        with Progress(
+            SpinnerColumn(), TextColumn("[dim]Waiting for Ollama API..."), transient=True, console=console
+        ) as prog:
+            prog.add_task("", total=None)
+            ok = _wait_for_http(OLLAMA_TAGS_URL, timeout=20)
+        if not ok:
+            _shutdown("Ollama failed to start")
+            raise RuntimeError("Ollama did not respond within 20 s")
+        console.print("  [bright_green]✓ Ollama API ready[/bright_green]")
 
-    # 2. Kill anything sitting on the FastAPI port
+    # 2. FastAPI port: reclaim from stray controllers, then start ours.
     _kill_port(FASTAPI_PORT, "FastAPI")
-
-    # 3. Start Ollama as child process
-    _start_ollama()
-
-    # 4. Wait for Ollama to accept connections
-    with Progress(
-        SpinnerColumn(), TextColumn("[dim]Waiting for Ollama API..."), transient=True, console=console
-    ) as prog:
-        prog.add_task("", total=None)
-        ok = _wait_for_http(OLLAMA_TAGS_URL, timeout=20)
-    if not ok:
-        _shutdown("Ollama failed to start")
-        raise RuntimeError("Ollama did not respond within 20 s")
-    console.print("  [bright_green]✓ Ollama API ready[/bright_green]")
-
-    # 5. Start FastAPI as child process
     _start_fastapi()
 
     # 6. Wait for FastAPI
@@ -559,8 +571,11 @@ async def main() -> None:
     table.add_column("Status",   width=10)
     table.add_column("Endpoint", style="dim")
 
-    ollama_proc  = _owned_procs[0] if len(_owned_procs) > 0 else None
-    fastapi_proc = _owned_procs[1] if len(_owned_procs) > 1 else None
+    if _ollama_reused:
+        ollama_proc, fastapi_proc = None, (_owned_procs[0] if _owned_procs else None)
+    else:
+        ollama_proc = _owned_procs[0] if len(_owned_procs) > 0 else None
+        fastapi_proc = _owned_procs[1] if len(_owned_procs) > 1 else None
 
     for label, proc, url, port in [
         ("Ollama serve",    ollama_proc,  OLLAMA_TAGS_URL, OLLAMA_PORT),

@@ -514,14 +514,82 @@ async def workspace_status(payload: StatusRequest | None = None) -> dict[str, An
 @app.post("/agent/deploy")
 async def agent_deploy(payload: DeployRequest | None = None) -> dict[str, Any]:
     """5. POST /agent/deploy
-    
-    Triggers atomic file rearrangements from staging to production paths and flushes the staging cache.
+
+    Triggers atomic file rearrangements from staging to production paths and
+    flushes the staging cache. Overwritten files are backed up under
+    .agent_runs/<latest_run>/backup/ for /agent/rollback.
     """
     if payload and payload.workspace_dir:
         state.rebind_workspace(payload.workspace_dir)
 
+    from agent_core.run_state import RUNS_DIR_NAME
+
+    runs_dir = state.workspace_root / RUNS_DIR_NAME
+    backup_dir = None
+    if runs_dir.is_dir():
+        run_dirs = sorted((d for d in runs_dir.iterdir() if d.is_dir()), reverse=True)
+        if run_dirs:
+            backup_dir = run_dirs[0] / "backup"
+
+    from agent_core.staging import StagingArea
+
+    staging = StagingArea(state.workspace_root)
+    # Reuse the controller's staging manager state: deploy whatever is staged.
+    staged_files = staging.manager.list_staged_files()
+    if not staged_files:
+        return {"status": "noop", "message": "No staged files to deploy", "deployed_files": []}
+    from agent_core.staging import safe_target
+
+    for rel in staged_files:
+        safe_target(state.workspace_root, rel)
+    if backup_dir is not None:
+        for rel in staged_files:
+            existing = state.workspace_root / rel
+            if existing.is_file():
+                dest = backup_dir / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(existing.read_bytes())
     result = state.staging.deploy_staged_files()
+    result["backup_dir"] = str(backup_dir) if backup_dir else None
     return result
+
+
+class RollbackRequest(BaseModel):
+    workspace_dir: str | None = Field(default=None, description="Optional workspace override")
+    run_id: str | None = Field(default=None, description="Run whose backup to restore (default: latest)")
+
+
+@app.post("/agent/rollback")
+async def agent_rollback(payload: RollbackRequest | None = None) -> dict[str, Any]:
+    """Restore files backed up during a previous deploy.
+
+    Picks the latest run's backup under .agent_runs/ unless run_id is given.
+    """
+    from agent_core.run_state import RUNS_DIR_NAME
+    from agent_core.staging import StagingArea
+
+    workspace = Path(payload.workspace_dir).resolve() if payload and payload.workspace_dir else state.workspace_root
+    runs_dir = workspace / RUNS_DIR_NAME
+    if not runs_dir.is_dir():
+        raise HTTPException(status_code=404, detail="No .agent_runs directory found")
+
+    run_dirs = sorted((d for d in runs_dir.iterdir() if d.is_dir()), reverse=True)
+    chosen = None
+    if payload and payload.run_id:
+        chosen = runs_dir / payload.run_id
+        if not chosen.is_dir():
+            raise HTTPException(status_code=404, detail=f"run not found: {payload.run_id}")
+    else:
+        chosen = next((d for d in run_dirs if (d / "backup").is_dir()), None)
+        if chosen is None:
+            raise HTTPException(status_code=404, detail="No run backups available to restore")
+
+    restored = StagingArea.rollback(workspace, chosen / "backup")
+    return {
+        "status": "restored" if restored else "noop",
+        "run_id": chosen.name,
+        "restored_files": restored,
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -538,7 +606,7 @@ def run_cli() -> None:
 
     # Otherwise run uvicorn server
     import uvicorn
-    host = os.getenv("HOST", "0.0.0.0")
+    host = os.getenv("HOST", "127.0.0.1")  # localhost by default; set HOST=0.0.0.0 to expose
     port = int(os.getenv("PORT", "8000"))
     logger.info(f"Starting Local LLM Master Controller on {host}:{port}")
     uvicorn.run("main:app", host=host, port=port, reload=False)

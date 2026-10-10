@@ -14,13 +14,23 @@ from pathlib import Path
 from agent_core.coder import ALLOWED_TARGET_SUFFIXES
 from workspace_staging import WorkspaceStagingManager
 
+# Path segments that must never be written or deployed to.
+PROTECTED_SEGMENTS = {".git", ".agent", ".agent_runs", ".agent_staging", ".agent_logs", "env", ".venv", "__pycache__"}
+
 
 class PathEscapeError(ValueError):
     """Target path would leave the workspace or is otherwise not allowed."""
 
 
+def is_protected(relative_name: str) -> bool:
+    parts = {p.lower() for p in Path(relative_name.replace("\\", "/")).parts}
+    return bool(parts & PROTECTED_SEGMENTS)
+
+
 def safe_target(workspace: Path, relative_name: str) -> Path:
     """Resolve ``relative_name`` inside ``workspace`` or raise PathEscapeError."""
+    if is_protected(relative_name):
+        raise PathEscapeError(f"target path is protected: {relative_name}")
     candidate = (workspace / relative_name).resolve()
     root = workspace.resolve()
     if candidate != root and root not in candidate.parents:
@@ -63,6 +73,41 @@ class StagingArea:
             )
         return "\n".join(chunks)[:max_chars]
 
-    def deploy(self) -> list[str]:
+    def deploy(self, backup_dir: Path | None = None) -> list[str]:
+        """Deploy staged files, backing up overwritten files to ``backup_dir``
+        (typically .agent_runs/<run_id>/backup/) so /agent/rollback can restore.
+        Protected paths are rejected before anything is written."""
+        staged_files = self.manager.list_staged_files()
+        for rel in staged_files:
+            safe_target(self.workspace, rel)  # raises on protected/escape
+
+        if backup_dir is not None:
+            backup_dir = Path(backup_dir)
+            for rel in staged_files:
+                existing = self.workspace / rel
+                if existing.is_file():
+                    dest = backup_dir / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(existing.read_bytes())
+
         result = self.manager.deploy_staged_files()
         return list(result.get("deployed_files", []))
+
+    @staticmethod
+    def rollback(workspace: Path, backup_dir: Path) -> list[str]:
+        """Restore files from a run's backup directory into the workspace."""
+        workspace = Path(workspace).resolve()
+        backup_dir = Path(backup_dir)
+        restored: list[str] = []
+        if not backup_dir.is_dir():
+            return restored
+        for backup_file in backup_dir.rglob("*"):
+            if not backup_file.is_file():
+                continue
+            rel = backup_file.relative_to(backup_dir).as_posix()
+            safe_target(workspace, rel)
+            dest = workspace / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(backup_file.read_bytes())
+            restored.append(rel)
+        return restored

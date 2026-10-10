@@ -65,6 +65,43 @@ class ExecutionSandbox:
                     return str(p.resolve())
         return "powershell.exe"
 
+    # Free-form shell is NOT allowed. Only these argument vectors may run,
+    # and only when explicitly enabled in the workspace's .agent config
+    # ("allowed_commands": ["py_compile", ...]). Anything else is rejected.
+    COMMAND_ALLOWLIST: dict[str, list[str]] = {
+        "py_compile": ["-m", "py_compile"],
+        "pytest": ["-m", "pytest", "-q"],
+    }
+
+    def _load_allowed_commands(self) -> set[str]:
+        """Read the allowlist from .agent (defaults to py_compile only)."""
+        try:
+            from agent_config import load_agent_config
+
+            config = load_agent_config(self.workspace_root)
+            allowed = getattr(config, "allowed_commands", None) or ["py_compile"]
+            return {a for a in allowed if a in self.COMMAND_ALLOWLIST}
+        except Exception:
+            return {"py_compile"}
+
+    def resolve_custom_command(self, name: str | None) -> list[str] | None:
+        """Map an allowlisted command NAME to its argument vector.
+
+        Free-form command strings are rejected — only names present in the
+        workspace .agent allowlist resolve. Returns None when no command was
+        requested; raises ValueError for anything not allowlisted.
+        """
+        if not name:
+            return None
+        key = name.strip()
+        allowed = self._load_allowed_commands()
+        if key not in allowed:
+            raise ValueError(
+                f"custom command {key!r} is not in the .agent allowlist "
+                f"(allowed: {sorted(allowed)}); free-form commands are not supported"
+            )
+        return self.COMMAND_ALLOWLIST[key]
+
     def generate_validation_script(
         self,
         target_rel_path: str,
@@ -73,6 +110,7 @@ class ExecutionSandbox:
         """Generate native validation script (.ps1 on Windows, .sh on Unix) for the staged file."""
         staged_abs = self.staging_manager.get_staged_file_path(target_rel_path)
         py_exe = self.find_python_executable()
+        custom_args = self.resolve_custom_command(custom_command)
 
         if self.platform == "win32":
             script_path = self.staging_manager.staging_dir / "_validate_step.ps1"
@@ -83,9 +121,10 @@ class ExecutionSandbox:
                 f'Write-Host "[SANDBOX] Validating staged file: {staged_abs}"',
             ]
 
-            if custom_command:
-                script_lines.append(f"Write-Host '[SANDBOX] Executing custom command: {custom_command}'")
-                script_lines.append(f"{custom_command}")
+            if custom_args:
+                joined = " ".join(f'"{py_exe}"' if i == 0 else a for i, a in enumerate([py_exe, *custom_args]))
+                script_lines.append(f"Write-Host '[SANDBOX] Executing allowlisted command: {custom_command}'")
+                script_lines.append(joined)
             elif target_rel_path.endswith(".py"):
                 script_lines.append(
                     f'& "{py_exe}" -m py_compile "{staged_abs}"'
@@ -120,9 +159,10 @@ class ExecutionSandbox:
                 f'echo "[SANDBOX] Validating staged file: {staged_abs}"',
             ]
 
-            if custom_command:
-                script_lines.append(f'echo "[SANDBOX] Executing custom command: {custom_command}"')
-                script_lines.append(f"{custom_command}")
+            if custom_args:
+                quoted = " ".join([f'"{py_exe}"', *custom_args])
+                script_lines.append(f'echo "[SANDBOX] Executing allowlisted command: {custom_command}"')
+                script_lines.append(quoted)
             elif target_rel_path.endswith(".py"):
                 script_lines.append(
                     f'"{py_exe}" -m py_compile "{staged_abs}"'
