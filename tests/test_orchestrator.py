@@ -48,7 +48,7 @@ def test_garbage_coder_fails_without_stub_files() -> None:
     rule does not fire — the task simply exhausts its attempts.)
     """
     with TemporaryDirectory() as tmp:
-        engine = StubEngine([PLAN, GARBAGE_A, "refined spec", GARBAGE_B])
+        engine = StubEngine([PLAN, GARBAGE_A, GARBAGE_B])
         result = _run(engine, tmp)
         assert result.status == "failed", result
         assert any("no usable files" in e for e in result.errors)
@@ -86,8 +86,10 @@ def test_no_progress_detector_marks_needs_human() -> None:
     """Two consecutive attempts with the same diagnostic hash -> needs_human."""
     with TemporaryDirectory() as tmp:
         # Coder emits uncompilable code; identical failure twice in a row.
+        # (Retry feedback now goes directly to the coder, not via the planner,
+        # so the script is plan -> bad -> bad with no refine call in between.)
         bad_code = "```FILE: generated.py\ndef broken(:\n```"
-        engine = StubEngine([PLAN, bad_code, "same refined spec", bad_code])
+        engine = StubEngine([PLAN, bad_code, bad_code])
         result = _run(engine, tmp)
         assert result.status == "needs_human", result
         assert result.needs_human, result

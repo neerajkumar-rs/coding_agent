@@ -265,15 +265,29 @@ def parse_coder_output(response: str) -> list[FileEdit]:
     return [FileEdit(path=name, full_content=content) for name, content in json_files.items()]
 
 
+RETRY_FEEDBACK_CHARS = 1_500
+
+
 def generate_file_edits(
     llm: LLM,
     coder_model: str,
     spec: str,
     existing_files: dict[str, str] | None = None,
+    retry_feedback: str | None = None,
 ) -> list[FileEdit]:
     """Edit-aware coder call. ``existing_files`` (bounded by the caller's
-    token budget) is shown to the model so it can emit SEARCH/REPLACE."""
+    token budget) is shown to the model so it can emit SEARCH/REPLACE.
+
+    On retry, ``retry_feedback`` carries the failing verifier output (~1500
+    chars) plus the staged file state — straight back to the coder, NOT via
+    the planner.
+    """
     prompt = EDIT_PROMPT_TEMPLATE + spec
+    if retry_feedback:
+        prompt += (
+            "\n\nPREVIOUS ATTEMPT FAILED. Fix exactly this:\n"
+            + retry_feedback[:RETRY_FEEDBACK_CHARS]
+        )
     if existing_files:
         prompt += "\n\nEXISTING FILES:\n"
         for name, content in existing_files.items():

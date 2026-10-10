@@ -30,7 +30,6 @@ from agent_core.staging import StagingArea
 from agent_core.verifier import verify_files
 from agent_config import AgentConfig, load_agent_config
 from ollama_client import (
-    TEMPERATURE_PLAN,
     OllamaEngine,
     OllamaTruncatedError,
 )
@@ -38,7 +37,6 @@ from ollama_client import (
 MAX_ATTEMPTS_PER_TASK = 2
 MAX_RETRIES = 3
 CODER_SPEC_CHARS = 8_000
-MAX_SPEC_WORDS = 300
 MAX_LOG_CHARS = 8_000
 MAX_GENERATED_CODE_CHARS = 100_000
 THINKER_INPUT_CHARS = 16_000
@@ -301,10 +299,13 @@ class Engine:
             #     unusable output FAILS the attempt with a clear reason.
             files: dict[str, str] | None = None
             coder_error: str | None = None
+            retry_feedback: str | None = None
             spec_chars = CODER_SPEC_CHARS
             for _trunc_retry in range(2):
                 try:
-                    files = self._generate_task_files(task, task_spec[:spec_chars], staging)
+                    files = self._generate_task_files(
+                        task, task_spec[:spec_chars], staging, retry_feedback
+                    )
                     coder_error = None
                     break
                 except OllamaTruncatedError as exc:
@@ -328,6 +329,7 @@ class Engine:
                 )
                 verify_passed = False
                 verify_stdout, verify_stderr = "", diagnostics
+                verify_diag = diagnostics
             else:
                 total_size = sum(len(content) for content in files.values())
                 if total_size > MAX_GENERATED_CODE_CHARS:
@@ -339,9 +341,13 @@ class Engine:
                 result.files = list(dict.fromkeys(result.files + list(files)))
                 result.code = "\n\n".join(files.values())
 
-                verify = verify_files(staged, staging.manager.staging_dir, test_command)
+                verify = verify_files(
+                    staged, staging.manager.staging_dir, test_command,
+                    workspace=self.workspace,
+                )
                 verify_passed = verify.passed
                 verify_stdout, verify_stderr = verify.stdout, verify.stderr
+                verify_diag = verify.diagnostics(coder.RETRY_FEEDBACK_CHARS)
                 journal.emit_event(
                     {
                         "event": "verify_result",
@@ -388,7 +394,9 @@ class Engine:
                     )
                     return "complete"
 
-            # --- Attempt failed: no-progress detection + spec refinement
+            # --- Attempt failed: no-progress detection + DIRECT coder feedback.
+            # Retry feedback = failing verifier output (~1500 chars) + the staged
+            # file contents — sent to the coder, NOT through the planner.
             result.errors.append(f"Task {task_number} attempt {attempt}: {diagnostics[:500]}")
             task["status"] = "failed"
             journal.emit_event(
@@ -411,9 +419,23 @@ class Engine:
             previous_diag_hash = diag_hash
 
             if attempt < self.budgets.max_attempts_per_task:
-                report(f"task {task_number} failed • planner is refining this task")
-                task_spec = self._refine_spec(task_spec, diagnostics)
-                task["spec"] = task_spec
+                report(f"task {task_number} failed • retrying coder with verifier feedback")
+                staged_state = ""
+                if files:
+                    staged_state = "\n\nSTAGED FILES (current state):\n" + "\n".join(
+                        f"[{name}]\n{content[:2_000]}" for name, content in files.items()
+                    )
+                retry_feedback = (verify_diag[: coder.RETRY_FEEDBACK_CHARS] + staged_state)[
+                    : coder.RETRY_FEEDBACK_CHARS + 4_500
+                ]
+                journal.emit_event(
+                    {
+                        "event": "retry_feedback",
+                        "task": task_number,
+                        "attempt": attempt,
+                        "feedback_chars": len(retry_feedback),
+                    }
+                )
 
         return "failed"
 
@@ -427,11 +449,17 @@ class Engine:
         return bool(getattr(self.llm, "supports_structured", False))
 
     def _generate_task_files(
-        self, task: dict[str, Any], task_spec: str, staging: StagingArea
+        self,
+        task: dict[str, Any],
+        task_spec: str,
+        staging: StagingArea,
+        retry_feedback: str | None = None,
     ) -> dict[str, str]:
         """Edit-aware coder call: existing targets are shown to the model
         (token-budgeted) and SEARCH/REPLACE blocks are applied; new files
-        arrive as full fenced blocks. Returns {relative_name: content}."""
+        arrive as full fenced blocks. On retry, ``retry_feedback`` carries the
+        failing verifier output (~1500 chars) directly to the coder.
+        Returns {relative_name: content}."""
         # Resolve which targets already exist (staging first, then workspace).
         existing: dict[str, str] = {}
         target_files = [str(f) for f in task.get("target_files", []) if str(f).strip()]
@@ -440,6 +468,8 @@ class Engine:
         )
         # Spec itself must fit; existing file contents share the rest.
         remaining_chars = budget.input_char_limit - len(task_spec) - 2_000
+        if retry_feedback:
+            remaining_chars -= coder.RETRY_FEEDBACK_CHARS
         for name in target_files:
             if remaining_chars <= 0:
                 break
@@ -458,7 +488,8 @@ class Engine:
             remaining_chars -= len(existing[name])
 
         file_edits = coder.generate_file_edits(
-            self, self.config.coder_model, task_spec, existing or None
+            self, self.config.coder_model, task_spec, existing or None,
+            retry_feedback=retry_feedback,
         )
         materialized: dict[str, str] = {}
         for file_edit in file_edits:
@@ -486,20 +517,6 @@ class Engine:
         return planner.plan_tasks(
             self, self.config.planner_model, request_text, workspace_context,
             str(self.workspace),
-        )
-
-    def _refine_spec(self, specification: str, diagnostics: str) -> str:
-        prompt = (
-            "You are a debugging context parser. Update the Markdown specification "
-            "under 300 words using ONLY the existing specification and test logs. "
-            "Keep signatures and logic rules; state the minimal correction. No code.\n\n"
-            f"SPECIFICATION:\n{specification}\n\nTEST LOG:\n{diagnostics}"
-        )
-        return " ".join(
-            self._llm_text(
-                self.config.planner_model, prompt,
-                max_tokens=900, temperature=TEMPERATURE_PLAN,
-            ).split()[:MAX_SPEC_WORDS]
         )
 
     def _set_workspace(self, workspace_dir: str | Path) -> None:
