@@ -238,26 +238,20 @@ def _extract_code(raw: str) -> str:
 
 
 def _check_generated(rel_path: str, content: str) -> str | None:
-    """Per-file deterministic CHECK, in-process. Returns error or None.
+    """Per-file deterministic CHECK, fully in-process. Returns error or None.
 
     Content problems return a string; an exception escaping this function is
-    an infra error (checker crashed) and aborts WITHOUT a coder retry.
+    an INFRA error (checker crashed) and aborts WITHOUT a coder retry.
     """
     suffix = Path(rel_path).suffix.lower()
     if suffix == ".py":
-        import os
-        import tempfile
-
-        fd, tmp_name = tempfile.mkstemp(suffix=".py")
+        # compile() in-memory: no temp files, no __pycache__, no os.devnull
+        # (py_compile with os.devnull fails on Windows: "nul is a non-regular
+        # file"), no dependence on cwd or paths with spaces.
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(content)
-            # cfile=os.devnull keeps __pycache__ out of the workspace.
-            py_compile.compile(tmp_name, cfile=os.devnull, doraise=True)
-        except py_compile.PyCompileError as exc:
-            return f"py_compile failed: {exc.msg}"
-        finally:
-            Path(tmp_name).unlink(missing_ok=True)
+            compile(content, rel_path, "exec")
+        except SyntaxError as exc:
+            return f"syntax error: {exc.msg} (line {exc.lineno})"
         return None
     return check_plausible_content(rel_path, content)
 

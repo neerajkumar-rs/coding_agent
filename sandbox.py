@@ -16,10 +16,22 @@ from workspace_staging import WorkspaceStagingManager
 logger = logging.getLogger("sandbox")
 
 
+def tail_lines(text: str, count: int = 30) -> str:
+    """Last ``count`` lines of an error log — line-bounded, never char-truncated."""
+    lines = text.strip().splitlines()
+    return "\n".join(lines[-count:])
+
+
 def check_plausible_content(rel_path: str, content: str) -> str | None:
-    """Non-Python plausibility check. Returns an error string, or None if OK."""
+    """Non-Python plausibility check. Returns an error string, or None if OK.
+
+    Fails: empty files, prose-only content, and leftover markdown fences.
+    Valid HTML needs a doctype/<html> AND a <body> and reasonable length.
+    """
     if not content.strip():
         return "file is empty"
+    if "```" in content:
+        return "leftover markdown fences (```) in file content"
     suffix = Path(rel_path).suffix.lower()
     if suffix == ".json":
         import json
@@ -32,6 +44,10 @@ def check_plausible_content(rel_path: str, content: str) -> str | None:
         lower = content.lower()
         if "<html" not in lower and "<!doctype" not in lower:
             return "HTML file contains neither <html> nor <!doctype"
+        if "<body" not in lower:
+            return "HTML file has no <body>"
+        if len(content.strip()) < 40:
+            return "HTML file is too short to be a real page"
     elif suffix == ".css":
         if "{" not in content or "}" not in content:
             return "CSS file contains no rule blocks"
@@ -152,22 +168,21 @@ class ExecutionSandbox:
                 script_lines.append(f"Write-Host '[SANDBOX] Executing allowlisted command: {custom_command}'")
                 script_lines.append(joined)
             elif target_rel_path.endswith(".py"):
+                # In-memory syntax check — no file writes, no __pycache__,
+                # works with spaces in paths. Path passed as an ARG, never
+                # interpolated into code.
                 script_lines.append(
-                    f'& "{py_exe}" -m py_compile "{staged_abs}"'
+                    f'& "{py_exe}" -c "import sys; compile(open(sys.argv[1], encoding=\'utf-8\').read(), sys.argv[1], \'exec\')" "{staged_abs}"'
                 )
                 script_lines.append('if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }')
                 script_lines.append('Write-Host "[SANDBOX] Syntax compilation successful."')
             else:
-                # Non-Python: non-empty + plausible content via sandbox module.
-                script_lines.append(
-                    f'$err = & "{py_exe}" -c "import sys; sys.path.insert(0, r\'{self.workspace_root}\'); '
-                    f'from sandbox import check_plausible_content; from pathlib import Path; '
-                    f'p = Path(r\'{staged_abs}\'); '
-                    f'err = check_plausible_content(r\'{target_rel_path}\', p.read_text(encoding=\'utf-8\', errors=\'replace\') if p.is_file() else \'\'); '
-                    f'print(err or \'\'); sys.exit(1 if err else 0)"'
+                # Non-Python files never reach generate_validation_script:
+                # execute_validation checks them in-process. Guard anyway.
+                raise ValueError(
+                    f"non-Python target {target_rel_path!r} is validated in-process; "
+                    "no script is generated for it"
                 )
-                script_lines.append('if ($LASTEXITCODE -ne 0) { Write-Error $err; exit $LASTEXITCODE }')
-                script_lines.append('Write-Host "[SANDBOX] Content plausibility check passed."')
 
             script_content = "\r\n".join(script_lines) + "\r\n"
             script_path.write_text(script_content, encoding="utf-8")
@@ -197,20 +212,18 @@ class ExecutionSandbox:
                 script_lines.append(f'echo "[SANDBOX] Executing allowlisted command: {custom_command}"')
                 script_lines.append(quoted)
             elif target_rel_path.endswith(".py"):
+                # In-memory syntax check; path passed as an arg, never
+                # interpolated into code.
                 script_lines.append(
-                    f'"{py_exe}" -m py_compile "{staged_abs}"'
+                    f'"{py_exe}" -c "import sys; compile(open(sys.argv[1], encoding=\'utf-8\').read(), sys.argv[1], \'exec\')" "{staged_abs}"'
                 )
                 script_lines.append('echo "[SANDBOX] Syntax compilation successful."')
             else:
-                # Non-Python: non-empty + plausible content via sandbox module.
-                script_lines.append(
-                    f'"{py_exe}" -c "import sys; sys.path.insert(0, \'{self.workspace_root}\'); '
-                    f'from sandbox import check_plausible_content; from pathlib import Path; '
-                    f'p = Path(\'{staged_abs}\'); '
-                    f'err = check_plausible_content(\'{target_rel_path}\', p.read_text(encoding=\'utf-8\', errors=\'replace\') if p.is_file() else \'\'); '
-                    f'print(err or \'\'); sys.exit(1 if err else 0)"'
+                # Non-Python files never reach generate_validation_script.
+                raise ValueError(
+                    f"non-Python target {target_rel_path!r} is validated in-process; "
+                    "no script is generated for it"
                 )
-                script_lines.append('echo "[SANDBOX] Content plausibility check passed."')
 
             script_content = "\n".join(script_lines) + "\n"
             script_path.write_text(script_content, encoding="utf-8")
@@ -297,7 +310,7 @@ class ExecutionSandbox:
         duration_s = round(time.time() - start_time, 3)
         success = exit_code == 0
 
-        # Discrete operational logging to sandbox.log
+        # Discrete operational logging to sandbox.log (full text in the log).
         self.staging_manager.log_sandbox(
             command=cmd,
             exit_code=exit_code,
@@ -311,6 +324,8 @@ class ExecutionSandbox:
             "exit_code": exit_code,
             "stdout": stdout,
             "stderr": stderr,
+            # Caller-facing error: last ~30 lines, never char-truncated.
+            "error_tail": tail_lines(stderr or stdout),
             "script_path": str(script_path),
             "duration_s": duration_s,
         }

@@ -142,7 +142,7 @@ def test_html_step_stages_and_validates(ws) -> None:
 def test_html_plausibility_check() -> None:
     assert check_plausible_content("a.html", "") == "file is empty"
     assert check_plausible_content("a.html", "just some text") is not None
-    assert check_plausible_content("a.html", "<!doctype html><html></html>") is None
+    assert check_plausible_content("a.html", "<!doctype html><html><head></head><body><p>ok page body</p></body></html>") is None
     assert check_plausible_content("a.json", "{bad json") is not None
     assert check_plausible_content("a.json", '{"ok": true}') is None
     assert check_plausible_content("a.css", "no braces here") is not None
