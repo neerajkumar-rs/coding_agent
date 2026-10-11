@@ -54,13 +54,11 @@ OLLAMA_BASE = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}"
 
 def _set_fastapi_port(port: int) -> None:
     """Repoint every FastAPI URL at *port* (busy-port fallback)."""
-    global FASTAPI_PORT, FASTAPI_BASE, HEALTH_URL, PLAN_URL, STEP_URL
+    global FASTAPI_PORT, FASTAPI_BASE, HEALTH_URL
     global STATUS_URL, DEPLOY_URL, INIT_URL, RUN_URL, CANCEL_URL, EVENTS_URL
     FASTAPI_PORT = port
     FASTAPI_BASE = f"http://{FASTAPI_HOST}:{port}"
     HEALTH_URL = FASTAPI_BASE + "/health"
-    PLAN_URL = FASTAPI_BASE + "/agent/plan"
-    STEP_URL = FASTAPI_BASE + "/agent/step"
     STATUS_URL = FASTAPI_BASE + "/workspace/status"
     DEPLOY_URL = FASTAPI_BASE + "/agent/deploy"
     INIT_URL = FASTAPI_BASE + "/workspace/init"
@@ -78,7 +76,7 @@ REQUIRED_MODELS = [
 ]
 
 OLLAMA_TAGS_URL = OLLAMA_BASE + "/api/tags"
-_set_fastapi_port(FASTAPI_PORT)  # initializes HEALTH_URL/PLAN_URL/... consistently
+_set_fastapi_port(FASTAPI_PORT)  # initializes HEALTH_URL/RUN_URL/... consistently
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 LOG_DIR = PROJECT_ROOT / ".agent_logs"

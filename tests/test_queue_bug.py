@@ -1,33 +1,22 @@
-"""Regression tests: plan->step queue persistence, stale-server detection,
-non-Python targets, scanner junk filtering."""
+"""Regression tests kept after retiring the /agent/plan + /agent/step queue:
+stale-server detection (build_id), scanner junk filtering, html plausibility,
+and plan-stage rejection of non-source/junk targets (now in run_pipeline's
+_valid_plan_task)."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 import main
 from main import _build_id
+from orchestrator import _valid_plan_task
 from sandbox import check_plausible_content
 from scanner import WorkspaceScanner, is_junk_file
-
-PLAN_JSON = '{"tasks":[{"id":1,"file":"index.html","action":"create","description":"x"}]}'
-
-
-def _mock_planner() -> None:
-    main.state.ollama.generate = AsyncMock(return_value=PLAN_JSON)
-
-
-def _mock_coder(code: str = "<html><body>hi</body></html>") -> None:
-    async def fake_stream(**kwargs):
-        yield f"```html\n{code}\n```"
-
-    main.state.ollama.stream_generate = MagicMock(side_effect=lambda **kw: fake_stream())
 
 
 @pytest.fixture
@@ -35,61 +24,6 @@ def ws():
     with TemporaryDirectory() as tmp:
         main.state.rebind_workspace(tmp)
         yield tmp
-
-
-def test_plan_then_step_same_workspace_keeps_queue(ws) -> None:
-    client = TestClient(main.app)
-    client.post("/workspace/init", json={"root_path": ws})
-    _mock_planner()
-    r = client.post("/agent/plan", json={"prompt": "make a page", "workspace_dir": ws})
-    assert r.status_code == 200
-    assert len(main.state.task_queue) == 1
-
-    _mock_coder()
-    r = client.post("/agent/step", json={"task_id": 1, "workspace_dir": ws})
-    assert r.status_code == 200, r.text
-    assert len(main.state.task_queue) == 1  # queue NOT wiped by same-workspace step
-
-
-def test_different_workspace_resets_queue(ws) -> None:
-    client = TestClient(main.app)
-    client.post("/workspace/init", json={"root_path": ws})
-    _mock_planner()
-    client.post("/agent/plan", json={"prompt": "make a page", "workspace_dir": ws})
-    assert len(main.state.task_queue) == 1
-
-    with TemporaryDirectory() as other:
-        client.post("/workspace/init", json={"root_path": other})
-        assert len(main.state.task_queue) == 0  # intentional reset on real change
-
-
-def test_step_unknown_task_id_clear_error(ws) -> None:
-    client = TestClient(main.app)
-    client.post("/workspace/init", json={"root_path": ws})
-    _mock_planner()
-    client.post("/agent/plan", json={"prompt": "p", "workspace_dir": ws})
-
-    r = client.post("/agent/step", json={"task_id": 99, "workspace_dir": ws})
-    assert r.status_code == 404
-    detail = r.json()["detail"]
-    assert "99" in detail and "known ids" in detail
-
-
-def test_step_unknown_task_id_empty_queue_message(ws) -> None:
-    client = TestClient(main.app)
-    client.post("/workspace/init", json={"root_path": ws})
-    r = client.post("/agent/step", json={"task_id": 5, "workspace_dir": ws})
-    assert r.status_code == 404
-    assert "EMPTY" in r.json()["detail"]
-
-
-def test_step_with_task_object_empty_queue(ws) -> None:
-    client = TestClient(main.app)
-    client.post("/workspace/init", json={"root_path": ws})
-    _mock_coder()
-    task = {"id": 7, "file": "page.html", "action": "create", "description": "d"}
-    r = client.post("/agent/step", json={"task": task, "workspace_dir": ws})
-    assert r.status_code == 200, r.text
 
 
 def test_health_exposes_build_id(ws) -> None:
@@ -127,18 +61,6 @@ def test_tui_stale_restart_kills_only_after_yes() -> None:
         kill_mock.assert_called_once_with(4321)
 
 
-def test_html_step_stages_and_validates(ws) -> None:
-    client = TestClient(main.app)
-    client.post("/workspace/init", json={"root_path": ws})
-    _mock_coder("<html><body>hi</body></html>")
-    task = {"id": 1, "file": "index.html", "action": "create", "description": "page"}
-    r = client.post("/agent/step", json={"task": task, "workspace_dir": ws})
-    assert r.status_code == 200, r.text
-    staged = Path(r.json()["staged_path"])
-    assert staged.exists()
-    assert not (Path(ws) / "index.html").exists()  # staged, not deployed
-
-
 def test_html_plausibility_check() -> None:
     assert check_plausible_content("a.html", "") == "file is empty"
     assert check_plausible_content("a.html", "just some text") is not None
@@ -168,11 +90,22 @@ def test_scanner_ignores_junk_files(ws) -> None:
     assert "task1_code.txt" not in joined
 
 
-def test_plan_rejects_non_source_targets(ws) -> None:
-    raw = json.dumps({"tasks": [
-        {"id": 1, "file": "tasks.md", "action": "create", "description": "junk"},
-        {"id": 2, "file": "logo.png", "action": "create", "description": "img"},
-        {"id": 3, "file": "app.py", "action": "create", "description": "real"},
-    ]})
-    tasks = main.parse_tasks_json(raw)
-    assert [t["file"] for t in tasks] == ["app.py"]
+def test_plan_rejects_non_source_and_junk_targets() -> None:
+    """run_pipeline's plan validation rejects junk artifacts and non-source
+    targets (the retired parse_tasks_json used to do this for the old queue)."""
+    bad = [
+        {"path": "tasks.md", "action": "create",
+         "description": "run artifact that must never be planned as a target"},
+        {"path": "summary.txt", "action": "create",
+         "description": "leftover summary artifact that must never be planned"},
+        {"path": "task1_code.txt", "action": "create",
+         "description": "leftover per-task code artifact that must not be planned"},
+        {"path": "logo.png", "action": "create",
+         "description": "binary image that is not a supported source target"},
+    ]
+    reasons = [_valid_plan_task(t) for t in bad]
+    assert all(r is not None for r in reasons), reasons
+
+    good = {"path": "app.py", "action": "create",
+            "description": "real python application implementing the requested feature completely"}
+    assert _valid_plan_task(good) is None

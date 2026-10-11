@@ -282,10 +282,16 @@ def _language_of(path: str) -> str:
 
 def _valid_plan_task(task: dict[str, Any]) -> str | None:
     """Return a rejection reason, or None when the plan task is acceptable."""
+    from scanner import is_junk_file
+
     path = str(task.get("path", "")).strip().replace("\\", "/")
     desc = str(task.get("description", "")).strip()
     if not path:
         return "empty path"
+    # Never plan around leftover run artifacts (tasks.md, summary.txt,
+    # taskN_code.txt, images, etc.) — same junk filter the scanner uses.
+    if is_junk_file(Path(path).name):
+        return f"junk artifact filename: {path}"
     stem = Path(path).stem.lower()
     if stem in PLACEHOLDER_STEMS:
         return f"placeholder filename: {path}"

@@ -150,7 +150,12 @@ def test_sandbox_execution() -> None:
 
 
 def test_fastapi_endpoints() -> None:
-    """Test 4: FastAPI master controller endpoints (init, plan, step, status, deploy)."""
+    """Test 4: FastAPI master controller endpoints (init, run, status, deploy).
+
+    The retired /agent/plan + /agent/step queue is superseded by the single
+    pipeline endpoint POST /agent/run (ROUTE -> PLAN -> CODE -> CHECK ->
+    VALIDATE -> SUMMARY), which stages CHECK-passed files without deploying.
+    """
     client = TestClient(app)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -168,44 +173,39 @@ def test_fastapi_endpoints() -> None:
         assert (tmp_path / ".agent_staging").exists()
         assert (tmp_path / ".agent_logs").exists()
 
-        # 2. POST /agent/plan (mocking ollama thinker response)
-        mock_thinker_output = (
-            "<think>Analyzing request to create user greeting module...</think>\n"
-            "```json\n"
-            "{\n"
-            '  "tasks": [\n'
-            '    {"id": 1, "file": "greet.py", "action": "create", "description": "Create greet function"}\n'
-            "  ]\n"
-            "}\n"
-            "```"
-        )
-        with patch.object(state.ollama, "generate", new_callable=AsyncMock) as mock_gen:
-            mock_gen.return_value = mock_thinker_output
-            plan_res = client.post("/agent/plan", json={"prompt": "Build greeting module"})
-            assert plan_res.status_code == 200
-            plan_data = plan_res.json()
-            assert len(plan_data["tasks"]) == 1
-            assert plan_data["tasks"][0]["file"] == "greet.py"
-            assert plan_data["tasks"][0]["action"] == "create"
+        # 2. POST /agent/run — the single pipeline. Mock the supervisor's
+        #    generate to route on the prompt markers run_pipeline emits.
+        plan_json = json.dumps([
+            {"path": "greet.py", "action": "create",
+             "description": "Create a greet function returning a greeting string"}
+        ])
+        good_code = "```python\ndef greet(name: str) -> str:\n    return f'Hello, {name}!'\n```"
+        validate_ok = json.dumps({
+            "satisfies_request": True, "problems": [], "summary": "A greet module."
+        })
 
-            # Check planner log was written
-            planner_log = tmp_path / ".agent_logs" / "planner.log"
-            assert planner_log.exists()
-            assert "Analyzing request" in planner_log.read_text(encoding="utf-8")
+        async def mock_generate(prompt: str, **kwargs):
+            if "JSON array of tasks" in prompt:
+                return plan_json
+            if "TARGET FILE: greet.py" in prompt:
+                return good_code
+            if "satisfies_request" in prompt:
+                return validate_ok
+            if "Describe only features visible" in prompt:
+                return ""
+            return ""
 
-        # 3. POST /agent/step (mocking coder stream response)
-        async def mock_stream(*args, **kwargs):
-            yield "```python\n"
-            yield "def greet(name: str) -> str:\n"
-            yield "    return f'Hello, {name}!'\n"
-            yield "```"
-
-        with patch.object(state.ollama, "stream_generate", side_effect=mock_stream):
-            step_res = client.post("/agent/step", json={"task_id": 1})
-            assert step_res.status_code == 200
-            step_data = step_res.json()
-            assert step_data["status"] == "completed"
-            assert step_data["diagnostic"]["success"] is True
+        with patch.object(state.ollama, "generate", side_effect=mock_generate):
+            run_res = client.post(
+                "/agent/run",
+                json={"prompt": "create greet.py with a greet function"},
+            )
+            assert run_res.status_code == 200, run_res.text
+            run_data = run_res.json()
+            assert "greet.py" in run_data["staged_files"]
+            assert run_data["failed_tasks"] == []
+            stages = [t["stage"] for t in run_data["trace"]]
+            assert "PLAN" in stages and "CHECK" in stages and "SUMMARY" in stages
 
             # Verify file was written to staging, NOT production root
             staged_file = tmp_path / ".agent_staging" / "greet.py"
@@ -213,11 +213,12 @@ def test_fastapi_endpoints() -> None:
             assert staged_file.exists()
             assert not prod_file.exists()
 
-            # Check coder and sandbox logs
-            assert (tmp_path / ".agent_logs" / "coder.log").exists()
-            assert (tmp_path / ".agent_logs" / "sandbox.log").exists()
+            # Run metadata lives under .agent_runs/<run_id>/
+            run_dir = tmp_path / ".agent_runs" / run_data["run_id"]
+            assert (run_dir / "state.json").exists()
+            assert (run_dir / "events.jsonl").exists()
 
-        # 4. POST /workspace/status
+        # 3. POST /workspace/status
         status_res = client.post("/workspace/status", json={})
         assert status_res.status_code == 200
         status_data = status_res.json()
@@ -225,7 +226,7 @@ def test_fastapi_endpoints() -> None:
         assert status_data["staged_count"] == 1
         assert "greet.py" in status_data["diffs"][0]["file"]
 
-        # 5. POST /agent/deploy
+        # 4. POST /agent/deploy
         deploy_res = client.post("/agent/deploy", json={})
         assert deploy_res.status_code == 200
         deploy_data = deploy_res.json()
@@ -240,7 +241,7 @@ def test_fastapi_endpoints() -> None:
         status_after = client.post("/workspace/status", json={}).json()
         assert status_after["has_changes"] is False
 
-        print("Test 4 passed: Complete FastAPI Master Controller lifecycle.")
+        print("Test 4 passed: Complete FastAPI Master Controller lifecycle (single pipeline).")
 
 
 if __name__ == "__main__":
