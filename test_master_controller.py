@@ -184,7 +184,7 @@ def test_fastapi_endpoints() -> None:
             "satisfies_request": True, "problems": [], "summary": "A greet module."
         })
 
-        async def mock_generate(prompt: str, **kwargs):
+        async def mock_generate(role_or_model, prompt, **kwargs):
             if "JSON array of tasks" in prompt:
                 return plan_json
             if "TARGET FILE: greet.py" in prompt:
@@ -195,7 +195,9 @@ def test_fastapi_endpoints() -> None:
                 return ""
             return ""
 
-        with patch.object(state.ollama, "generate", side_effect=mock_generate):
+        # The pipeline now funnels through state.gateway.generate (the single
+        # process-wide LLM gateway), so patch THAT — the true entry point.
+        with patch.object(state.gateway, "generate", side_effect=mock_generate):
             run_res = client.post(
                 "/agent/run",
                 json={"prompt": "create greet.py with a greet function"},

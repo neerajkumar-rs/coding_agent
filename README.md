@@ -233,14 +233,32 @@ The workspace root itself only ever receives the **requested target files**
 
 ## VRAM Safety Model (RTX 3050 4 GB)
 
-1. **One model at a time** — a single process-wide lock serializes every
-   generation across all workspaces and endpoints.
-2. **Server-side residency** — when the TUI spawns `ollama serve` it sets
-   `OLLAMA_FLASH_ATTENTION=1` and `OLLAMA_MAX_LOADED_MODELS=1`
-   (server env vars — NOT payload fields). `keep_alive: "5m"` keeps the model
-   warm between calls via the payload's top-level field.
-3. **Context discipline** — `num_ctx=4096`; prompt inputs are capped at 85% of
-   the window (tokens ≈ chars/3.5) minus the output reserve.
+**The honest guarantee:** at most ONE model is resident in VRAM, and after
+every load at least **97% of that model's weights sit on the GPU**
+(`size_vram / size >= 0.97`). The OS may still page the model file into cache
+while loading — that is normal and not a VRAM leak.
+
+1. **One process-wide lock** — `AgentGateway._lock` (in `ollama_client.py`)
+   serializes every generation on the `/agent/run` path. It is the only lock
+   on the hot path (the supervisor's `_vram_mutex` is the *same* object,
+   injected by the gateway).
+2. **VRAM guard (per load of model M)** — `/api/ps` first: every other resident
+   model is unloaded (`keep_alive=0`) and polled empty (15 s timeout). After the
+   load, `size_vram/size >= 0.97` is required; otherwise M is unloaded, num_ctx
+   steps down one rung of [4096, 6144, 8192, 12288, 16384], and the load is
+   retried. At the lowest rung it raises `VramGuardError` — it never falls back
+   to CPU silently. OOM / "runner stopped" / HTTP 500 trigger the same
+   step-down retry.
+3. **Server-side residency** — when the TUI spawns `ollama serve` it sets
+   `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_MAX_LOADED_MODELS=1`,
+   `OLLAMA_NUM_PARALLEL=1` (server env vars, NOT payload fields). Reusing an
+   already-running Ollama prints a warning that these cannot be verified.
+   `keep_alive: "5m"` is the payload's top-level field.
+4. **Context discipline** — per-role `num_ctx` (thinker 8192, coder 6144 by
+   default); prompt inputs capped at 85% of the window minus the output reserve.
+5. **nvidia-smi watchdog** — logs `memory.used` around each load; warns when
+   free VRAM < 300 MB; silent when nvidia-smi is absent. On Windows it prints
+   once: set "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback".
 
 ---
 

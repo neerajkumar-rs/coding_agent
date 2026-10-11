@@ -73,6 +73,17 @@ class ControllerState:
         self.sandbox = ExecutionSandbox(self.workspace_root, self.staging)
         self.scanner = WorkspaceScanner(self.workspace_root)
         self.ollama = OllamaSupervisorClient()
+        # THE single process-wide LLM gateway (one lock, VRAM guard). Lazy-built
+        # so importing main never binds a lock to the wrong event loop.
+        self._gateway: Any | None = None
+
+    @property
+    def gateway(self) -> Any:
+        from ollama_client import AgentGateway
+
+        if self._gateway is None:
+            self._gateway = AgentGateway(self.ollama, self.config)
+        return self._gateway
 
     def rebind_workspace(self, root_path: str | Path) -> None:
         self.workspace_root = Path(root_path).resolve()
@@ -80,6 +91,8 @@ class ControllerState:
         self.staging = WorkspaceStagingManager(self.workspace_root)
         self.sandbox = ExecutionSandbox(self.workspace_root, self.staging)
         self.scanner = WorkspaceScanner(self.workspace_root)
+        # Config changed: rebuild the gateway's config view (same lock/transport).
+        self._gateway = None
         logger.info(f"Workspace rebound to: {self.workspace_root}")
 
     def ensure_workspace(self, root_path: str | Path | None) -> None:
@@ -287,6 +300,15 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
     cancel_event = get_engine(state.workspace_root)._cancel_event
     cancel_event.clear()  # a fresh run starts un-cancelled
 
+    # THE single process-wide gateway: one lock, VRAM guard, role config.
+    gateway = state.gateway
+
+    def _role_of(model: str) -> str:
+        """Map a pipeline model name to its role (thinker vs coder)."""
+        if model == state.config.coder_model:
+            return "coder"
+        return "thinker"
+
     async def _generate(
         model: str,
         prompt: str,
@@ -295,9 +317,11 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
         role: str | None = None,
         num_ctx: int | None = None,
     ) -> str:
-        return await state.ollama.generate(
-            prompt=prompt, system_prompt=system, model_name=model,
-            config=state.config, temperature=temperature,
+        return await gateway.generate(
+            role or _role_of(model),
+            prompt,
+            system=system,
+            temperature=temperature,
             cancel_event=cancel_event,
         )
 
@@ -312,43 +336,12 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
             logger.warning(f"model unload failed for {model}: {exc}")
 
     async def _structured_generate(model: str, prompt: str, schema: Any) -> Any:
-        """Schema-constrained generation: Ollama `format` + pydantic validation,
-        one self-correct retry. Aborts promptly on cancel. Raises on failure so
-        the caller falls back to the JSON-regex prompt path."""
-        last_error: str | None = None
-        for _attempt in range(2):
-            effective = prompt
-            if last_error:
-                effective = (
-                    f"{prompt}\n\nYour previous reply failed validation with:\n"
-                    f"{last_error}\nReturn ONLY a JSON object matching the schema."
-                )
-            payload = {
-                "model": model,
-                "prompt": effective,
-                "system": "You output only strict JSON matching the schema.",
-                "stream": False,
-                "keep_alive": state.config.keep_alive,
-                "format": schema.model_json_schema(),
-                "options": {
-                    "num_ctx": state.config.max_context_tokens,
-                    "num_predict": 1024,
-                    "temperature": TEMPERATURE_PLAN,
-                },
-            }
-            if cancel_event.is_set():
-                raise RuntimeError("run cancelled")
-            async with httpx.AsyncClient(timeout=state.ollama.timeout) as client:
-                resp = await client.post(state.ollama.generate_url, json=payload)
-                if resp.status_code != 200:
-                    raise OllamaError(f"structured generate failed ({resp.status_code})")
-                raw = resp.json().get("response", "")
-            _, clean = strip_think_blocks(raw)
-            try:
-                return schema.model_validate(json.loads(clean))
-            except Exception as exc:
-                last_error = str(exc)[:400]
-        raise OllamaError(f"structured output failed validation twice: {last_error}")
+        """Schema-constrained generation through the single gateway (Ollama
+        `format` + pydantic, one self-correct retry). Raises on failure so the
+        caller falls back to the JSON-regex prompt path."""
+        return await gateway.structured(
+            _role_of(model), prompt, schema, cancel_event=cancel_event
+        )
 
     try:
         result = await run_pipeline(

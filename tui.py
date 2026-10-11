@@ -536,9 +536,10 @@ def _start_ollama() -> subprocess.Popen:
         raise RuntimeError("ollama executable not found — cannot start")
     env = os.environ.copy()
     env["OLLAMA_HOST"] = f"{OLLAMA_HOST}:{OLLAMA_PORT}"
-    # 4GB VRAM ceiling: flash attention + single loaded model.
+    # 4GB VRAM ceiling: flash attention + single loaded model + no parallelism.
     env.setdefault("OLLAMA_FLASH_ATTENTION", "1")
     env.setdefault("OLLAMA_MAX_LOADED_MODELS", "1")
+    env.setdefault("OLLAMA_NUM_PARALLEL", "1")
     console.print(f"  [dim]→ ollama serve  (port {OLLAMA_PORT})[/dim]")
     return _spawn([exe, "serve"], "ollama_service.log", env=env)
 
@@ -563,6 +564,12 @@ def start_all_services(assume_yes: bool = False) -> None:
     _ollama_reused = _check_ollama_running().ok
     if _ollama_reused:
         console.print("  [bright_green]✓ Reusing already-running Ollama (not owned by this TUI)[/bright_green]")
+        # We did NOT spawn it, so we cannot verify/force the server env vars
+        # (OLLAMA_MAX_LOADED_MODELS=1 etc.) that the VRAM guard relies on.
+        console.print(
+            "  [yellow]! Cannot verify OLLAMA_MAX_LOADED_MODELS=1 / OLLAMA_NUM_PARALLEL=1 /\n"
+            "    OLLAMA_FLASH_ATTENTION=1 on a reused Ollama — set them when you start it.[/yellow]"
+        )
     else:
         _start_ollama()
         with Progress(
