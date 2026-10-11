@@ -63,6 +63,10 @@ class OllamaError(RuntimeError):
         self.done_reason = done_reason
 
 
+class OllamaCancelledError(OllamaError):
+    """The in-flight request was aborted because the run was cancelled."""
+
+
 class OllamaTruncatedError(OllamaError):
     """Response was cut off (``done_reason == "length"``). Always retryable."""
 
@@ -207,6 +211,49 @@ class OllamaSupervisorClient:
             },
         }
 
+    async def _post_cancellable(
+        self,
+        client: httpx.AsyncClient,
+        payload: dict[str, Any],
+        cancel_event: Any | None,
+    ) -> dict[str, Any]:
+        """POST /api/generate, aborting the in-flight request the moment the
+        workspace's cancel event is set. Closing the client drops the HTTP
+        connection, which makes Ollama stop the runner promptly."""
+        if cancel_event is None:
+            response = await client.post(self.generate_url, json=payload)
+            if response.status_code != 200:
+                raise OllamaError(
+                    f"Ollama generation failed ({response.status_code}): {response.text}"
+                )
+            return response.json()
+
+        async def _watch() -> None:
+            while not cancel_event.is_set():
+                await asyncio.sleep(0.1)
+
+        post_task = asyncio.ensure_future(client.post(self.generate_url, json=payload))
+        watch_task = asyncio.ensure_future(_watch())
+        try:
+            done, _pending = await asyncio.wait(
+                {post_task, watch_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if watch_task in done and cancel_event.is_set():
+                post_task.cancel()
+                await client.aclose()  # drop the connection: aborts the runner
+                raise OllamaCancelledError("run cancelled by user")
+            watch_task.cancel()
+            response = post_task.result()
+            if response.status_code != 200:
+                raise OllamaError(
+                    f"Ollama generation failed ({response.status_code}): {response.text}"
+                )
+            return response.json()
+        finally:
+            for task in (post_task, watch_task):
+                if not task.done():
+                    task.cancel()
+
     async def generate_response(
         self,
         prompt: str,
@@ -216,6 +263,7 @@ class OllamaSupervisorClient:
         num_predict: int | None = None,
         temperature: float = TEMPERATURE_PLAN,
         seed: int = DEFAULT_SEED,
+        cancel_event: Any | None = None,
     ) -> LLMResponse:
         """Sequential stateless generation with think-stripping and truncation guard.
 
@@ -249,12 +297,7 @@ class OllamaSupervisorClient:
                     f"temp={temperature}, keep_alive={cfg.keep_alive})"
                 )
                 async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    response = await client.post(self.generate_url, json=payload)
-                    if response.status_code != 200:
-                        raise OllamaError(
-                            f"Ollama generation failed ({response.status_code}): {response.text}"
-                        )
-                    data = response.json()
+                    data = await self._post_cancellable(client, payload, cancel_event)
 
             raw_text = data.get("response", "")
             done_reason = data.get("done_reason") or "stop"
@@ -301,6 +344,7 @@ class OllamaSupervisorClient:
         config: AgentConfig | None = None,
         num_predict: int | None = None,
         temperature: float = TEMPERATURE_PLAN,
+        cancel_event: Any | None = None,
     ) -> str:
         """Compatibility wrapper: return only the think-stripped answer text."""
         response = await self.generate_response(
@@ -310,6 +354,7 @@ class OllamaSupervisorClient:
             config=config,
             num_predict=num_predict,
             temperature=temperature,
+            cancel_event=cancel_event,
         )
         return response.text
 

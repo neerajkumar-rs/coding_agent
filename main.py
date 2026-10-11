@@ -533,12 +533,25 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
     """
     from orchestrator import run_pipeline
 
-    state.ensure_workspace(payload.workspace_dir)
+    from agent_core.engine import get_engine
 
-    async def _generate(model: str, prompt: str, system: str = "", temperature: float = 0.2) -> str:
+    state.ensure_workspace(payload.workspace_dir)
+    # One cancel event per workspace: /agent/cancel sets it on this same engine.
+    cancel_event = get_engine(state.workspace_root)._cancel_event
+    cancel_event.clear()  # a fresh run starts un-cancelled
+
+    async def _generate(
+        model: str,
+        prompt: str,
+        system: str = "",
+        temperature: float = 0.2,
+        role: str | None = None,
+        num_ctx: int | None = None,
+    ) -> str:
         return await state.ollama.generate(
             prompt=prompt, system_prompt=system, model_name=model,
             config=state.config, temperature=temperature,
+            cancel_event=cancel_event,
         )
 
     async def _unload(model: str) -> None:
@@ -551,15 +564,62 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
         except Exception as exc:
             logger.warning(f"model unload failed for {model}: {exc}")
 
+    async def _structured_generate(model: str, prompt: str, schema: Any) -> Any:
+        """Schema-constrained generation: Ollama `format` + pydantic validation,
+        one self-correct retry. Aborts promptly on cancel. Raises on failure so
+        the caller falls back to the JSON-regex prompt path."""
+        last_error: str | None = None
+        for _attempt in range(2):
+            effective = prompt
+            if last_error:
+                effective = (
+                    f"{prompt}\n\nYour previous reply failed validation with:\n"
+                    f"{last_error}\nReturn ONLY a JSON object matching the schema."
+                )
+            payload = {
+                "model": model,
+                "prompt": effective,
+                "system": "You output only strict JSON matching the schema.",
+                "stream": False,
+                "keep_alive": state.config.keep_alive,
+                "format": schema.model_json_schema(),
+                "options": {
+                    "num_ctx": state.config.max_context_tokens,
+                    "num_predict": 1024,
+                    "temperature": TEMPERATURE_PLAN,
+                },
+            }
+            if cancel_event.is_set():
+                raise RuntimeError("run cancelled")
+            async with httpx.AsyncClient(timeout=state.ollama.timeout) as client:
+                resp = await client.post(state.ollama.generate_url, json=payload)
+                if resp.status_code != 200:
+                    raise OllamaError(f"structured generate failed ({resp.status_code})")
+                raw = resp.json().get("response", "")
+            _, clean = strip_think_blocks(raw)
+            try:
+                return schema.model_validate(json.loads(clean))
+            except Exception as exc:
+                last_error = str(exc)[:400]
+        raise OllamaError(f"structured output failed validation twice: {last_error}")
+
     try:
-        return await run_pipeline(
+        result = await run_pipeline(
             payload.prompt,
             state.workspace_root,
             generate=_generate,
             planner_model=state.config.planner_model,
             coder_model=state.config.coder_model,
             unload=_unload,
+            cancel_event=cancel_event,
+            num_ctx=state.config.max_context_tokens,
+            structured_generate=_structured_generate,
         )
+        if result.get("status") == "cancelled":
+            # Cancel is a normal outcome, not a 500: unload whatever is resident.
+            await _unload(state.config.coder_model)
+            await _unload(state.config.planner_model)
+        return result
     except HTTPException:
         raise
     except Exception as exc:

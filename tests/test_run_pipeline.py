@@ -223,3 +223,112 @@ def test_validate_error_marks_unverified() -> None:
         assert validate["status"] == "failed"
         # Files still staged (CHECK passed); failure is reported, not hidden
         assert len(result["staged_files"]) == 3
+
+
+# --- Phase 1: RunJournal observability ---------------------------------------
+
+def test_run_pipeline_writes_run_journal() -> None:
+    fake = make_fake_generate({
+        "JSON array of tasks": WEB_PLAN,
+        "TARGET FILE: index.html": f"```html\n{INDEX_HTML}\n```",
+        "TARGET FILE: style.css": f"```css\n{STYLE_CSS}\n```",
+        "TARGET FILE: script.js": f"```javascript\n{SCRIPT_JS}\n```",
+        "satisfies_request": VALIDATE_OK,
+    })
+    with TemporaryDirectory() as tmp:
+        result = _run(run_pipeline(
+            "make a blog site in html5 css and js",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+        ))
+        run_dir = Path(tmp) / ".agent_runs" / result["run_id"]
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        assert state["status"] == "completed"
+        assert state["llm_calls"] >= 3  # plan + 3 coder + validate (+summary)
+        events = (run_dir / "events.jsonl").read_text(encoding="utf-8")
+        assert '"run_started"' in events and '"run_finished"' in events
+        assert '"stage": "PLAN"' in events and '"stage": "SUMMARY"' in events
+
+
+# --- Phase 1: cancellation -----------------------------------------------------
+
+def test_cancel_during_code_stops_fast_and_stages_nothing_further() -> None:
+    import threading
+    import time as _time
+
+    cancel = threading.Event()
+
+    async def fake(model, prompt, system="", temperature=0.2):
+        if "JSON array of tasks" in prompt:
+            return WEB_PLAN
+        if "TARGET FILE: index.html" in prompt:
+            # Cancel lands while the first coder call is in flight.
+            cancel.set()
+            _time.sleep(0.05)
+            return f"```html\n{INDEX_HTML}\n```"
+        if "TARGET FILE: style.css" in prompt:
+            return f"```css\n{STYLE_CSS}\n```"
+        if "TARGET FILE: script.js" in prompt:
+            return f"```javascript\n{SCRIPT_JS}\n```"
+        return VALIDATE_OK
+
+    with TemporaryDirectory() as tmp:
+        start = _time.monotonic()
+        result = _run(run_pipeline(
+            "make a blog site in html5 css and js",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+            cancel_event=cancel,
+        ))
+        elapsed = _time.monotonic() - start
+        assert result["status"] == "cancelled"
+        assert elapsed < 2.0  # stops within 2 s of the cancel landing
+        # index.html was coded (the call in flight completed) but the pipeline
+        # aborted before staging the remaining files.
+        assert "script.js" not in result["staged_files"]
+        # Journal records the cancellation
+        state = json.loads(
+            (Path(tmp) / ".agent_runs" / result["run_id"] / "state.json").read_text(encoding="utf-8")
+        )
+        assert state["status"] == "cancelled"
+
+
+# --- Phase 1: deterministic verifier gate on Python --------------------------
+
+def test_verifier_catches_runtime_import_crash() -> None:
+    """Syntax-valid but import-crashing Python passes compile() yet must be
+    rejected by the verifier's import-smoke step (and never staged)."""
+    crashing = "```python\nimport nonexistent_module_xyz_123\n\nX = 1\n```"
+    fake = make_fake_generate({
+        "JSON array of tasks": json.dumps([
+            {"path": "crashes.py", "action": "create",
+             "description": "Python module that imports a missing dependency at top level"}
+        ]),
+        "TARGET FILE: crashes.py": crashing,
+    })
+    with TemporaryDirectory() as tmp:
+        result = _run(run_pipeline(
+            "create crashes.py that imports a missing module",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+        ))
+        assert result["staged_files"] == []
+        assert result["failed_tasks"][0]["path"] == "crashes.py"
+        assert "verifier" in result["failed_tasks"][0]["error"].lower()
+        assert not (Path(tmp) / ".agent_staging" / "crashes.py").exists()
+
+
+def test_verifier_passes_clean_python() -> None:
+    fake = make_fake_generate({
+        "JSON array of tasks": json.dumps([
+            {"path": "greet.py", "action": "create",
+             "description": "Python module with a greet function returning a greeting string"}
+        ]),
+        "TARGET FILE: greet.py": "```python\ndef greet(name):\n    return f'Hello, {name}!'\n```",
+        "satisfies_request": VALIDATE_OK,
+        "Describe only features visible": "",
+    })
+    with TemporaryDirectory() as tmp:
+        result = _run(run_pipeline(
+            "create greet.py with a greet function",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+        ))
+        assert result["staged_files"] == ["greet.py"]
+        assert result["failed_tasks"] == []

@@ -244,3 +244,59 @@ def test_chat_strips_think_before_return() -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# In-flight cancellation (async supervisor)
+# ---------------------------------------------------------------------------
+
+class _SlowGenerate(BaseHTTPRequestHandler):
+    """Holds the POST open for ~5s, simulating a long in-flight generation."""
+
+    def do_POST(self) -> None:
+        import time as _t
+
+        _t.sleep(5)
+        body = json.dumps({"response": "late", "done_reason": "stop"}).encode()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except OSError:
+            pass  # client already hung up on cancel
+
+    def log_message(self, *_a: object) -> None:
+        return
+
+
+def test_supervisor_aborts_inflight_request_on_cancel() -> None:
+    import asyncio
+    import threading as _threading
+
+    from ollama_client import OllamaCancelledError, OllamaSupervisorClient
+
+    server, base_url = _serve(_SlowGenerate)
+    cancel = _threading.Event()
+    try:
+        async def go() -> float:
+            client = OllamaSupervisorClient(base_url=base_url)
+            cancel.set()  # cancel before the (slow) POST can complete
+            started = asyncio.get_event_loop().time()
+            try:
+                await client.generate(
+                    prompt="ping",
+                    model_name="qwen2.5-coder:3b",
+                    config=AgentConfig(max_context_tokens=4096),
+                    cancel_event=cancel,
+                )
+                return -1.0
+            except OllamaCancelledError:
+                return asyncio.get_event_loop().time() - started
+
+        elapsed = asyncio.run(go())
+        assert 0.0 <= elapsed < 2.0  # aborted fast, not after the 5s reply
+    finally:
+        server.shutdown()
+        server.server_close()

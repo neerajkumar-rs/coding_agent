@@ -20,6 +20,30 @@ class Plan(BaseModel):
     tasks: list[PlanTask] = Field(min_length=1, max_length=12)
 
 
+# --- run_pipeline plan shape (path/action/description) -------------------------
+
+class PipelineTask(BaseModel):
+    """One run_pipeline task: the single unified plan format."""
+
+    path: str = Field(min_length=1, max_length=200)
+    action: str = Field(default="create", pattern="^(create|edit)$")
+    description: str = Field(min_length=1, max_length=2_000)
+
+
+class PipelinePlan(BaseModel):
+    """run_pipeline planner output: an ordered list of file tasks."""
+
+    tasks: list[PipelineTask] = Field(min_length=1, max_length=12)
+
+
+class ValidateResult(BaseModel):
+    """Validator output: does the generated set satisfy the request?"""
+
+    satisfies_request: bool
+    problems: list[str] = Field(default_factory=list, max_length=20)
+    summary: str = Field(default="", max_length=500)
+
+
 class AuditIssue(BaseModel):
     severity: str = Field(pattern="^(info|warning|critical)$")
     message: str = Field(min_length=1, max_length=500)
