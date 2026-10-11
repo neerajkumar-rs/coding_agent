@@ -16,28 +16,26 @@ This project is licensed under the [MIT License](./LICENSE).
 
 ```
 FastAPI Master Controller (main.py)   ←  0 MB VRAM deterministic supervisor
-        │  /agent/run · /agent/plan · /agent/step · /agent/deploy
+        │  /agent/run (THE pipeline) · /agent/deploy
         │  /agent/events (SSE) · /agent/cancel · /agent/rollback
         ▼
-agent_core.engine.Engine              ←  THE pipeline (orchestrator.py is a shim)
+orchestrator.run_pipeline             ←  ROUTE → PLAN → CODE → CHECK → VALIDATE → SUMMARY
+        │  (agent_core is the library it calls)
+        ├── agent_core.context.py    ContextBudget: prompts capped at ≤85% of num_ctx
+        ├── agent_core.schemas.py    PipelinePlan / ValidateResult (Ollama format +
+        │                            pydantic, 1 retry) with JSON-regex fallback
+        ├── agent_core.verifier.py   DETERMINISTIC Python gate: py_compile → ruff* →
+        │                            import smoke → pytest* (*skipped when tool absent)
+        ├── agent_core.staging.py    path-escape + protected paths, backups/rollback
+        ├── agent_core.run_state.py  RunJournal: .agent_runs/<run_id>/{state.json,
+        │                            events.jsonl}
+        ├── workspace_staging.py     .agent_staging/ → difflib → atomic deploy
+        └── sandbox.py               in-process plausibility CHECK (non-Python)
         │
-        ├── context.py     AST repo map + token budgeter (chars/3.5, ≤85% of num_ctx)
-        ├── planner.py     Plan via Ollama structured outputs (pydantic-validated,
-        │                  one retry) with markdown fallback
-        ├── coder.py       New files: full fenced block. Edits: SEARCH/REPLACE
-        │                  (exact → whitespace-normalized, unique-only)
-        ├── verifier.py    DETERMINISTIC: py_compile → ruff* → import smoke → pytest*
-        │                  (*skipped when tool absent; the only pass/fail gate)
-        ├── auditor.py     LLM review of the DIFF only; verdict pass/concerns;
-        │                  NEVER blocks a deterministic pass
-        ├── staging.py     .agent_staging/ → verify → deploy (backups to
-        │                  .agent_runs/<id>/backup/), path-escape + protected paths
-        └── run_state.py   .agent_runs/<run_id>/{state.json,events.jsonl,tasks.md}
-        │
-        ▼  one process-wide lock (sync threading.Lock + async gateway)
+        ▼  one async lock on the hot path (OllamaSupervisorClient._vram_mutex)
 Local Ollama  http://localhost:11434
-        ├── deepseek-r1:1.5b          ←  Planner / Auditor
-        └── qwen2.5-coder:3b          ←  Coder
+        ├── deepseek-r1:1.5b          ←  Planner / Validator
+        └── qwen2.5-coder:3b          ←  Coder / Answers / Summaries
 ```
 
 **Run budgets** (per run): 900 s wall time, 40 LLM calls, 2 attempts per task.
@@ -131,17 +129,16 @@ All endpoints accept and return JSON.
 { "prompt": "Create a greeting CLI in generated.py", "auto_deploy": true }
 ```
 
-Runs the full engine: context scan → plan → per task [coder → stage →
-deterministic verify → audit (diff only)] → deploy on success with backups.
-Response carries `status`, `run_id`, `files`, `deployed_files`, `attempts`,
-`llm_calls`, `errors`, `needs_human`, `audits`.
+Runs the single pipeline `orchestrator.run_pipeline`: ROUTE → PLAN → CODE →
+CHECK → VALIDATE → SUMMARY. Stages CHECK-passed files (never auto-deploys).
+Response carries `summary`, `staged_files`, `failed_tasks`, `trace`, `run_id`
+for code tasks, or `answer`, `trace`, `run_id` for questions, plus `status`
+on cancel/budget stop.
 
-### `POST /agent/plan` / `POST /agent/step`
-
-Interactive flow: plan a task queue, then execute tasks one at a time into
-`.agent_staging/`, each followed by a sandbox validation. `/agent/step` accepts
-`custom_command` only as an **allowlisted name** from `.agent`
-(`allowed_commands`, default `["py_compile"]`); free-form shell is rejected.
+`POST /agent/plan` and `POST /agent/step` were **retired** — `/agent/run`
+supersedes them. `/agent/run` never auto-deploys: it stages CHECK-passed files
+and returns `{summary, staged_files, failed_tasks, trace, run_id}` (or
+`{answer, trace, run_id}` for questions). Deploy is explicit:
 
 ### `POST /workspace/status`
 
@@ -189,16 +186,17 @@ e:\coding_agent\
 │   └── planner_eval.py    ← planner schema-conformance benchmark
 │
 ├── main.py                ← FastAPI controller (all endpoints)
-├── orchestrator.py        ← COMPAT SHIM over Engine (legacy RunResult)
+├── orchestrator.py        ← run_pipeline: THE single pipeline behind /agent/run
 ├── agent_config.py        ← .agent profile + --recalculate CLI
 ├── ollama_client.py       ← think-stripping + truncation-guarded LLM layer
 ├── workspace_staging.py   ← staging manager + difflib + atomic deploy
-├── sandbox.py             ← allowlisted validation commands (.ps1/.sh)
-├── scanner.py             ← workspace scanner (interactive endpoints)
+├── sandbox.py             ← in-process plausibility CHECK + allowlisted commands
+├── scanner.py             ← workspace scanner (file questions)
 ├── tui.py                 ← Rich TUI (reuses running Ollama)
+├── tui_textual.py         ← Textual TUI (two-column, sidebar, save prompt)
 │
-├── tests/                 ← pytest suite (61 tests, offline)
-├── test_master_controller.py  ← legacy lifecycle suite (offline)
+├── tests/                 ← pytest suite (160 tests, offline)
+├── test_master_controller.py  ← legacy lifecycle suite (offline, via /agent/run)
 ├── e2e_smoke_test.py          ← end-to-end with mock Ollama server
 └── test_live_ollama.py        ← live Ollama connection check
 ```
@@ -218,7 +216,7 @@ The workspace root itself only ever receives the **requested target files**
 ## Testing
 
 ```powershell
-# Unit tests (61, offline)
+# Unit tests (160, offline)
 .\env\Scripts\python.exe -m pytest tests/ -q
 
 # Legacy lifecycle suite (offline)
@@ -255,7 +253,7 @@ Reports land in `<workspace>\.agent_runs\bench\` (JSON + Markdown).
 # Headless from the shell (starts/reuses Ollama, NO FastAPI):
 .\env\Scripts\python.exe tui.py --benchmark --quick
 .\env\Scripts\python.exe tui.py --workspace E:\proj --benchmark --quick --coexist
-.\env\Scripts\python.exe tui.py --benchmark --compare validator=deepseek-r1:1.5b,phi4-mini --repeat 3
+.\env\Scripts\python.exe tui.py --benchmark --compare validator=deepseek-r1:1.5b,qwen2.5-coder:3b --repeat 3
 
 # Or directly:
 .\env\Scripts\python.exe bench.py --workspace . --quick
@@ -268,7 +266,7 @@ inference on the 4 GB card):
 /benchmark                                  all roles from .agent
 /benchmark --quick
 /benchmark --roles validator --repeat 3
-/benchmark --compare planner=deepseek-r1:1.5b,phi4-mini
+/benchmark --compare planner=deepseek-r1:1.5b,qwen2.5-coder:3b
 /benchmark --plan-mode two-stage
 /benchmark --coexist
 /benchmark last                             print the newest report

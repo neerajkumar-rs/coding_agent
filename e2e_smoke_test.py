@@ -8,8 +8,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from agent_core.engine import Engine, RunRequest
+from agent_core.llm_gateway import LLMGateway
+from agent_core.run_state import RUNS_DIR_NAME
 from ollama_client import OllamaEngine
-from orchestrator import RUNS_DIR_NAME, VibeOrchestrator
 
 
 class FakeOllama(BaseHTTPRequestHandler):
@@ -64,8 +66,8 @@ def main() -> None:
         base_url = f"http://127.0.0.1:{server.server_port}"
         with TemporaryDirectory() as workspace:
             engine = OllamaEngine(base_url=base_url, workspace_root=workspace)
-            result = VibeOrchestrator(engine=engine, workspace=workspace).run(
-                "Create a greeting function", "generated.py"
+            result = Engine(workspace=workspace, llm=LLMGateway(engine)).run(
+                RunRequest(prompt="Create a greeting function", target_file="generated.py")
             )
             workspace_root = Path(workspace)
             target = workspace_root / "generated.py"
@@ -104,7 +106,10 @@ def main() -> None:
             assert not staging_leftovers, staging_leftovers
 
             # Think blocks were stripped before validation/parsing
-            assert "think" not in result.llm_validation.lower()[:200] or result.llm_validation.startswith("PASS")
+            audit_text = "; ".join(
+                issue["message"] for audit in result.audits for issue in audit.get("issues", [])
+            )
+            assert "think" not in audit_text.lower()[:200]
         print("E2E smoke test passed: Ollama thinker -> coder -> write -> compile")
     finally:
         server.shutdown()

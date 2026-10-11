@@ -1,11 +1,10 @@
-"""Compatibility shim + the single server-side pipeline.
+"""The single server-side pipeline used by POST /agent/run.
 
-``VibeOrchestrator`` keeps its Phase 1 constructor and ``run()`` signature so
-existing callers and tests keep working, delegating to agent_core's Engine.
-
-``run_pipeline`` is THE request pipeline used by POST /agent/run:
 ROUTE -> PLAN -> CODE -> CHECK -> VALIDATE -> SUMMARY, with a per-stage
-trace and no hidden stages.
+trace and no hidden stages. agent_core is a library this pipeline calls:
+RunJournal (logs/events), safe_target/StagingArea (staging/safety),
+ContextBudget (85% prompt budget), schemas (structured planner/validator),
+and verifier (deterministic Python CHECK).
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ from typing import Any, Awaitable, Callable
 
 from agent_core.coder import ALLOWED_TARGET_SUFFIXES, parse_coder_output, apply_file_edit
 from agent_core.context import ContextBudget
-from agent_core.run_state import RUNS_DIR_NAME, RunJournal
+from agent_core.run_state import RUNS_DIR_NAME, RunJournal, diagnostic_hash
 from agent_core.schemas import PipelinePlan, ValidateResult
 from agent_core.staging import safe_target
 from agent_core.verifier import verify_files
@@ -40,107 +39,22 @@ from agent_core.engine import (
     DEFAULT_MAX_WALL_SECONDS,
     MAX_ATTEMPTS_PER_TASK,
     BudgetExhausted,
-    Engine,
     RunBudgets,
     RunCancelled,
-    RunRequest,
 )
-from agent_core.llm_gateway import LegacyLLMAdapter
-from agent_core.run_state import RUNS_DIR_NAME
 
 # Re-exported so older imports (tests, e2e, tui) keep resolving.
 __all__ = [
     "BudgetExhausted",
     "RunBudgets",
-    "RunResult",
-    "VibeOrchestrator",
+    "RunCancelled",
     "RUNS_DIR_NAME",
     "MAX_ATTEMPTS_PER_TASK",
     "DEFAULT_MAX_WALL_SECONDS",
     "DEFAULT_MAX_LLM_CALLS",
+    "classify_request",
+    "run_pipeline",
 ]
-
-
-@dataclass
-class RunResult:
-    """Legacy result shape returned by VibeOrchestrator.run()."""
-
-    status: str
-    run_id: str = ""
-    target_file: str = ""
-    files: list[str] = field(default_factory=list)
-    specification: str = ""
-    code: str = ""
-    attempts: int = 0
-    stdout: str = ""
-    stderr: str = ""
-    llm_validation: str = ""
-    errors: list[str] = field(default_factory=list)
-    needs_human: list[str] = field(default_factory=list)
-    llm_calls: int = 0
-    elapsed_seconds: float = 0.0
-
-
-class VibeOrchestrator:
-    """Thin adapter: legacy interface in, agent_core Engine out."""
-
-    def __init__(
-        self,
-        engine: Any | None = None,
-        workspace: Path | str = ".",
-        max_retries: int = MAX_ATTEMPTS_PER_TASK,
-        budgets: RunBudgets | None = None,
-    ) -> None:
-        if budgets is None:
-            budgets = RunBudgets(max_attempts_per_task=max_retries)
-        budgets.max_attempts_per_task = max(1, min(budgets.max_attempts_per_task, 3))
-        self.budgets = budgets
-        # A provided "engine" is a legacy chat engine (or test stub): adapt it
-        # so it satisfies the Engine's llm protocol without consuming extra
-        # scripted responses on structured calls.
-        llm = LegacyLLMAdapter(engine) if engine is not None else None
-        self._engine = Engine(workspace=workspace, llm=llm, budgets=budgets)
-        self.workspace = self._engine.workspace
-
-    def run(
-        self,
-        user_request: str,
-        target_file: str | None = None,
-        test_command: list[str] | None = None,
-        progress: Callable[[str], None] | None = None,
-        workspace_dir: str | Path | None = None,
-    ) -> RunResult:
-        report = self._engine.run(
-            RunRequest(
-                prompt=user_request,
-                target_file=target_file,
-                test_command=test_command,
-                progress=progress,
-                workspace_dir=workspace_dir,
-                auto_deploy=True,
-            )
-        )
-        self.workspace = self._engine.workspace
-        return RunResult(
-            status=report.status,
-            run_id=report.run_id,
-            target_file=target_file or "",
-            files=report.files,
-            specification=report.specification,
-            code=report.code,
-            attempts=report.attempts,
-            stdout=report.stdout,
-            stderr=report.stderr,
-            llm_validation="; ".join(
-                issue["message"]
-                for audit in report.audits
-                for issue in audit.get("issues", [])
-            ),
-            errors=report.errors,
-            needs_human=report.needs_human,
-            llm_calls=report.llm_calls,
-            elapsed_seconds=report.elapsed_seconds,
-        )
 
 
 # ===========================================================================
@@ -529,6 +443,7 @@ async def run_pipeline(
     journal: RunJournal | None = None,
     num_ctx: int = 8192,
     structured_generate: Callable[..., Awaitable[Any]] | None = None,
+    budgets: RunBudgets | None = None,
 ) -> dict[str, Any]:
     """ROUTE -> PLAN -> CODE -> CHECK -> VALIDATE -> SUMMARY.
 
@@ -551,6 +466,8 @@ async def run_pipeline(
     # 85% of the context window is the input budget; the plan/code prompts are
     # trimmed against it so a large request can never blow the window.
     budget = ContextBudget(num_ctx, reserve_output_tokens=2048)
+    if budgets is None:
+        budgets = RunBudgets()
     llm_calls = 0
 
     def _cancelled() -> bool:
@@ -559,6 +476,12 @@ async def run_pipeline(
     def _check_cancel() -> None:
         if _cancelled():
             raise RunCancelled("run cancelled by user")
+
+    def _check_wall_time() -> None:
+        if time.monotonic() - pipeline_start > budgets.max_wall_seconds:
+            raise BudgetExhausted(
+                f"max wall time exceeded ({budgets.max_wall_seconds:.0f}s)"
+            )
 
     def record(stage: str, status: str, seconds: float, note: str = "") -> None:
         trace.append({"stage": stage, "status": status,
@@ -589,10 +512,15 @@ async def run_pipeline(
                         "request": user_request[:500]})
 
     async def _llm(model: str, prompt: str, system: str = "", temperature: float = 0.2) -> str:
-        """Single LLM choke point: budget the prompt, count the call, and
-        honour cancellation immediately before hitting the model."""
+        """Single LLM choke point: budget the prompt, count + cap the call,
+        and honour cancellation immediately before hitting the model."""
         nonlocal llm_calls
         _check_cancel()
+        _check_wall_time()
+        if llm_calls >= budgets.max_llm_calls:
+            raise BudgetExhausted(
+                f"max total LLM calls exceeded ({budgets.max_llm_calls})"
+            )
         llm_calls += 1
         return await generate(model, budget.trim(prompt), system=system, temperature=temperature)
 
@@ -794,6 +722,8 @@ async def run_pipeline(
             )
             content: str | None = None
             error: str | None = None
+            previous_diag_hash: str | None = None
+            no_progress = False
             for attempt in range(1 + MAX_TASK_RETRIES):
                 prompt = code_prompt
                 if error:
@@ -819,14 +749,22 @@ async def run_pipeline(
                 check_seconds += time.monotonic() - c0
                 if error is None:
                     break
+                # No-progress rule: the same diagnostic twice in a row means the
+                # coder is stuck — stop early instead of burning the last retry.
+                diag_hash = diagnostic_hash(error)
+                if previous_diag_hash is not None and diag_hash == previous_diag_hash:
+                    no_progress = True
+                    break
+                previous_diag_hash = diag_hash
 
             if infra_error:
                 failed_tasks.append({"path": path, "error": infra_error})
                 break  # abort: never retry coder on infra errors
             if error is not None or content is None:
-                failed_tasks.append(
-                    {"path": path, "error": error or "no content generated"}
-                )
+                reason = error or "no content generated"
+                if no_progress:
+                    reason += " (needs human: identical failure twice)"
+                failed_tasks.append({"path": path, "error": reason})
                 continue
             safe_target(workspace, path)  # raises on escape/protected
             staging.stage_file(path, content)
@@ -999,6 +937,16 @@ async def run_pipeline(
         return {
             "status": "cancelled",
             "summary": "Run cancelled by user.",
+            "staged_files": sorted(generated) if "generated" in locals() else [],
+            "failed_tasks": failed_tasks if "failed_tasks" in locals() else [],
+            "trace": trace,
+            "run_id": journal.run_id,
+        }
+    except BudgetExhausted as exc:
+        _finish("budget_exhausted")
+        return {
+            "status": "budget_exhausted",
+            "summary": f"Run stopped: {exc}",
             "staged_files": sorted(generated) if "generated" in locals() else [],
             "failed_tasks": failed_tasks if "failed_tasks" in locals() else [],
             "trace": trace,

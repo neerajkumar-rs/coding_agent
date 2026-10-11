@@ -1,6 +1,49 @@
-# Migration Guide — Phase 1→6 Refactor
+# Migration Guide — Architecture
 
-This document covers what changed, why, and how to adapt.
+This document describes the CURRENT architecture, what changed, and how to adapt.
+
+## The single pipeline (current)
+
+`POST /agent/run` runs **one** pipeline, `orchestrator.run_pipeline`:
+
+```
+ROUTE -> PLAN -> CODE -> CHECK -> VALIDATE -> SUMMARY
+```
+
+- **ROUTE** is rules-only (no model): `QUESTION` / `FILE_QUESTION` / `CODE_TASK` / `UNCLEAR`.
+- **PLAN** produces tasks in the single unified format `{path, action, description}`.
+  With a `structured_generate` seam it uses Ollama `format` + pydantic
+  (`agent_core.schemas.PipelinePlan`) first, then falls back to the JSON-regex path.
+  Plan validation rejects placeholder filenames, junk artifacts, unsupported
+  types, sub-8-word descriptions, language mismatches, and incomplete web plans.
+- **CODE** runs each task through the coder with per-task CHECK (max 2 retries).
+- **CHECK** is in-process (`compile()` for Python, plausibility for the rest)
+  PLUS the deterministic `agent_core.verifier` chain on staged Python files
+  (py_compile → ruff* → import smoke → pytest*; *skipped when unavailable).
+- **VALIDATE** = one reviewer call (schema-constrained when available) + one fix pass.
+- **SUMMARY** = a deterministic skeleton (files built/failed+reasons, how-to-run,
+  total time) + 2–3 guarded model sentences.
+
+The retired `POST /agent/plan` + `POST /agent/step` queue is gone; `/agent/run`
+supersedes it. `run_pipeline` enforces budgets (900 s wall / 40 LLM calls /
+2 attempts), the no-progress rule (identical diagnostic twice => marked
+needs-human), and per-run observability via `RunJournal`
+(`.agent_runs/<run_id>/state.json` + `events.jsonl`).
+
+### Cancellation
+
+One cancel event per workspace (the engine's `_cancel_event`, set by
+`POST /agent/cancel`). The pipeline checks it before every LLM call and between
+stages; the supervisor races the in-flight HTTP request against the event and
+closes the connection on cancel, then the caller unloads the resident model.
+A cancelled run returns `status: "cancelled"` and stages nothing further.
+
+### Lock count (honest, pre-Phase-3)
+
+Today there is ONE async lock on the hot path: the supervisor's `_vram_mutex`
+(`/agent/run` goes through it). The sync `OllamaEngine._sync_lock`, the
+`agent_core.llm_gateway` process lock, and the TUI `_gpu_lock` still exist and
+are consolidated into a single gateway lock in Phase 3.
 
 ## For users
 
@@ -41,41 +84,44 @@ This document covers what changed, why, and how to adapt.
 }
 ```
 
-- `allowed_commands` gates the sandbox: `/agent/step`'s `custom_command` must be
+- `allowed_commands` gates the sandbox: any custom validation command must be
   one of these **names** (free-form shell is rejected). Add `"pytest"` to enable
   the pytest vector.
 
 ## For developers
 
-### orchestrator.py is now a shim
+### orchestrator.run_pipeline is the entry point
 
-`VibeOrchestrator` still works (same constructor, same `run()` signature, same
-`RunResult` shape) but delegates everything to `agent_core.engine.Engine`.
-New code should use the engine directly:
+The `VibeOrchestrator` shim is retired. New code calls the single pipeline:
 
 ```python
-from agent_core.engine import Engine, RunRequest
+from orchestrator import run_pipeline
 
-report = Engine(workspace=".").run(RunRequest(prompt="add a /health endpoint"))
-report.status, report.files, report.deployed_files
+result = await run_pipeline(
+    "make a blog site in html5 css and js",
+    workspace,
+    generate=my_generate,          # async (model, prompt, system=, temperature=) -> str
+    planner_model="deepseek-r1:1.5b",
+    coder_model="qwen2.5-coder:3b",
+)
+result["staged_files"], result["failed_tasks"], result["trace"], result["run_id"]
 ```
+
+`agent_core.engine.Engine` still exists as the per-workspace session object
+behind `get_engine` / `POST /agent/cancel` / `POST /agent/rollback` /
+`GET /agent/events`. Its internal `run()` loop (structured planner, auditor)
+is retained for those consumers but is NOT the `/agent/run` path.
 
 ### The pipeline contract
 
-1. `context.py` builds a token-budgeted repo map + snippets (≤85% of num_ctx).
-2. `planner.py` produces tasks (structured output, pydantic-validated, one
-   retry; markdown fallback for weak models).
-3. `coder.py` produces full blocks (new files) or SEARCH/REPLACE edits
-   (existing files). Edit application is exact-first, whitespace-fuzzy second,
-   and fails loudly on no-match/ambiguity.
-4. `staging.py` writes to `.agent_staging/` only; protected paths
-   (`.git`, `.agent*`, `env/`, `.venv`) and escapes are rejected.
-5. `verifier.py` is the ONLY pass/fail gate: py_compile → ruff* → import smoke
-   → pytest* (*skipped when unavailable).
-6. `auditor.py` reviews the diff and NEVER blocks a deterministic pass.
-7. Retry feedback goes straight to the coder (failing verifier output ≈1500
-   chars + staged file state), not through the planner.
-8. Deploy happens on success (with backups) or explicitly via `/agent/deploy`.
+1. `context.py` — `ContextBudget` enforces ≤85% of num_ctx for prompt inputs.
+2. PLAN/CODE/VALIDATE go through the injected `generate` seam (all LLM access).
+3. `staging.py`/`workspace_staging.py` write to `.agent_staging/` only;
+   protected paths (`.git`, `.agent*`, `env/`, `.venv`) and escapes are rejected.
+4. `verifier.py` is the deterministic Python gate; the in-process plausibility
+   checks cover non-Python. The validator LLM never blocks a deterministic pass.
+5. Retry feedback goes straight to the coder, not through the planner.
+6. Deploy happens only via `/agent/deploy` (with backups for `/agent/rollback`).
 
 ### Ollama payload rules (corrected)
 
@@ -91,12 +137,22 @@ report.status, report.files, report.deployed_files
 
 | Suite | Covers |
 |---|---|
-| `tests/test_llm_client.py` | think-stripping, truncation retry |
-| `tests/test_orchestrator.py` | budgets, no-progress, no-junk regression |
-| `tests/test_agent_core.py` | structured outputs, planner fallback, sessions |
+| `tests/test_llm_client.py` | think-stripping, truncation retry, in-flight cancel |
+| `tests/test_run_pipeline.py` | ROUTE/PLAN/CODE/CHECK/VALIDATE/SUMMARY, journal, cancel, verifier gate |
+| `tests/test_orchestrator.py` | run_pipeline budgets, no-progress, no-junk regression |
+| `tests/test_router.py` | rules-only classify_request |
+| `tests/test_plan_quality.py` | plan validation rules, fallback |
+| `tests/test_summary.py` | summary skeleton + guarded prose, UNVERIFIED |
+| `tests/test_save_flow.py` | save prompt, --yes, config fallback, no removed-model strings |
+| `tests/test_check_sandbox.py` | in-process CHECK, infra vs content errors, plausibility |
+| `tests/test_queue_bug.py` | build_id stale-server guard, junk filter, target rejection |
+| `tests/test_agent_core.py` | structured outputs, planner fallback, engine sessions |
 | `tests/test_edits.py` | SEARCH/REPLACE applier, token budgeter, repo map |
 | `tests/test_verifier.py` | deterministic step chain |
 | `tests/test_safety.py` | path escape, protected paths, sandbox allowlist, rollback |
 | `tests/test_events_endpoint.py` | SSE events, cancel, rollback endpoints |
-| `test_master_controller.py` | legacy FastAPI lifecycle |
-| `e2e_smoke_test.py` | full pipeline against a mock Ollama |
+| `tests/test_tui_textual.py` | Textual UI (sidebar, save prompt, wordmark) |
+| `tests/test_tui_startup.py` | TUI startup, workspace picker, CLI args |
+| `tests/test_tui_benchmark.py` | benchmark run/main, gpu lock, config roles |
+| `test_master_controller.py` | legacy FastAPI lifecycle (now via /agent/run) |
+| `e2e_smoke_test.py` | full Engine pipeline against a mock Ollama |

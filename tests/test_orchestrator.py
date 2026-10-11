@@ -1,108 +1,150 @@
-"""Unit tests for the hardened orchestrator: budgets, no-progress, no scaffolds."""
+"""Unit tests for run_pipeline hardening: budgets, no-progress, no scaffolds,
+run metadata under .agent_runs/. (Ported from the retired VibeOrchestrator
+shim onto the single pipeline behind POST /agent/run.)"""
 
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from orchestrator import (
-    RUNS_DIR_NAME,
-    RunBudgets,
-    VibeOrchestrator,
-)
+from orchestrator import RUNS_DIR_NAME, RunBudgets, run_pipeline
+
+PLANNER = "deepseek-r1:1.5b"
+CODER = "qwen2.5-coder:3b"
+
+PLAN = json.dumps([
+    {"path": "generated.py", "action": "create",
+     "description": "Python module with a greet function returning a greeting"}
+])
+GOOD_CODE = "```python\ndef greet(name: str) -> str:\n    return f'Hello, {name}!'\n```"
+BROKEN_CODE = "```python\ndef broken(:\n```"
+VALIDATE_OK = json.dumps({
+    "satisfies_request": True, "problems": [], "summary": "A greet module."
+})
 
 
-class StubEngine:
-    """Scriptable stand-in for OllamaEngine (only .chat is used)."""
+def _fake(routes: dict[str, str]):
+    import re
 
-    def __init__(self, responses: list[str]) -> None:
-        self.responses = list(responses)
-        self.calls: list[str] = []
+    async def fake(model, prompt, system="", temperature=0.2, **kw):
+        target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
+        if target and f"TARGET FILE: {target.group(1)}" in routes:
+            return routes[f"TARGET FILE: {target.group(1)}"]
+        for marker in sorted(routes, key=len, reverse=True):
+            if marker in prompt:
+                return routes[marker]
+        return ""
 
-    def chat(self, model: str, prompt: str, system: str = "", max_tokens=None, temperature=0.1) -> str:
-        self.calls.append(prompt)
-        if self.responses:
-            return self.responses.pop(0)
-        return "PASS\nlooks fine"
-
-    @property
-    def active_model(self) -> str:
-        return "stub"
+    return fake
 
 
-PLAN = "## TASK 1: create greeting\n- files: generated.py\n- logic: def greet(name: str) -> str"
-GOOD_CODE = "```FILE: generated.py\n\ndef greet(name: str) -> str:\n    return f'Hello, {name}!'\n```"
-GARBAGE_A = "i have no idea what you want, here is a poem about bananas"
-GARBAGE_B = "still no clue, maybe try asking a bigger model?"
-
-
-def _run(engine: StubEngine, tmp: str, budgets: RunBudgets | None = None):
-    orch = VibeOrchestrator(engine=engine, workspace=tmp, budgets=budgets)
-    return orch.run("Create a greeting function", "generated.py")
-
-
-def test_garbage_coder_fails_without_stub_files() -> None:
-    """Coder returns garbage twice -> run ends `failed`, NO scaffold/stub files.
-
-    (The two garbage replies differ, so diagnostics differ and the no-progress
-    rule does not fire — the task simply exhausts its attempts.)
-    """
-    with TemporaryDirectory() as tmp:
-        engine = StubEngine([PLAN, GARBAGE_A, GARBAGE_B])
-        result = _run(engine, tmp)
-        assert result.status == "failed", result
-        assert any("no usable files" in e for e in result.errors)
-        root = Path(tmp)
-        # No stub files, no junk metadata in the workspace root
-        assert not (root / "generated.py").exists()
-        assert not (root / "summary.txt").exists()
-        assert not (root / "tasks.md").exists()
-        assert not list(root.glob("task*_code.txt"))
-        # Run metadata exists under .agent_runs/
-        run_dir = root / RUNS_DIR_NAME / result.run_id
-        assert (run_dir / "state.json").exists()
-        assert (run_dir / "events.jsonl").exists()
-
-
-def test_budget_exhaustion_llm_calls() -> None:
-    with TemporaryDirectory() as tmp:
-        engine = StubEngine([PLAN, GOOD_CODE, "PASS\nok"])
-        budgets = RunBudgets(max_llm_calls=1)  # only the planner call fits
-        result = _run(engine, tmp, budgets)
-        assert result.status == "budget_exhausted", result
-        assert any("LLM calls" in e for e in result.errors)
-
-
-def test_budget_exhaustion_wall_time() -> None:
-    with TemporaryDirectory() as tmp:
-        engine = StubEngine([PLAN, GOOD_CODE, "PASS\nok"])
-        budgets = RunBudgets(max_wall_seconds=0.0)  # immediately exhausted
-        result = _run(engine, tmp, budgets)
-        assert result.status == "budget_exhausted", result
-        assert any("wall time" in e for e in result.errors)
-
-
-def test_no_progress_detector_marks_needs_human() -> None:
-    """Two consecutive attempts with the same diagnostic hash -> needs_human."""
-    with TemporaryDirectory() as tmp:
-        # Coder emits uncompilable code; identical failure twice in a row.
-        # (Retry feedback now goes directly to the coder, not via the planner,
-        # so the script is plan -> bad -> bad with no refine call in between.)
-        bad_code = "```FILE: generated.py\ndef broken(:\n```"
-        engine = StubEngine([PLAN, bad_code, bad_code])
-        result = _run(engine, tmp)
-        assert result.status == "needs_human", result
-        assert result.needs_human, result
-        assert result.attempts == 2
+def _run(coro):
+    return asyncio.run(coro)
 
 
 def test_happy_path_and_metadata_location() -> None:
+    fake = _fake({
+        "JSON array of tasks": PLAN,
+        "TARGET FILE: generated.py": GOOD_CODE,
+        "satisfies_request": VALIDATE_OK,
+        "Describe only features visible": "",
+    })
     with TemporaryDirectory() as tmp:
-        engine = StubEngine([PLAN, GOOD_CODE, "PASS\nall good"])
-        result = _run(engine, tmp)
-        assert result.status == "completed", result
-        assert (Path(tmp) / "generated.py").exists()
-        run_dir = Path(tmp) / RUNS_DIR_NAME / result.run_id
-        assert (run_dir / "tasks.md").exists()
-        events = (run_dir / "events.jsonl").read_text(encoding="utf-8").strip().splitlines()
-        assert any('"run_finished"' in line for line in events)
+        result = _run(run_pipeline(
+            "create generated.py with a greet function",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+        ))
+        assert result["staged_files"] == ["generated.py"]
+        assert result["failed_tasks"] == []
+        # Metadata under .agent_runs/<run_id>/, no junk in the workspace root
+        run_dir = Path(tmp) / RUNS_DIR_NAME / result["run_id"]
+        assert (run_dir / "state.json").exists()
+        assert (run_dir / "events.jsonl").exists()
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        assert state["status"] == "completed"
+        assert state["llm_calls"] > 0
+        root = Path(tmp)
+        assert not (root / "generated.py").exists()  # staged, not deployed
+        assert not (root / "summary.txt").exists()
+        assert not (root / "tasks.md").exists()
+        assert not list(root.glob("task*_code.txt"))
+
+
+def test_budget_exhaustion_llm_calls() -> None:
+    fake = _fake({
+        "JSON array of tasks": PLAN,
+        "TARGET FILE: generated.py": GOOD_CODE,
+        "satisfies_request": VALIDATE_OK,
+    })
+    with TemporaryDirectory() as tmp:
+        result = _run(run_pipeline(
+            "create generated.py with a greet function",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+            budgets=RunBudgets(max_llm_calls=1),  # only the planner call fits
+        ))
+        assert result["status"] == "budget_exhausted"
+        assert "LLM calls" in result["summary"]
+
+
+def test_budget_exhaustion_wall_time() -> None:
+    fake = _fake({
+        "JSON array of tasks": PLAN,
+        "TARGET FILE: generated.py": GOOD_CODE,
+        "satisfies_request": VALIDATE_OK,
+    })
+    with TemporaryDirectory() as tmp:
+        result = _run(run_pipeline(
+            "create generated.py with a greet function",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+            budgets=RunBudgets(max_wall_seconds=0.0),  # immediately exhausted
+        ))
+        assert result["status"] == "budget_exhausted"
+        assert "wall time" in result["summary"]
+
+
+def test_no_progress_detector_marks_needs_human() -> None:
+    """Two consecutive attempts with the same diagnostic -> early stop marked
+    needs human (identical failure twice)."""
+    fake = _fake({
+        "JSON array of tasks": PLAN,
+        "TARGET FILE: generated.py": BROKEN_CODE,  # identical broken code each time
+    })
+    with TemporaryDirectory() as tmp:
+        result = _run(run_pipeline(
+            "create generated.py with a greet function",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+        ))
+        assert result["staged_files"] == []
+        assert len(result["failed_tasks"]) == 1
+        assert "needs human" in result["failed_tasks"][0]["error"].lower()
+
+
+def test_garbage_coder_fails_without_stub_files() -> None:
+    """Coder returns garbage (extracts to prose) that fails CHECK twice with
+    DIFFERENT diagnostics -> task fails, NO scaffold/stub files staged."""
+    garbage_a = "```python\nthis is not python code at all just prose\n```"
+    garbage_b = "```python\nstill prose but different words so hash differs here\n```"
+    calls = {"n": 0}
+
+    async def fake(model, prompt, system="", temperature=0.2, **kw):
+        import re
+        if "JSON array of tasks" in prompt:
+            return PLAN
+        target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
+        if target:
+            calls["n"] += 1
+            return garbage_a if calls["n"] == 1 else garbage_b
+        return ""
+
+    with TemporaryDirectory() as tmp:
+        result = _run(run_pipeline(
+            "create generated.py with a greet function",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+        ))
+        assert result["staged_files"] == []
+        assert result["failed_tasks"]
+        root = Path(tmp)
+        assert not (root / "generated.py").exists()
+        assert not list(root.glob("task*_code.txt"))
