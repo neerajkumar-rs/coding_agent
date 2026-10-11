@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import ctypes
 import json
 import logging
@@ -16,96 +17,169 @@ from typing import Any
 logger = logging.getLogger("agent_config")
 
 DEFAULT_PLANNER_MODEL = "deepseek-r1:1.5b"
-DEFAULT_CODER_MODEL = "qwen2.5-coder:3b"
+DEFAULT_CODER_MODEL = "qwen2.5-coder:3b-instruct"
 DEFAULT_CONTEXT_TOKENS = 4096
 DEFAULT_KEEP_ALIVE = "5m"
 RTX_3050_VRAM_CEILING_GB = 4.0
 
+# Role ceilings (num_ctx). The effective num_ctx is always clamped to these
+# (and further by calibration in Phase 6).
+ROLE_CTX_CEILINGS = {"thinker": 16384, "coder": 12288, "validator": 16384}
 
-@dataclass
+# Canonical default roles: the single source of truth for model + sampling.
+# thinker = planner/Q&A, coder = code, validator = review (thinker model+ctx).
+def _default_roles() -> dict[str, dict[str, Any]]:
+    return {
+        "thinker": {
+            "model": DEFAULT_PLANNER_MODEL,
+            "num_ctx": 8192,
+            "num_predict": 2048,
+            "temperature": 0.2,
+            "keep_alive": DEFAULT_KEEP_ALIVE,
+        },
+        "coder": {
+            "model": DEFAULT_CODER_MODEL,
+            "num_ctx": 6144,
+            "num_predict": 2048,
+            "temperature": 0.1,
+            "keep_alive": DEFAULT_KEEP_ALIVE,
+        },
+        "validator": {
+            "model": DEFAULT_PLANNER_MODEL,
+            "num_ctx": 8192,
+            "num_predict": 512,
+            "temperature": 0.0,
+            "keep_alive": DEFAULT_KEEP_ALIVE,
+        },
+    }
+
+
+@dataclass(init=False)
 class AgentConfig:
-    planner_model: str = DEFAULT_PLANNER_MODEL
-    coder_5b_or_3b: str = DEFAULT_CODER_MODEL  # Serialized as "coder.5b_or_3b"
-    max_context_tokens: int = DEFAULT_CONTEXT_TOKENS
-    keep_alive: str = DEFAULT_KEEP_ALIVE  # Top-level Ollama keep_alive (model residency)
+    # ``roles`` is the single source of truth: {thinker, coder, validator},
+    # each {model, num_ctx, num_predict, temperature, keep_alive}.
+    roles: dict[str, dict[str, Any]]
     # Sandbox allowlist: only these named command vectors may run for
     # validation. Free-form shell is never executed.
-    allowed_commands: list[str] | None = None  # defaults to ["py_compile"]
-    # Role map written by /benchmark apply: {"planner": {"model": ...}, ...}
-    roles: dict[str, dict[str, Any]] | None = None
+    allowed_commands: list[str] | None  # defaults to ["py_compile"]
     # Unknown keys from .agent are preserved verbatim on save (round-trip).
-    extra: dict[str, Any] | None = None
+    extra: dict[str, Any] | None
 
     _KNOWN_KEYS = {
         "planner_model", "coder.5b_or_3b", "coder_5b_or_3b", "coder_model",
         "max_context_tokens", "keep_alive", "allowed_commands", "roles",
     }
 
+    def __init__(
+        self,
+        roles: dict[str, dict[str, Any]] | None = None,
+        allowed_commands: list[str] | None = None,
+        extra: dict[str, Any] | None = None,
+        # Legacy constructor inputs (migration only; folded into roles below):
+        planner_model: str | None = None,
+        coder_5b_or_3b: str | None = None,
+        max_context_tokens: int | None = None,
+        keep_alive: str | None = None,
+        **legacy: Any,
+    ) -> None:
+        import re as _re
+
+        removed_pattern = _re.compile(r"l[fm]{2}|li[q]uid", _re.IGNORECASE)
+        # coder may also arrive under the alternate legacy spellings.
+        if coder_5b_or_3b is None:
+            coder_5b_or_3b = legacy.pop("coder_model", None) or legacy.pop("coder.5b_or_3b", None)
+
+        merged = _default_roles()
+        saved = roles or {}
+        if "planner" in saved and "thinker" not in saved:
+            saved = {**saved, "thinker": saved["planner"]}
+        for role, overrides in saved.items():
+            if role in merged and isinstance(overrides, dict):
+                merged[role] = {**merged[role], **{k: v for k, v in overrides.items() if v is not None}}
+
+        def _clean(model: Any) -> str | None:
+            if model and removed_pattern.search(str(model)):
+                return None
+            return str(model) if model else None
+
+        # Fold legacy ctor inputs into roles (only where the role did not
+        # already set the key, so an explicit saved role always wins).
+        if (p := _clean(planner_model)) and "model" not in saved.get("thinker", {}):
+            merged["thinker"]["model"] = p
+            merged["validator"]["model"] = p
+        if (c := _clean(coder_5b_or_3b)) and "model" not in saved.get("coder", {}):
+            merged["coder"]["model"] = c
+        if max_context_tokens is not None:
+            for role in merged:
+                if "num_ctx" not in saved.get(role, {}):
+                    merged[role]["num_ctx"] = int(max_context_tokens)
+        if keep_alive:
+            for role in merged:
+                if "keep_alive" not in saved.get(role, {}):
+                    merged[role]["keep_alive"] = str(keep_alive)
+
+        self.roles = merged
+        self.allowed_commands = allowed_commands
+        self.extra = extra
+
+    # --- compat views: read from roles (migration inputs, never the source) ---
+
+    @property
+    def planner_model(self) -> str:
+        return str(self.roles["thinker"]["model"])  # type: ignore[index]
+
+    @property
+    def coder_model(self) -> str:
+        return str(self.roles["coder"]["model"])  # type: ignore[index]
+
+    @property
+    def coder_5b_or_3b(self) -> str:
+        return self.coder_model
+
+    @property
+    def max_context_tokens(self) -> int:
+        # The thinker context window is the pipeline's default budget ceiling.
+        return int(self.roles["thinker"]["num_ctx"])  # type: ignore[index]
+
+    @property
+    def keep_alive(self) -> str:
+        return str(self.roles["thinker"]["keep_alive"])  # type: ignore[index]
+
+    def get_role_config(self, role: str) -> dict[str, Any]:
+        """Effective settings for a role, num_ctx clamped to the role ceiling."""
+        # Legacy alias: "planner" is the thinker role.
+        canonical = "thinker" if role == "planner" else role
+        cfg = dict(self.roles.get(canonical, self.roles["thinker"]))  # type: ignore[arg-type]
+        ceiling = ROLE_CTX_CEILINGS.get(canonical)
+        if ceiling is not None:
+            cfg["num_ctx"] = min(int(cfg.get("num_ctx", ceiling)), ceiling)
+        return cfg
+
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = dict(self.extra or {})
-        data.update(
-            {
-                "planner_model": self.planner_model,
-                "coder.5b_or_3b": self.coder_5b_or_3b,
-                "max_context_tokens": self.max_context_tokens,
-                "keep_alive": self.keep_alive,
-                "allowed_commands": self.allowed_commands or ["py_compile"],
-            }
-        )
-        if self.roles:
-            data["roles"] = self.roles
+        data["roles"] = self.roles
+        data["allowed_commands"] = self.allowed_commands or ["py_compile"]
         return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AgentConfig:
-        coder = (
-            data.get("coder.5b_or_3b")
-            or data.get("coder_5b_or_3b")
-            or data.get("coder_model")
-            or DEFAULT_CODER_MODEL
-        )
-        planner = data.get("planner_model") or DEFAULT_PLANNER_MODEL
-        # Saved configs may reference models removed from this project; those
-        # fall back to the defaults. The needle is a character class so the
-        # removed name never appears literally in the codebase.
-        import re as _re
-
-        removed_pattern = _re.compile(r"l[fm]{2}|li[q]uid", _re.IGNORECASE)
-        if removed_pattern.search(str(planner)):
-            planner = DEFAULT_PLANNER_MODEL
-        if removed_pattern.search(str(coder)):
-            coder = DEFAULT_CODER_MODEL
-        ctx = int(data.get("max_context_tokens", DEFAULT_CONTEXT_TOKENS))
-        keep_alive = str(data.get("keep_alive") or DEFAULT_KEEP_ALIVE)
+        # Delegate to the constructor: it folds legacy top-level keys into roles.
         raw_allowed = data.get("allowed_commands")
         allowed = [str(a) for a in raw_allowed] if isinstance(raw_allowed, list) else None
-        roles = data.get("roles") if isinstance(data.get("roles"), dict) else None
         extra = {k: v for k, v in data.items() if k not in cls._KNOWN_KEYS}
         return cls(
-            planner_model=planner,
-            coder_5b_or_3b=coder,
-            max_context_tokens=ctx,
-            keep_alive=keep_alive,
+            roles=data.get("roles") if isinstance(data.get("roles"), dict) else None,
             allowed_commands=allowed,
-            roles=roles,
             extra=extra or None,
+            planner_model=data.get("planner_model"),
+            coder_5b_or_3b=(
+                data.get("coder.5b_or_3b")
+                or data.get("coder_5b_or_3b")
+                or data.get("coder_model")
+            ),
+            max_context_tokens=data.get("max_context_tokens"),
+            keep_alive=data.get("keep_alive"),
         )
-
-    @property
-    def coder_model(self) -> str:
-        return self.coder_5b_or_3b
-
-    def get_role_config(self, role: str) -> dict[str, Any]:
-        """Merged settings for a role: role overrides layered on config defaults."""
-        base: dict[str, Any] = {
-            "model": self.planner_model if role in ("planner", "validator") else self.coder_model,
-            "num_ctx": self.max_context_tokens,
-            "num_predict": 2048,
-            "temperature": 0.2 if role in ("planner", "validator") else 0.1,
-            "keep_alive": self.keep_alive,
-        }
-        overrides = (self.roles or {}).get(role, {})
-        return {**base, **{k: v for k, v in overrides.items() if v is not None}}
 
 
 def detect_system_ram_gb() -> float:
@@ -258,18 +332,26 @@ def parse_and_recalculate(args: list[str] | None = None) -> AgentConfig | None:
         workspace_dir = Path(parsed.workspace).resolve()
         existing = load_agent_config(workspace_dir)
 
-        planner = parsed.planner_model or existing.planner_model
-        coder = parsed.coder_model or existing.coder_5b_or_3b
+        coder = parsed.coder_model or existing.coder_model
         tokens = benchmark_and_calculate_tokens(
             coder_model=coder,
             manual_context=parsed.max_context_tokens,
         )
 
-        updated = AgentConfig(
-            planner_model=planner,
-            coder_5b_or_3b=coder,
-            max_context_tokens=tokens,
-        )
+        # Copy-on-write: never rebuild AgentConfig from scratch (that would drop
+        # roles, keep_alive, allowed_commands and extra). Update roles in place
+        # on a copy of the existing config.
+        updated = copy.deepcopy(existing)
+        if parsed.planner_model:
+            updated.roles["thinker"]["model"] = parsed.planner_model
+            updated.roles["validator"]["model"] = parsed.planner_model
+        if parsed.coder_model:
+            updated.roles["coder"]["model"] = parsed.coder_model
+        # Recalculated token ceiling applies to every role (clamped per role).
+        for role, cfg in updated.roles.items():
+            ceiling = ROLE_CTX_CEILINGS.get(role, tokens)
+            cfg["num_ctx"] = min(tokens, ceiling)
+
         saved_path = save_agent_config(updated, workspace_dir)
         print(f"[Dynamic System Engine] Profile written to: {saved_path}")
         print(json.dumps(updated.to_dict(), indent=2))

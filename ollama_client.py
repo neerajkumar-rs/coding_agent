@@ -63,6 +63,19 @@ class OllamaError(RuntimeError):
         self.done_reason = done_reason
 
 
+class ModelNotInstalled(OllamaError):
+    """The exact configured model is not in /api/tags. Never substitute."""
+
+    def __init__(self, requested: str, installed: list[str] | None = None) -> None:
+        self.requested = requested
+        self.installed = installed or []
+        hint = f"ollama pull {requested}"
+        detail = f"model not installed: {requested!r}. Run: {hint}"
+        if self.installed:
+            detail += f"\nInstalled: {', '.join(self.installed)}"
+        super().__init__(detail)
+
+
 class OllamaCancelledError(OllamaError):
     """The in-flight request was aborted because the run was cancelled."""
 
@@ -150,35 +163,24 @@ class OllamaSupervisorClient:
         return self._cached_installed_models or []
 
     async def resolve_model_name(self, requested: str) -> str:
-        """Resolve requested model name against locally pulled Ollama models."""
+        """Exact-match the configured model against /api/tags.
+
+        No fuzzy substitution, ever. The only normalization is Ollama's own:
+        an untagged name matches its ``:latest`` tag. Otherwise raise
+        :class:`ModelNotInstalled` with the exact ``ollama pull <name>``.
+        """
         installed = await self.list_installed_models()
         if not installed:
+            # Cannot verify (offline/tags failed): pass the name through and let
+            # the generate call surface any real error.
             return requested
-
-        # Direct match
-        for m in installed:
-            if m == requested or m.startswith(f"{requested}:"):
-                return m
-
-        # Fuzzy match for deepseek 1.5b
-        req_lower = requested.lower()
-        if "deepseek" in req_lower and "1.5b" in req_lower:
-            for m in installed:
-                m_lower = m.lower()
-                if "deepseek" in m_lower and "1.5b" in m_lower:
-                    logger.info(f"Resolved '{requested}' to locally installed '{m}'")
-                    return m
-
-        # Fuzzy match for qwen coder
-        if "coder" in req_lower:
-            size = "3b" if "3b" in req_lower else ("1.5b" if "1.5b" in req_lower else "")
-            for m in installed:
-                m_lower = m.lower()
-                if "coder" in m_lower and (not size or size in m_lower):
-                    logger.info(f"Resolved '{requested}' to locally installed '{m}'")
-                    return m
-
-        return requested
+        # Exact match.
+        if requested in installed:
+            return requested
+        # Ollama's untagged -> :latest normalization.
+        if ":" not in requested and f"{requested}:latest" in installed:
+            return f"{requested}:latest"
+        raise ModelNotInstalled(requested, installed)
 
     def build_payload(
         self,
@@ -438,21 +440,23 @@ class OllamaEngine:
         return self.config.coder_model
 
     def _resolve_model_name(self, requested: str) -> str:
+        """Exact-match against /api/tags; never fuzzy-substitute.
+
+        Falls back to the requested name only when the tags endpoint is
+        unreachable (the generate call then surfaces any real error).
+        """
         try:
             with httpx.Client(timeout=5.0) as client:
                 res = client.get(self.tags_url)
                 if res.status_code == 200:
                     installed = [m.get("name", "") for m in res.json().get("models", [])]
-                    for m in installed:
-                        if m == requested or m.startswith(f"{requested}:"):
-                            return m
-                    req_lower = requested.lower()
-                    for m in installed:
-                        m_lower = m.lower()
-                        if "deepseek" in req_lower and "1.5b" in req_lower and "deepseek" in m_lower and "1.5b" in m_lower:
-                            return m
-                        if "coder" in req_lower and "coder" in m_lower:
-                            return m
+                    if requested in installed:
+                        return requested
+                    if ":" not in requested and f"{requested}:latest" in installed:
+                        return f"{requested}:latest"
+                    raise ModelNotInstalled(requested, installed)
+        except ModelNotInstalled:
+            raise
         except Exception:
             pass
         return requested

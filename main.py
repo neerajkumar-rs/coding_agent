@@ -154,6 +154,76 @@ async def health_check() -> dict[str, Any]:
     }
 
 
+def _base_model_warning(name: str, quant: str) -> str | None:
+    """Heuristic: a name with no instruct/chat/code suffix, or a base quant,
+    is likely a base (non-instruction-tuned) model — warn for the thinker."""
+    lowered = name.lower()
+    if any(tag in lowered for tag in ("instruct", "chat", "coder", "-it", "r1")):
+        return None
+    return f"'{name}' looks like a BASE model (no instruct/chat/coder tag); it may follow instructions poorly"
+
+
+@app.get("/models")
+async def list_models() -> dict[str, Any]:
+    """Per-role model card: model, digest (12 chars), size, quant.
+
+    Reads /api/tags (digest, size) and /api/show (quantization) for each
+    configured role, plus which model is currently resident (from /api/ps).
+    """
+    tags: dict[str, dict[str, Any]] = {}
+    resident: list[str] = []
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.get(state.ollama.tags_url)
+            if resp.status_code == 200:
+                for m in resp.json().get("models", []):
+                    tags[m.get("name", "")] = m
+        except httpx.HTTPError:
+            pass
+        try:
+            ps = await client.get(f"{state.ollama.base_url}/api/ps")
+            if ps.status_code == 200:
+                resident = [m.get("name", "") for m in ps.json().get("models", [])]
+        except httpx.HTTPError:
+            pass
+        # /api/show per configured role for the quantization level
+        quants: dict[str, str] = {}
+        for role in ("thinker", "coder", "validator"):
+            name = str(state.config.get_role_config(role)["model"])
+            if name in quants:
+                continue
+            try:
+                show = await client.post(
+                    f"{state.ollama.base_url}/api/show", json={"name": name}
+                )
+                if show.status_code == 200:
+                    details = show.json().get("details", {})
+                    quants[name] = details.get("quantization_level", "")
+            except httpx.HTTPError:
+                pass
+
+    roles: dict[str, Any] = {}
+    for role in ("thinker", "coder", "validator"):
+        cfg = state.config.get_role_config(role)
+        name = str(cfg["model"])
+        tag = tags.get(name, {})
+        raw_digest = str(tag.get("digest", ""))
+        digest = raw_digest.removeprefix("sha256:")[:12]
+        size_gb = round(int(tag.get("size", 0)) / (1024**3), 2) if tag.get("size") else None
+        quant = quants.get(name, "")
+        roles[role] = {
+            "model": name,
+            "digest": digest,
+            "size_gb": size_gb,
+            "quant": quant,
+            "num_ctx": cfg.get("num_ctx"),
+            "installed": name in tags,
+            "resident": name in resident,
+            "warning": _base_model_warning(name, quant),
+        }
+    return {"workspace": str(state.workspace_root), "roles": roles, "resident": resident}
+
+
 @app.post("/workspace/init")
 async def workspace_init(payload: InitRequest) -> dict[str, Any]:
     """1. POST /workspace/init
@@ -165,17 +235,25 @@ async def workspace_init(payload: InitRequest) -> dict[str, Any]:
     target_root.mkdir(parents=True, exist_ok=True)
     state.rebind_workspace(target_root)
 
-    # Check for overrides
+    # Check for overrides. Copy-on-write: never rebuild AgentConfig from
+    # scratch (that drops roles/keep_alive/allowed_commands/extra).
     if payload.coder_model or payload.planner_model or payload.max_context_tokens:
-        updated_tokens = benchmark_and_calculate_tokens(
-            coder_model=payload.coder_model or state.config.coder_model,
-            manual_context=payload.max_context_tokens,
-        )
-        state.config = AgentConfig(
-            planner_model=payload.planner_model or state.config.planner_model,
-            coder_5b_or_3b=payload.coder_model or state.config.coder_5b_or_3b,
-            max_context_tokens=updated_tokens,
-        )
+        import copy as _copy
+
+        updated = _copy.deepcopy(state.config)
+        if payload.planner_model:
+            updated.roles["thinker"]["model"] = payload.planner_model
+            updated.roles["validator"]["model"] = payload.planner_model
+        if payload.coder_model:
+            updated.roles["coder"]["model"] = payload.coder_model
+        if payload.max_context_tokens or payload.coder_model or payload.planner_model:
+            tokens = benchmark_and_calculate_tokens(
+                coder_model=payload.coder_model or state.config.coder_model,
+                manual_context=payload.max_context_tokens,
+            )
+            for role, cfg in updated.roles.items():
+                cfg["num_ctx"] = min(tokens, 16384)
+        state.config = updated
         save_agent_config(state.config, state.workspace_root)
 
     # Scan project structure for awareness

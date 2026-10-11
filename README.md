@@ -198,7 +198,7 @@ e:\coding_agent\
 ├── tests/                 ← pytest suite (160 tests, offline)
 ├── test_master_controller.py  ← legacy lifecycle suite (offline, via /agent/run)
 ├── e2e_smoke_test.py          ← end-to-end with mock Ollama server
-└── test_live_ollama.py        ← live Ollama connection check
+└── scripts/live_smoke.py      ← live Ollama connection check (not pytest)
 ```
 
 Workspace-side artifacts (all git-ignored):
@@ -226,7 +226,7 @@ The workspace root itself only ever receives the **requested target files**
 .\env\Scripts\python.exe e2e_smoke_test.py
 
 # Live Ollama check (needs ollama serve)
-.\env\Scripts\python.exe test_live_ollama.py
+.\env\Scripts\python.exe scripts/live_smoke.py
 ```
 
 ---

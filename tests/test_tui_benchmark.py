@@ -161,32 +161,47 @@ def test_apply_writes_roles_only_after_yes() -> None:
     with TemporaryDirectory() as tmp:
         save_agent_config(AgentConfig(), tmp)
         tui._last_bench_report = {
-            "best_per_role": {"planner": "phi4-mini", "coder": "qwen2.5-coder:3b"},
+            "best_per_role": {"thinker": "deepseek-r1:1.5b", "coder": "qwen2.5-coder:3b-instruct"},
         }
         # Answer "n" -> nothing written
         with patch.object(tui.Prompt, "ask", return_value="n"):
             asyncio.run(tui._apply_bench_roles(tmp))
-        data = json.loads((Path(tmp) / ".agent").read_text(encoding="utf-8"))
-        assert "roles" not in data
+        before = json.loads((Path(tmp) / ".agent").read_text(encoding="utf-8"))
+        assert before["roles"]["thinker"]["model"] == "deepseek-r1:1.5b"  # default, unchanged
 
-        # Answer "y" -> roles written, other keys preserved
+        # Answer "y" -> roles written and become the EFFECTIVE source; the
+        # legacy planner_model is migrated (reflects roles), not left
+        # contradicting it.
+        tui._last_bench_report = {
+            "best_per_role": {"thinker": "deepseek-r1:1.5b", "coder": "qwen2.5-coder:3b-instruct"},
+        }
         with patch.object(tui.Prompt, "ask", return_value="y"):
             asyncio.run(tui._apply_bench_roles(tmp))
-        data = json.loads((Path(tmp) / ".agent").read_text(encoding="utf-8"))
-        assert data["roles"]["planner"]["model"] == "phi4-mini"
-        assert data["planner_model"] == "deepseek-r1:1.5b"  # preserved
-        assert data["max_context_tokens"] == 4096           # preserved
+        loaded = load_agent_config(tmp)
+        # roles is the effective source
+        assert loaded.get_role_config("coder")["model"] == "qwen2.5-coder:3b-instruct"
+        assert loaded.get_role_config("thinker")["model"] == "deepseek-r1:1.5b"
+        # compat views read FROM roles (migrated, never contradicting)
+        assert loaded.planner_model == loaded.get_role_config("thinker")["model"]
+        assert loaded.coder_model == loaded.get_role_config("coder")["model"]
 
 
 def test_config_roles_roundtrip() -> None:
     with TemporaryDirectory() as tmp:
-        cfg = AgentConfig(roles={"planner": {"model": "x", "num_ctx": 2048}})
+        cfg = AgentConfig(roles={"thinker": {"model": "x", "num_ctx": 2048}})
         save_agent_config(cfg, tmp)
         loaded = load_agent_config(tmp)
-        assert loaded.roles == {"planner": {"model": "x", "num_ctx": 2048}}
-        role = loaded.get_role_config("planner")
+        # the saved thinker role survived the round-trip
+        assert loaded.roles["thinker"]["model"] == "x"
+        assert loaded.roles["thinker"]["num_ctx"] == 2048
+        role = loaded.get_role_config("thinker")
         assert role["model"] == "x"
         assert role["num_ctx"] == 2048
         assert role["keep_alive"] == "5m"
-        # coder role falls back to defaults
-        assert loaded.get_role_config("coder")["model"] == "qwen2.5-coder:3b"
+        # legacy "planner" alias resolves to the thinker role
+        assert loaded.get_role_config("planner")["model"] == "x"
+        # coder role falls back to the default
+        assert loaded.get_role_config("coder")["model"] == "qwen2.5-coder:3b-instruct"
+        # keep_alive and allowed_commands survive the round-trip
+        assert loaded.keep_alive == "5m"
+        assert loaded.allowed_commands == ["py_compile"]

@@ -123,10 +123,10 @@ def test_agent_config_ignores_removed_models() -> None:
         }), encoding="utf-8")
         config = load_agent_config(tmp)
         assert config.planner_model == "deepseek-r1:1.5b"
-        assert config.coder_model == "qwen2.5-coder:3b"
+        assert config.coder_model == "qwen2.5-coder:3b-instruct"
         # supported names still load fine
         save_agent_config(AgentConfig(), tmp)
-        assert load_agent_config(tmp).coder_model == "qwen2.5-coder:3b"
+        assert load_agent_config(tmp).coder_model == "qwen2.5-coder:3b-instruct"
 
 
 # --- no lfm anywhere (the spec's grep as a test) ------------------------------

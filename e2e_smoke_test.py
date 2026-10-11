@@ -17,7 +17,7 @@ from ollama_client import OllamaEngine
 class FakeOllama(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path.endswith("/api/tags"):
-            body = {"models": [{"name": "deepseek-r1:1.5b"}, {"name": "qwen2.5-coder:3b"}]}
+            body = {"models": [{"name": "deepseek-r1:1.5b"}, {"name": "qwen2.5-coder:3b-instruct"}]}
         else:
             body = {"status": "ok"}
         encoded = json.dumps(body).encode()
