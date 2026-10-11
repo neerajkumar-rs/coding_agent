@@ -124,11 +124,13 @@ def _post_json_sync(url: str, payload: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 class Sidebar(Static):
-    """SYSTEM, LAST RUN, then pinned to the bottom: workspace + wordmark."""
+    """SYSTEM, LAST RUN at the top; a spacer pushes workspace + wordmark to
+    the very bottom of the sidebar (wordmark last, bottom-left)."""
 
     def compose(self) -> ComposeResult:
         yield Static("", id="sb-system")
         yield Static("", id="sb-lastrun")
+        yield Static("", id="sb-spacer")  # expands, pinning the rest to bottom
         yield Static("", id="sb-workspace")
         wordmark = Text.from_markup(WORDMARK)
         wordmark.no_wrap = True
@@ -178,8 +180,9 @@ class OllamaAgentApp(App):
     }
     #sidebar { width: 30; background: $panel; padding: 1 2; }
     #sb-system, #sb-lastrun { padding-bottom: 1; }
-    #sb-workspace { dock: bottom; }
-    #sb-wordmark { dock: bottom; text-align: left; padding: 0 1; }
+    #sb-spacer { height: 1fr; }
+    #sb-workspace { padding: 0 1; }
+    #sb-wordmark { text-align: left; padding: 0 1; }
     #status-bar { height: 1; background: $boost; dock: bottom; }
     #status-left { width: 1fr; padding: 0 1; color: $text-muted; }
     #status-right { width: auto; padding: 0 1; color: $primary; }
