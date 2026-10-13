@@ -61,6 +61,7 @@ LOG_CHANNELS: dict[str, str] = {
     "thinker": "thinker.log",
     "coder": "coder.log",
     "validator": "validator.log",
+    "writer": "writer.log",
     "sandbox": "sandbox.log",
     "events": "events.jsonl",
 }
@@ -89,19 +90,38 @@ def tail_run_logs(
     workspace: Path | str,
     channel: str = "",
     lines: int = 60,
+    run_id: str = "",
 ) -> dict[str, Any]:
-    """Read the LATEST run's logs for a workspace. Pure data — both TUIs
-    render this their own way.
+    """Read a run's logs for a workspace. Pure data — both TUIs render this
+    their own way.
 
     ``channel`` picks one registered channel ("" = all role channels).
-    ``lines`` is a LINE count (tail semantics). Never raises: an unreadable
-    file becomes {"error": ...}. Returns {"run_id", "searched", "sections"},
-    where "searched" is the exact path checked when no run exists.
+    ``lines`` is a LINE count (tail semantics). ``run_id`` selects a specific
+    run (exact name or unique prefix; "" = latest). Never raises: an
+    unreadable file becomes {"error": ...}. Returns {"run_id", "searched",
+    "sections"}, where "searched" is the exact path checked when nothing
+    matched.
     """
     runs_dir = Path(workspace) / RUNS_DIR_NAME
-    chosen = latest_run_dir(workspace)
-    if chosen is None:
-        return {"run_id": None, "searched": str(runs_dir), "sections": []}
+    chosen: Path | None = None
+    if run_id:
+        if runs_dir.is_dir():
+            exact = runs_dir / run_id
+            if exact.is_dir():
+                chosen = exact
+            else:
+                matches = [d for d in runs_dir.iterdir()
+                           if d.is_dir() and d.name.startswith(run_id)]
+                chosen = matches[0] if len(matches) == 1 else None
+        if chosen is None:
+            return {"run_id": None,
+                    "searched": str(runs_dir / run_id),
+                    "sections": [],
+                    "error": f"no run matching {run_id!r}"}
+    else:
+        chosen = latest_run_dir(workspace)
+        if chosen is None:
+            return {"run_id": None, "searched": str(runs_dir), "sections": []}
 
     channels = [channel] if channel in LOG_CHANNELS else list(ROLE_CHANNELS)
     sections: list[dict[str, Any]] = []
@@ -120,6 +140,8 @@ def tail_run_logs(
 def format_run_logs(result: dict[str, Any]) -> str:
     """Render tail_run_logs output as plain text (shared by both TUIs)."""
     if result.get("run_id") is None:
+        if result.get("error"):
+            return f"{result['error']} — searched {result.get('searched')}"
         return f"No runs yet — searched {result.get('searched')}"
     parts = [f"--- latest run: {result['run_id']} ---"]
     sections = result.get("sections", [])

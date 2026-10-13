@@ -39,8 +39,11 @@ class FakeOllama(BaseHTTPRequestHandler):
     # length_times: next N generates answer done_reason="length" (truncated);
     # reject_think: HTTP 400 on any payload carrying "think" (the probe's
     # supports_think_param=False path); response_text: canned answer override.
+    # think_inert: accept think:false but answer WITH a <think> tag anyway
+    # (the erwan2 distill's real behavior under Ollama 0.40, verified live).
     length_times: int = 0
     reject_think: bool = False
+    think_inert: bool = False
     response_text: str = "OK"
 
     MODEL_SIZES = {MODEL: 1_900_000_000, THINKER: 1_100_000_000}
@@ -54,6 +57,7 @@ class FakeOllama(BaseHTTPRequestHandler):
         cls.requests = []
         cls.length_times = 0
         cls.reject_think = False
+        cls.think_inert = False
         cls.response_text = "OK"
 
     # -- helpers -------------------------------------------------------------
@@ -95,7 +99,9 @@ class FakeOllama(BaseHTTPRequestHandler):
             self._send(json.dumps({"error": "model does not support thinking"}).encode(), 400)
             return
 
-        if payload.get("keep_alive") == 0:  # unload
+        if payload.get("keep_alive") == 0 and not payload.get("prompt"):
+            # Pure unload (no prompt). Real Ollama still GENERATES when a
+            # prompt is present with keep_alive=0, then unloads right after.
             type(self).loaded.pop(model, None)
             self._send(b"{}"); return
 
@@ -132,12 +138,18 @@ class FakeOllama(BaseHTTPRequestHandler):
             }).encode()
             self._send(body)
             return
+        text = type(self).response_text
+        if type(self).think_inert and "think" in payload:
+            text = "<think>hmm</think>" + text
         body = json.dumps({
-            "response": type(self).response_text, "done": True, "done_reason": "stop",
+            "response": text, "done": True, "done_reason": "stop",
             "prompt_eval_count": 10, "eval_count": 2, "total_duration": 1_000_000,
             "eval_duration": 500_000,
         }).encode()
         self._send(body)
+        if payload.get("keep_alive") == 0:
+            # generated with keep_alive=0: real Ollama unloads right after
+            type(self).loaded.pop(model, None)
 
     def _send(self, body: bytes, code: int = 200) -> None:
         self.send_response(code)
@@ -441,6 +453,26 @@ def test_probe_capabilities_think_rejected() -> None:
         server.shutdown(); server.server_close()
 
 
+def test_probe_detects_accepted_but_ignored_think() -> None:
+    """The live case: Ollama accepts think:false (HTTP 200) but the model
+    answers with a <think> tag anyway — the switch is semantically inert, so
+    supports_think_param must record False (budgets assume thinking)."""
+    server, base = _serve()
+    try:
+        FakeOllama.think_inert = True
+        gw = _gateway(base)
+        entry = _run(gw.probe_capabilities(THINKER))
+        assert entry["supports_think_param"] is False
+        assert entry["think_ignored"] is True
+        # and the budget therefore boosts (thinking will happen)
+        _run(gw.generate("thinker", "hi"))
+        gen = [r for r in FakeOllama.requests if r.get("prompt") == "hi"]
+        assert "think" not in gen[-1]
+        assert gen[-1]["options"]["num_predict"] == 2048 + 512
+    finally:
+        server.shutdown(); server.server_close()
+
+
 # --- 11. truncation: one bigger-budget retry, then OllamaTruncatedError -------
 
 def test_truncation_retries_once_with_bigger_budget() -> None:
@@ -510,6 +542,92 @@ def test_only_gateway_module_posts_to_generate() -> None:
         for match in re.finditer(r'["\'][^"\']*/api/(?:generate|chat)["\']', text):
             offenders.append(f"{path.name}: {match.group(0)}")
     assert offenders == [], f"direct Ollama endpoints outside the gateway: {offenders}"
+
+
+# --- 11b. think switch: default-off once the probe confirms support ----------
+
+def test_think_defaults_false_once_probe_confirms_support() -> None:
+    """Live finding: an R1 distill thinks by default when no think switch is
+    sent, truncating the answer budget. Once the probe confirms support, a
+    bare generate must SEND think=false and skip the think_budget boost."""
+    server, base = _serve()
+    try:
+        gw = _gateway(base)
+        _run(gw.probe_capabilities(THINKER))  # FakeOllama accepts think -> True
+        _run(gw.generate("thinker", "hi"))
+        gen = [r for r in FakeOllama.requests if r.get("prompt") == "hi"]
+        assert gen[-1]["think"] is False
+        # no think_budget boost: base 2048, not 2048+512
+        assert gen[-1]["options"]["num_predict"] == 2048
+    finally:
+        server.shutdown(); server.server_close()
+
+
+def test_think_explicit_true_keeps_budget_boost() -> None:
+    server, base = _serve()
+    try:
+        gw = _gateway(base)
+        _run(gw.probe_capabilities(THINKER))
+        _run(gw.generate("thinker", "hi", think=True))
+        gen = [r for r in FakeOllama.requests if r.get("prompt") == "hi"]
+        assert gen[-1]["think"] is True
+        assert gen[-1]["options"]["num_predict"] == 2048 + 512
+    finally:
+        server.shutdown(); server.server_close()
+
+
+def test_think_unprobed_sends_no_switch_and_boosts_budget() -> None:
+    server, base = _serve()
+    try:
+        gw = _gateway(base)  # never probed: think_supported is None
+        _run(gw.generate("thinker", "hi"))
+        gen = [r for r in FakeOllama.requests if r.get("prompt") == "hi"]
+        assert "think" not in gen[-1]
+        assert gen[-1]["options"]["num_predict"] == 2048 + 512
+    finally:
+        server.shutdown(); server.server_close()
+
+
+def test_coder_never_gets_think_switch() -> None:
+    server, base = _serve()
+    try:
+        gw = _gateway(base)
+        _run(gw.generate("coder", "hi", think=None))
+        gen = [r for r in FakeOllama.requests if r.get("prompt") == "hi"]
+        assert "think" not in gen[-1]
+        assert gen[-1]["options"]["num_predict"] == 2048  # no boost, ever
+    finally:
+        server.shutdown(); server.server_close()
+
+
+# --- 12c. probe_ctx: one tiny generation at an exact ctx, no step-down -------
+
+def test_probe_ctx_ok_and_fraction() -> None:
+    server, base = _serve()
+    try:
+        gw = _gateway(base)
+        out = _run(gw.probe_ctx("coder", 6144))
+        assert out["ok"] is True and out["fraction"] == 1.0
+        # a probe never keeps the model warm
+        assert FakeOllama.loaded == {}
+        # exactly one ping generate at the requested ctx
+        gen = [r for r in FakeOllama.requests if r.get("prompt") == "ping"]
+        assert gen[-1]["options"]["num_ctx"] == 6144
+        assert gen[-1]["options"]["num_predict"] == 8
+    finally:
+        server.shutdown(); server.server_close()
+
+
+def test_probe_ctx_fails_below_gpu_fraction() -> None:
+    server, base = _serve()
+    try:
+        gw = _gateway(base)
+        FakeOllama.gpu_fraction = 0.5
+        out = _run(gw.probe_ctx("coder", 16384))
+        assert out["ok"] is False and out["fraction"] == 0.5
+        assert FakeOllama.loaded == {}
+    finally:
+        server.shutdown(); server.server_close()
 
 
 # --- 13. on_call hook: full per-call record, and swap records -----------------

@@ -19,3 +19,4 @@ logs
 .agent_staging/
 .agent_runs/
 .agent_tui_state.json
+calibration.json

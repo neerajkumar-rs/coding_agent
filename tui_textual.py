@@ -197,6 +197,7 @@ class OllamaAgentApp(App):
         self._save_pending = False
         self._workspace_pending = False
         self._confirm_pending = False
+        self._setup_pending = False
         self._vitals_lines: list[str] = ["n/a", "n/a", "n/a"]
         self._vitals_at = 0.0
         self._polling = False
@@ -259,6 +260,7 @@ class OllamaAgentApp(App):
             f"T:{_short_model(roles.get('thinker', {}).get('model'))}@{roles.get('thinker', {}).get('num_ctx')}",
             f"C:{_short_model(roles.get('coder', {}).get('model'))}@{roles.get('coder', {}).get('num_ctx')}",
             f"V:{_short_model(roles.get('validator', {}).get('model'))}@{roles.get('validator', {}).get('num_ctx')}",
+            f"W:{_short_model(roles.get('writer', {}).get('model'))}@{roles.get('writer', {}).get('num_ctx')}",
             f"res:{_short_model(resident)}",
         ]
         gpu_pct = ""
@@ -284,6 +286,14 @@ class OllamaAgentApp(App):
         if self._confirm_pending:
             self._confirm_pending = False
             self._answer_confirm(text.lower() in ("", "y", "yes"))
+            return
+        if self._setup_pending:
+            # Enter (empty) or anything but y = N — never auto-runs.
+            self._setup_pending = False
+            if text.lower() == "y":
+                self._setup_work()
+            else:
+                self._write(f"[{DIM}]Calibration skipped — nothing changed.[/]")
             return
         if not text:
             return
@@ -323,12 +333,25 @@ class OllamaAgentApp(App):
         elif command == "/models":
             self._models_work()
         elif command.startswith("/logs"):
+            from agent_core.run_state import LOG_CHANNELS as _LOG_CH
             args = text.strip()[len("/logs"):].split()
-            channel = args[0] if args else ""
+            channel, run_id = "", ""
             count = 60
-            if len(args) > 1 and args[1].isdigit():
-                count = int(args[1])
-            self._write(_tail_logs_text(self.workspace, channel, count))
+            positional = [a for a in args if not a.isdigit()]
+            digits = [a for a in args if a.isdigit()]
+            if digits:
+                count = int(digits[0])
+            if positional:
+                if positional[0] in _LOG_CH:
+                    channel = positional[0]
+                else:
+                    run_id = positional[0]
+                if len(positional) > 1:
+                    if positional[1] in _LOG_CH:
+                        channel = positional[1]
+                    else:
+                        run_id = run_id or positional[1]
+            self._write(_tail_logs_text(self.workspace, channel, count, run_id=run_id))
         elif command.startswith("/router"):
             self._router_work(text.strip()[len("/router"):].strip())
         elif command == "/roles":
@@ -337,6 +360,12 @@ class OllamaAgentApp(App):
             self._model_work(text.strip()[len("/model"):].strip())
         elif command.startswith("/ctx"):
             self._ctx_work(text.strip()[len("/ctx"):].strip())
+        elif command == "/setup":
+            self._setup_pending = True
+            self._write(f"[yellow]Machine calibration probes every role model at several "
+                        f"context sizes against the GPU guard (loads/unloads models, "
+                        f"a few minutes). Never auto-runs.[/]")
+            self._write(f"[bold {ACCENT}]Run calibration? \\[y/N] (default: N)[/]")
         elif command == "/run":
             self._write(f"[{DIM}]Type the request directly — /run is the default pipeline.[/]")
         else:
@@ -499,6 +528,39 @@ class OllamaAgentApp(App):
         self.call_from_thread(self._write, "\n".join(lines))
 
     @work(thread=True)
+    def _setup_work(self) -> None:
+        """/setup — machine calibration through a local gateway, GPU-locked
+        against in-TUI bench/runs (UX mutex; the VRAM guard is the real
+        safety). Writes calibration.json atomically per role."""
+        import calibrate
+        from ollama_client import AgentGateway, OllamaSupervisorClient
+
+        lock = tui._get_gpu_lock()
+        if lock.locked():
+            self.call_from_thread(
+                self._write, f"[{DIM}]GPU busy — try again when the current operation finishes.[/]",
+            )
+            return
+        self.call_from_thread(self._write, f"[{DIM}]Calibrating… (models load/unload per probe)[/]")
+
+        async def _go():
+            async with lock:
+                gateway = AgentGateway(OllamaSupervisorClient(base_url=tui.OLLAMA_BASE))
+                return await calibrate.run_calibration(gateway)
+
+        try:
+            data = asyncio.run(_go())
+        except Exception as exc:
+            self.call_from_thread(self._write, f"[{RED}]Calibration failed: {exc}[/]")
+            return
+        lines = ["[bold]Calibration complete[/]"]
+        for role, entry in (data.get("roles") or {}).items():
+            note = " (cancelled)" if entry.get("cancelled") else ""
+            lines.append(f"  {role}: ceiling={entry.get('ceiling')}{note}")
+        lines.append(f"[{DIM}]Written to {calibrate.CALIBRATION_PATH} — applies immediately.[/]")
+        self.call_from_thread(self._write, "\n".join(lines))
+
+    @work(thread=True)
     def _status_work(self) -> None:
         try:
             health = _post_get_sync(tui.HEALTH_URL)
@@ -542,7 +604,7 @@ class OllamaAgentApp(App):
             data = _post_get_sync(tui.CONFIG_URL)
             roles = data.get("roles", {})
             lines = [f"[bold]ROLES[/]  [{DIM}](workspace: {data.get('workspace')})[/]"]
-            for role in ("thinker", "coder", "validator"):
+            for role in ("thinker", "coder", "validator", "writer"):
                 cfg = roles.get(role, {})
                 lines.append(
                     f"  {role}: model={cfg.get('model')}  ctx={cfg.get('num_ctx')}  "
@@ -561,7 +623,7 @@ class OllamaAgentApp(App):
         """/model <thinker|coder|validator> <name> — validate + persist."""
         parts = args.split()
         if len(parts) != 2:
-            self.call_from_thread(self._write, f"[{DIM}]Usage: /model <thinker|coder|validator> <name>[/]")
+            self.call_from_thread(self._write, f"[{DIM}]Usage: /model <thinker|coder|validator|writer> <name>[/]")
             return
         role, name = parts
         try:
@@ -582,7 +644,7 @@ class OllamaAgentApp(App):
         """/ctx <role> <n> — clamp to the role ceiling, persist."""
         parts = args.split()
         if len(parts) != 2 or not parts[1].isdigit():
-            self.call_from_thread(self._write, f"[{DIM}]Usage: /ctx <thinker|coder|validator> <n>[/]")
+            self.call_from_thread(self._write, f"[{DIM}]Usage: /ctx <thinker|coder|validator|writer> <n>[/]")
             return
         role, n = parts[0], int(parts[1])
         try:
@@ -701,18 +763,22 @@ def _short_model(name) -> str:
     return base.split(":")[0]
 
 
-def _tail_logs_text(workspace: str, channel: str = "", count: int = 60) -> str:
-    """Read the ACTIVE workspace's LATEST run logs from .agent_runs/<run_id>/.
+def _tail_logs_text(workspace: str, channel: str = "", count: int = 60,
+                    run_id: str = "") -> str:
+    """Read the ACTIVE workspace's run logs from .agent_runs/<run_id>/.
 
     Thin markup wrapper over the registry-driven reader in
     agent_core.run_state: ``channel`` is any registered channel
-    (thinker/coder/validator/sandbox/events), ``count`` is a LINE count.
-    When no run exists, the exact path searched is printed.
+    (thinker/coder/validator/sandbox/events), ``count`` is a LINE count,
+    ``run_id`` selects a specific run (exact or unique prefix; default latest).
+    When nothing matches, the exact path searched is printed.
     """
     from agent_core.run_state import tail_run_logs
 
-    result = tail_run_logs(workspace, channel, count)
+    result = tail_run_logs(workspace, channel, count, run_id=run_id)
     if result.get("run_id") is None:
+        if result.get("error"):
+            return f"[{DIM}]{result['error']} — searched {result.get('searched')}[/]"
         return f"[{DIM}]No runs yet — searched {result.get('searched')}[/]"
     parts: list[str] = [f"[{DIM}]--- latest run: {result['run_id']} ---[/]"]
     sections = result.get("sections", [])

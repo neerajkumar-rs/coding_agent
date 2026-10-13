@@ -367,6 +367,7 @@ async def _summary_prose(
             summary_model, prompt,
             system="You describe only what the code visibly does.",
             temperature=TEMPERATURE_PLAN,
+            role="writer",  # server path: the writer role owns summary prose
         )
     except Exception:
         return ""

@@ -33,6 +33,7 @@ def _seed_run_with_logs(workspace: str | Path, run_id: str = "") -> RunJournal:
     )
     journal.log_llm_call("coder", model="m2", prompt="code this", response="the code")
     journal.log_role("validator", "verdict block")
+    journal.log_role("writer", "summary prose block")
     journal.log_role("sandbox", "check output block")
     journal.emit_event({"event": "run_started", "run_id": journal.run_id})
     journal.emit_event({"event": "run_finished", "status": "completed"})
@@ -77,6 +78,44 @@ def test_events_channel_selected_explicitly() -> None:
         result = tail_run_logs(tmp, "events")
         assert [s["channel"] for s in result["sections"]] == ["events"]
         assert any("run_started" in line for line in result["sections"][0]["lines"])
+
+
+# ---------------------------------------------------------------------------
+# run_id selection (exact + unique prefix), with and without a channel.
+# ---------------------------------------------------------------------------
+
+def test_run_id_exact_and_prefix_selection(tmp_path: Path) -> None:
+    older = _seed_run_with_logs(tmp_path, run_id="20261012T000000Z-aaa111")
+    newer = _seed_run_with_logs(tmp_path, run_id="20261013T000000Z-bbb222")
+    # exact id picks that run even though it is older
+    result = tail_run_logs(tmp_path, "thinker", 60, run_id=older.run_id)
+    assert result["run_id"] == older.run_id
+    # unique prefix picks it too
+    result = tail_run_logs(tmp_path, run_id="20261012")
+    assert result["run_id"] == older.run_id
+    # empty run_id = latest
+    assert tail_run_logs(tmp_path)["run_id"] == newer.run_id
+
+
+def test_run_id_no_match_reports_searched_path(tmp_path: Path) -> None:
+    _seed_run_with_logs(tmp_path, run_id="20261013T000000Z-bbb222")
+    result = tail_run_logs(tmp_path, run_id="nonexistent-run")
+    assert result["run_id"] is None
+    assert "nonexistent-run" in result["error"]
+    assert "nonexistent-run" in result["searched"]
+    # ambiguous prefix matches nothing uniquely
+    _seed_run_with_logs(tmp_path, run_id="20261013T235959Z-ccc333")
+    result = tail_run_logs(tmp_path, run_id="20261013")
+    assert result["run_id"] is None
+
+
+def test_run_id_via_rich_tui_formatter(tmp_path: Path) -> None:
+    older = _seed_run_with_logs(tmp_path, run_id="20261012T000000Z-aaa111")
+    _seed_run_with_logs(tmp_path, run_id="20261013T000000Z-bbb222")
+    text = tui.format_run_logs_text(str(tmp_path), run_id=older.run_id)
+    assert older.run_id in text
+    text = tui.format_run_logs_text(str(tmp_path), run_id="nope")
+    assert "nope" in text and "searched" in text
 
 
 # ---------------------------------------------------------------------------
@@ -192,3 +231,50 @@ def test_no_retired_log_dir_references_in_repo() -> None:
         except OSError:
             continue
     assert offenders == [], f"retired log-dir references remain: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# Textual hygiene: no Rich console output or blocking prompts inside the app.
+# ---------------------------------------------------------------------------
+
+def test_textual_app_has_no_rich_console_or_blocking_prompts() -> None:
+    """Inside tui_textual.py, output goes to the RichLog widget only: no
+    console.print, Prompt.ask/Confirm.ask, input(), rich.print, breakpoint().
+    (Docstrings/comments are stripped before scanning.)"""
+    import ast
+
+    source = (Path(tui.PROJECT_ROOT) / "tui_textual.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    banned_calls = {"print", "input", "breakpoint"}  # rich.print / bare input / breakpoint
+    banned_attrs = {("Prompt", "ask"), ("Confirm", "ask")}  # Prompt.ask / Confirm.ask
+    violations: list[str] = []
+
+    class _Names(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.console_names: set[str] = set()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in banned_calls:
+                violations.append(f"line {node.lineno}: {func.id}()")
+            elif isinstance(func, ast.Attribute):
+                if (isinstance(func.value, ast.Name)
+                        and (func.value.id, func.attr) in banned_attrs):
+                    violations.append(f"line {node.lineno}: {func.value.id}.{func.attr}()")
+                if func.attr == "print" and isinstance(func.value, ast.Name) \
+                        and func.value.id in self.console_names:
+                    violations.append(f"line {node.lineno}: {func.value.id}.print()")
+            self.generic_visit(node)
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            # Track names bound to a Rich Console() so `x.print(...)` is caught.
+            if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) \
+                    and node.value.func.id == "Console":
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self.console_names.add(target.id)
+            self.generic_visit(node)
+
+    _Names().visit(tree)
+    assert violations == [], f"Textual hygiene violations: {violations}"

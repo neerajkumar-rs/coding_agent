@@ -76,3 +76,30 @@ def test_registry_without_workspace_does_not_write() -> None:
         reg.set("coder", num_ctx=4096)
         assert cfg.get_role_config("coder")["num_ctx"] == 4096
         assert not (Path(tmp) / ".agent").exists()
+
+
+# --- writer role (4th role): prose/summaries, thinker model by default ------
+
+def test_writer_role_defaults() -> None:
+    from agent_config import ROLE_CTX_CEILINGS, ROLE_NAMES
+
+    assert "writer" in ROLE_NAMES
+    cfg = AgentConfig()
+    writer = cfg.get_role_config("writer")
+    assert writer["model"] == "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
+    assert writer["temperature"] == 0.4  # warmer prose
+    assert writer["num_predict"] == 1024
+    assert writer["inline_system"] is True
+    assert ROLE_CTX_CEILINGS["writer"] == 16384
+
+
+def test_writer_role_via_registry_and_channels() -> None:
+    from agent_core.run_state import LOG_CHANNELS
+
+    assert "writer" in LOG_CHANNELS  # /logs writer works out of the box
+    cfg = AgentConfig()
+    reg = RoleRegistry(cfg)
+    out = reg.set("writer", num_ctx=4096)
+    assert out["num_ctx"] == 4096
+    with pytest.raises(ValueError, match="unknown role"):
+        reg.set("writers", num_ctx=1024)

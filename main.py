@@ -197,13 +197,21 @@ def _capability_entry(caps: Any, model: str) -> dict[str, Any]:
     return {}
 
 
-def _base_model_warning(name: str, quant: str) -> str | None:
-    """Heuristic: a name with no instruct/chat/code suffix, or a base quant,
-    is likely a base (non-instruction-tuned) model — warn for the thinker."""
+def _base_model_warning(name: str, quant: str, template: str | None = None) -> str | None:
+    """Heuristic warnings for a role model: a name with no instruct/chat/code
+    suffix is likely a base model, and an empty /api/show template means no
+    chat template (prompt structure will be poor). template=None means /api/show
+    never answered (model not installed) — no template warning then."""
     lowered = name.lower()
-    if any(tag in lowered for tag in ("instruct", "chat", "coder", "-it", "r1")):
-        return None
-    return f"'{name}' looks like a BASE model (no instruct/chat/coder tag); it may follow instructions poorly"
+    warnings: list[str] = []
+    if not any(tag in lowered for tag in ("instruct", "chat", "coder", "-it", "r1")):
+        warnings.append(
+            f"'{name}' looks like a BASE model (no instruct/chat/coder tag); "
+            "it may follow instructions poorly"
+        )
+    if template is not None and not template.strip():
+        warnings.append(f"'{name}' has no chat template in /api/show")
+    return " | ".join(warnings) if warnings else None
 
 
 @app.get("/models")
@@ -229,9 +237,14 @@ async def list_models() -> dict[str, Any]:
                 resident = [m.get("name", "") for m in ps.json().get("models", [])]
         except httpx.HTTPError:
             pass
-        # /api/show per configured role for the quantization level
+        # /api/show per configured role for the quantization level + template.
+        # A model whose /api/show never answered stays absent from `templates`
+        # (None below) — the missing-template warning only fires for models
+        # that actually responded with an empty template.
         quants: dict[str, str] = {}
-        for role in ("thinker", "coder", "validator"):
+        templates: dict[str, str] = {}
+        from agent_config import ROLE_NAMES
+        for role in ROLE_NAMES:
             name = str(state.config.get_role_config(role)["model"])
             if name in quants:
                 continue
@@ -240,13 +253,15 @@ async def list_models() -> dict[str, Any]:
                     f"{state.ollama.base_url}/api/show", json={"name": name}
                 )
                 if show.status_code == 200:
-                    details = show.json().get("details", {})
-                    quants[name] = details.get("quantization_level", "")
+                    data = show.json()
+                    quants[name] = data.get("details", {}).get("quantization_level", "")
+                    templates[name] = str(data.get("template", ""))
             except httpx.HTTPError:
                 pass
 
     roles: dict[str, Any] = {}
-    for role in ("thinker", "coder", "validator"):
+    from agent_config import ROLE_NAMES
+    for role in ROLE_NAMES:
         cfg = state.config.get_role_config(role)
         name = str(cfg["model"])
         tag = tags.get(name, {})
@@ -262,7 +277,7 @@ async def list_models() -> dict[str, Any]:
             "num_ctx": cfg.get("num_ctx"),
             "installed": name in tags,
             "resident": name in resident,
-            "warning": _base_model_warning(name, quant),
+            "warning": _base_model_warning(name, quant, templates.get(name)),
         }
     return {"workspace": str(state.workspace_root), "roles": roles, "resident": resident}
 
@@ -270,10 +285,12 @@ async def list_models() -> dict[str, Any]:
 @app.get("/config")
 async def get_config() -> dict[str, Any]:
     """The current per-role config (the single source of truth) + router opts."""
+    from agent_config import ROLE_NAMES
+
     return {
         "workspace": str(state.workspace_root),
         "roles": {role: state.config.get_role_config(role)
-                  for role in ("thinker", "coder", "validator")},
+                  for role in ROLE_NAMES},
         "router": state.config.router,
         "allowed_commands": state.config.allowed_commands,
     }
@@ -514,7 +531,8 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
             state_data = json.loads(journal.state_path.read_text(encoding="utf-8"))
             caps = (state.config.extra or {}).get("capabilities", {})
             roles_state: dict[str, Any] = {}
-            for role_name in ("thinker", "coder", "validator"):
+            from agent_config import ROLE_NAMES as _ROLE_NAMES
+            for role_name in _ROLE_NAMES:
                 rc = state.config.get_role_config(role_name)
                 entry = _capability_entry(caps, str(rc.get("model")))
                 roles_state[role_name] = {

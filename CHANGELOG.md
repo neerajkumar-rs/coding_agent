@@ -1,7 +1,32 @@
-# CHANGELOG — v3 implementation (Phases 0–3 consolidation)
+# CHANGELOG — v3 implementation (Phases 0–3 consolidation + backlog 1–6)
 
-All changes offline-verified: **267 tests pass** (`pytest tests/ test_master_controller.py`),
-24 test files, no live-Ollama dependency in the suite.
+All changes offline-verified: **292 tests pass** (`pytest tests/ test_master_controller.py`),
+26 test files. Live Ollama verification done on this machine (see below).
+
+## Backlog round (2026-10-13)
+
+- **Textual hygiene grep test** — AST scan of `tui_textual.py`: no
+  `console.print` / `Prompt.ask` / `input()` / `breakpoint()` inside the app.
+- **`/models` template warning** — a role whose model answers `/api/show`
+  with an empty template is flagged ("no chat template"); models that never
+  answered (not installed) are not flagged.
+- **`/logs run <id>`** — both TUIs select a run by exact id or unique prefix
+  (`/logs <run> [channel] [N]`), with the searched path reported on no match.
+- **Writer role (4th role)** — `roles.writer` (summary/docs prose; thinker
+  model by default, warmer temperature, 1024 predict), its own
+  `writer.log` channel, registry/`/config/role`-switchable, and the pipeline's
+  summary call carries `role="writer"`. Zero extra VRAM until reconfigured.
+- **`/setup` machine calibration** — `calibrate.py` + `/setup` in both TUIs
+  (y/N gated, never auto-runs): binary search over the ctx rungs per role via
+  `AgentGateway.probe_ctx` (one tiny generation at an exact ctx, no
+  step-down), atomic write to `calibration.json` after EACH role
+  (cancel/crash keeps completed roles), machine fingerprint (TOTAL vram/ram +
+  os + cpu) gating. `ceiling_for(role)` prefers measured ceilings when the
+  fingerprint matches — no caller changes.
+- **Live-found think fix** — the thinker accepts but ignores `think:false`;
+  the probe now detects it semantically, and `generate()` only sends
+  `think=False` when the probe confirmed a REAL switch (otherwise the budget
+  boost applies). Four new gateway tests pin the behavior.
 
 ## What changed
 
@@ -96,14 +121,27 @@ All changes offline-verified: **267 tests pass** (`pytest tests/ test_master_con
   model configured, `_role_of` already maps it correctly.
 - **`/logs run <id>` selection dropped** per v3 deferral (channel-only now).
 
-## Not verified on this machine (needs live Ollama + the RTX 3050)
+## Verified live on this machine (RTX 3050 4GB, Ollama 0.40.2, 2026-10-13)
 
-- Whether `erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest` accepts `think: false`
-  (the probe path is implemented and tested against a fake 400; real model
-  untested).
+- Both reference models installed with the exact expected digests
+  (`0a7c62f3bef4`, `f72c60cabf62`).
+- **`think:false` is accepted by Ollama but IGNORED by the erwan2 R1
+  distill** — it emits `<think>` regardless. The capability probe now checks
+  the OUTPUT for a think tag (not just the HTTP status) and records
+  `supports_think_param=false, think_ignored=true`; budgets always include
+  `think_budget` for this model. (A trivial prompt spent 108–311 think tokens;
+  `think_budget=512` is right-sized.)
+- Live generates through the gateway: exactly one resident model at every
+  `/api/ps` sample, clean thinker→coder swap, `size_vram/size = 1.000`.
+- **Measured ctx rungs (0.97 guard):** thinker passes 8192/12288/16384;
+  coder passes 6144/8192 and FAILS 12288 (0.833). The static coder ceiling
+  (12288) is too optimistic on this card — run `/setup` (or
+  `python calibrate.py --yes`) to write measured ceilings into
+  `calibration.json`; `ceiling_for` then prefers them automatically.
+
+## Still not verified here
+
 - How Ollama `format=` constrained decoding interacts with the thinker's
-  `<think>` output (fallback path exists; interaction unmeasured).
-- The `think_budget` (512) that actually avoids mid-answer truncation.
-- Which `num_ctx` rungs pass the 0.97 GPU-fraction check per model.
-- Real nvidia-smi readings during a run, real swap durations.
+  `<think>` output (fallback path exists; interaction unmeasured live).
 - `scripts/live_smoke.py` end-to-end against the real server.
+- nvidia-smi watchdog readings during a loaded run (GPU busy mid-run).

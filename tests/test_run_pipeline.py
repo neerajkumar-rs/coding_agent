@@ -57,6 +57,35 @@ def make_fake_generate(routes: dict[str, str], default: str = ""):
     return fake
 
 
+def test_summary_call_uses_writer_role() -> None:
+    """The summary prose call carries role='writer' through the generate seam
+    (the server maps it to the writer role config)."""
+    seen_roles: list[str] = []
+
+    async def fake(model, prompt, system="", temperature=0.2, **kwargs):
+        import re
+        if "Describe only features visible" in prompt:
+            seen_roles.append(kwargs.get("role", ""))
+            return "A small python module."
+        target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
+        if target and target.group(1) == "greet.py":
+            return "```python\ndef greet(name: str) -> str:\n    return f'Hello, {name}!'\n```"
+        if "JSON array of tasks" in prompt:
+            return json.dumps([{"path": "greet.py", "action": "create",
+                                "description": "Create a greet function returning a greeting string"}])
+        if "satisfies_request" in prompt:
+            return json.dumps({"satisfies_request": True, "problems": [], "summary": "ok"})
+        return ""
+
+    with TemporaryDirectory() as tmp:
+        result = _run(run_pipeline(
+            "create greet.py with a greet function",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+        ))
+    assert result["staged_files"] == ["greet.py"]
+    assert seen_roles == ["writer"]
+
+
 def _run(coro):
     return asyncio.run(coro)
 

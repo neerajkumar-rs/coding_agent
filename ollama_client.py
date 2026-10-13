@@ -637,6 +637,45 @@ class AgentGateway:
         except httpx.HTTPError as exc:
             logger.warning(f"unload {model} failed: {exc}")
 
+    async def probe_ctx(self, role: str, num_ctx: int) -> dict[str, Any]:
+        """Calibration probe: ONE tiny generation at exactly this num_ctx —
+        no rung step-down, no truncation retry. Returns {"ok", "fraction",
+        "size_vram", "size"}; "ok" means fraction >= min_gpu_fraction.
+        The model is always unloaded afterwards (a probe never keeps warm).
+        """
+        rc = self.config.get_role_config(role)
+        resolved = await self.supervisor.resolve_model_name(str(rc["model"]))
+        async with self._lock:
+            async with httpx.AsyncClient(timeout=self.supervisor.timeout) as client:
+                await self._ensure_only_resident(client, resolved)
+                try:
+                    await self.supervisor.generate_unlocked(
+                        prompt="ping", system_prompt="", model_name=resolved,
+                        config=self._ctx_config(num_ctx), num_predict=8,
+                        temperature=0.0,
+                    )
+                except OllamaTruncatedError:
+                    pass  # an 8-token probe may truncate; residency is what matters
+                except Exception as exc:
+                    await self._unload(client, resolved)
+                    self._resident_model = None
+                    return {"ok": False, "fraction": 0.0, "error": str(exc)[:200]}
+                resident = await self._ps(client)
+                entry = next((m for m in resident if m.get("name") == resolved), None)
+                if entry is None:
+                    return {"ok": False, "fraction": 0.0, "error": "not resident"}
+                size = int(entry.get("size", 0) or 0)
+                size_vram = int(entry.get("size_vram", 0) or 0)
+                fraction = (size_vram / size) if size else 0.0
+                await self._unload(client, resolved)
+                self._resident_model = None
+                return {
+                    "ok": fraction >= self.min_gpu_fraction,
+                    "fraction": round(fraction, 3),
+                    "size_vram": size_vram,
+                    "size": size,
+                }
+
     async def unload(self, model: str) -> None:
         """Public keep_alive=0 unload — the ONLY sanctioned /api/generate post
         outside a guarded generate. Callers (the server's cancel path, bench)
@@ -722,8 +761,26 @@ class AgentGateway:
                         entry["template"] = str(data.get("template", ""))[:200]
                 except httpx.HTTPError as exc:
                     entry["show_error"] = str(exc)
-                # Tiny think:false call; HTTP 400 "does not support thinking"
-                # (or any 4xx mentioning thinking) -> supports_think_param False.
+                if not entry.get("digest"):
+                    # /api/show may omit the digest (verified live on Ollama
+                    # 0.40); /api/tags always has it.
+                    try:
+                        tags = await client.get(f"{self.base_url}/api/tags")
+                        if tags.status_code == 200:
+                            for m in tags.json().get("models", []):
+                                if m.get("name") == resolved:
+                                    entry["digest"] = str(m.get("digest", ""))
+                                    break
+                    except httpx.HTTPError:
+                        pass
+                # Tiny think:false call. Two checks (verified live on the
+                # erwan2 R1 distill under Ollama 0.40, which ACCEPTS the switch
+                # but IGNORES it — the model thinks anyway):
+                #   1. HTTP 400 "does not support thinking" -> unsupported.
+                #   2. A 200 whose output still contains a <think> tag ->
+                #      the switch is accepted but semantically inert -> record
+                #      supports_think_param=False (the budget must assume
+                #      thinking happens) and note think_ignored=True.
                 entry["supports_think_param"] = True
                 try:
                     await self._ensure_only_resident(client, resolved)
@@ -732,13 +789,16 @@ class AgentGateway:
                         json={
                             "model": resolved, "prompt": "ping", "stream": False,
                             "think": False, "keep_alive": 0,
-                            "options": {"num_ctx": 2048, "num_predict": 8},
+                            "options": {"num_ctx": 2048, "num_predict": 64},
                         },
                     )
                     if resp.status_code == 400 and "think" in resp.text.lower():
                         entry["supports_think_param"] = False
                     elif resp.status_code >= 400:
                         entry["probe_error"] = f"{resp.status_code}: {resp.text[:200]}"
+                    elif "<think>" in (resp.json().get("response") or "").lower():
+                        entry["supports_think_param"] = False
+                        entry["think_ignored"] = True
                 except httpx.HTTPError as exc:
                     entry["probe_error"] = str(exc)
         caps = dict((self.config.extra or {}).get("capabilities", {}))
@@ -789,13 +849,20 @@ class AgentGateway:
         if rc.get("inline_system") and system:
             prompt = f"{system}\n\n{prompt}"
             system = ""
-        # num_predict is shared between thinking and answer: when a reasoning
-        # model cannot disable thinking, add the role's think allowance on top.
+        # num_predict is shared between thinking and answer. Whether thinking
+        # will actually happen decides the budget boost AND the think switch:
+        #  - caller passed think=True            -> thinking on, add budget
+        #  - think=None + probe says unsupported -> model thinks anyway, add budget
+        #  - think=None + probe says SUPPORTED   -> send think=False (disable),
+        #    no budget boost (verified live: an R1 distill thinks by default
+        #    when no switch is sent, and truncates small num_predict budgets)
         effective_predict = num_predict if num_predict is not None else int(rc["num_predict"])
-        if (
-            think is not False
-            and is_reasoning_model(resolved)
-            and self.think_supported(resolved) is not True
+        reasoning = is_reasoning_model(resolved)
+        if think is None and reasoning and self.think_supported(resolved) is True:
+            think = False
+        if reasoning and (
+            think is True
+            or (think is None and self.think_supported(resolved) is not True)
         ):
             effective_predict += int(rc.get("think_budget", 512))
         rungs = [r for r in CTX_RUNGS if r <= int(rc["num_ctx"])]

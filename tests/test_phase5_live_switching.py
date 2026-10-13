@@ -18,7 +18,7 @@ from ollama_client import OllamaSupervisorClient
 
 
 class _TagsHandler(BaseHTTPRequestHandler):
-    models = ["qwen2.5-coder:3b-instruct", "deepseek-r1:1.5b", "qwen2.5-coder:1.5b"]
+    models = ["qwen2.5-coder:3b-instruct", "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "qwen2.5-coder:1.5b"]
 
     def do_GET(self) -> None:
         if self.path.endswith("/api/tags"):
@@ -52,7 +52,7 @@ def test_get_config_returns_roles_and_router(ws) -> None:
     r = client.get("/config")
     assert r.status_code == 200
     data = r.json()
-    assert set(data["roles"]) == {"thinker", "coder", "validator"}
+    assert set(data["roles"]) == {"thinker", "coder", "validator", "writer"}
     assert data["roles"]["coder"]["model"] == "qwen2.5-coder:3b-instruct"
     assert "min_confidence" in data["router"]
 

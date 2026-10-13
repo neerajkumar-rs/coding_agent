@@ -201,11 +201,19 @@ touch a model; T2 goes through the same gateway lock.
 
 ### `GET /config` · `POST /config/role`
 
-The live per-role config (thinker/coder/validator: model, num_ctx,
+The live per-role config (thinker/coder/validator/writer: model, num_ctx,
 num_predict, temperature, keep_alive, inline_system, think_budget) and the
 validated update path. Changes persist to `.agent` and apply on the NEXT
 gateway call, never mid-generation. num_ctx is clamped through
 `ceiling_for(role)`.
+
+### Machine calibration — `/setup` or `python calibrate.py`
+
+Probes each role model at the context rungs against the 0.97 GPU guard and
+writes measured ceilings to `calibration.json` (repo root, git-ignored,
+fingerprint-gated to this machine). y/N gated — never auto-runs; atomic write
+after each role so a cancel keeps completed roles. `ceiling_for` prefers
+measured values immediately.
 
 ---
 
@@ -257,7 +265,7 @@ The workspace root itself only ever receives the **requested target files**
 ## Testing
 
 ```powershell
-# Unit tests (267 incl. the root lifecycle suite, offline)
+# Unit tests (292 incl. the root lifecycle suite, offline)
 .\env\Scripts\python.exe -m pytest tests/ test_master_controller.py -q
 
 # Legacy lifecycle suite (offline)

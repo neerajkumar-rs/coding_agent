@@ -26,10 +26,12 @@ RTX_3050_VRAM_CEILING_GB = 4.0
 
 # Role ceilings (num_ctx). The effective num_ctx is always clamped to these
 # (and further by calibration in Phase 6).
-ROLE_CTX_CEILINGS = {"thinker": 16384, "coder": 12288, "validator": 16384}
+ROLE_CTX_CEILINGS = {"thinker": 16384, "coder": 12288, "validator": 16384, "writer": 16384}
 
 # Canonical role names; "planner" is accepted everywhere as the thinker alias.
-ROLE_NAMES = ("thinker", "coder", "validator")
+# writer = prose (summaries/docs); defaults to the thinker MODEL so a fourth
+# role costs zero extra VRAM/swaps until configured otherwise.
+ROLE_NAMES = ("thinker", "coder", "validator", "writer")
 
 
 def canonical_role(role: str) -> str:
@@ -38,10 +40,105 @@ def canonical_role(role: str) -> str:
 
 
 def ceiling_for(role: str) -> int:
-    """The static num_ctx ceiling for a role. Every num_ctx anywhere is
-    clamped through this — a later calibration phase swaps in measured values
-    here without touching any caller."""
-    return ROLE_CTX_CEILINGS.get(canonical_role(role), max(ROLE_CTX_CEILINGS.values()))
+    """The num_ctx ceiling for a role. Every num_ctx anywhere is clamped
+    through this. A measured value from calibration.json wins when its
+    machine fingerprint matches THIS machine; otherwise the static ceiling."""
+    canonical = canonical_role(role)
+    measured = measured_ceiling(canonical)
+    if measured is not None:
+        return measured
+    return ROLE_CTX_CEILINGS.get(canonical, max(ROLE_CTX_CEILINGS.values()))
+
+
+# ---------------------------------------------------------------------------
+# Machine calibration (calibrate.py writes calibration.json; we read it here)
+# ---------------------------------------------------------------------------
+CALIBRATION_PATH = Path(__file__).resolve().parent / "calibration.json"
+
+_fingerprint_cache: str | None = None
+_calib_cache: tuple[str, float, dict[str, Any] | None] | None = None
+
+
+def _total_ram_gb() -> float:
+    """TOTAL physical RAM (stable, unlike the available-RAM probe used for
+    budgeting). Falls back to the available-RAM estimate off Windows."""
+    try:
+        if sys.platform == "win32":
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [
+                    ("length", ctypes.c_ulong),
+                    ("memory_load", ctypes.c_ulong),
+                    ("total_phys", ctypes.c_ulonglong),
+                    ("avail_phys", ctypes.c_ulonglong),
+                    ("total_page", ctypes.c_ulonglong),
+                    ("avail_page", ctypes.c_ulonglong),
+                    ("total_virtual", ctypes.c_ulonglong),
+                    ("avail_virtual", ctypes.c_ulonglong),
+                    ("avail_extended", ctypes.c_ulonglong),
+                ]
+
+            status = MemoryStatus()
+            status.length = ctypes.sizeof(MemoryStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return round(status.total_phys / (1024**3), 2)
+    except Exception:
+        pass
+    return detect_system_ram_gb()
+
+
+def machine_fingerprint() -> str:
+    """Stable fingerprint: TOTAL VRAM + TOTAL RAM + OS + CPU count — only
+    quantities that do not change between two calls on the same machine.
+    Cached (nvidia-smi is a subprocess call — run at most once per process)."""
+    global _fingerprint_cache
+    if _fingerprint_cache is None:
+        import hashlib
+        import platform
+
+        raw = (
+            f"gpu={detect_gpu_vram_gb()}|ram={_total_ram_gb()}|"
+            f"os={platform.system()}-{platform.release()}|cpu={os.cpu_count()}"
+        )
+        _fingerprint_cache = hashlib.sha256(raw.encode()).hexdigest()[:16]
+    return _fingerprint_cache
+
+
+def load_calibration(path: str | Path | None = None) -> dict[str, Any] | None:
+    """The calibration dict, or None when missing/corrupt. Mtime-cached."""
+    global _calib_cache
+    p = Path(path) if path else CALIBRATION_PATH
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        return None
+    if _calib_cache and _calib_cache[0] == str(p) and _calib_cache[1] == mtime:
+        return _calib_cache[2]
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        data = data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        data = None
+    _calib_cache = (str(p), mtime, data)
+    return data
+
+
+def measured_ceiling(role: str, path: str | Path | None = None) -> int | None:
+    """The measured ceiling for a role when the calibration fingerprint
+    matches THIS machine, else None (caller falls back to static)."""
+    data = load_calibration(path)
+    if not data or data.get("fingerprint") != machine_fingerprint():
+        return None
+    entry = (data.get("roles") or {}).get(role)
+    if isinstance(entry, dict) and isinstance(entry.get("ceiling"), int):
+        return int(entry["ceiling"])
+    return None
+
+
+def _reset_calibration_cache() -> None:
+    """Test hook: drop the fingerprint + calibration caches."""
+    global _fingerprint_cache, _calib_cache
+    _fingerprint_cache = None
+    _calib_cache = None
 
 # Canonical default roles: the single source of truth for model + sampling.
 # thinker = planner/Q&A, coder = code, validator = review (thinker model+ctx).
@@ -73,6 +170,17 @@ def _default_roles() -> dict[str, dict[str, Any]]:
             "num_ctx": 8192,
             "num_predict": 512,
             "temperature": 0.0,
+            "keep_alive": DEFAULT_KEEP_ALIVE,
+            "inline_system": True,
+            "think_budget": 512,
+        },
+        # Prose role: summaries / docs. Same model as the thinker by default
+        # (zero extra VRAM), warmer temperature for readable prose.
+        "writer": {
+            "model": DEFAULT_PLANNER_MODEL,
+            "num_ctx": 8192,
+            "num_predict": 1024,
+            "temperature": 0.4,
             "keep_alive": DEFAULT_KEEP_ALIVE,
             "inline_system": True,
             "think_budget": 512,

@@ -195,3 +195,55 @@ def test_base_model_warning_heuristic() -> None:
     assert _base_model_warning("qwen2.5:3b", "Q4_K_M") is not None  # no instruct tag -> warn
     assert _base_model_warning("qwen2.5-coder:3b-instruct", "Q4_K_M") is None
     assert _base_model_warning("erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "Q4_0") is None  # r1 tag ok
+
+
+def test_template_missing_warning() -> None:
+    from main import _base_model_warning
+
+    # empty template from a model that ANSWERED /api/show -> warn
+    w = _base_model_warning("qwen2.5-coder:3b-instruct", "Q4_K_M", template="")
+    assert w is not None and "no chat template" in w
+    # template present -> no warning
+    assert _base_model_warning("qwen2.5-coder:3b-instruct", "Q4_K_M", template="{{ .Prompt }}") is None
+    # template None = /api/show never answered (model not installed) -> NO warning
+    assert _base_model_warning("qwen2.5-coder:3b-instruct", "Q4_K_M", template=None) is None
+
+
+def test_models_endpoint_template_warning() -> None:
+    """The endpoint surfaces the missing-template warning per role card."""
+
+    class _TemplateHandler(_ModelsHandler):
+        def do_POST(self) -> None:
+            if self.path.endswith("/api/show"):
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                name = payload.get("name", "")
+                # coder gets a real template; thinker/validator get an empty one
+                template = "{{ .Prompt }}" if "coder" in name else ""
+                body = json.dumps({
+                    "details": {"quantization_level": "Q4_K_M"},
+                    "template": template,
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body)
+            else:
+                self.send_response(404); self.end_headers()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _TemplateHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        with TemporaryDirectory() as tmp:
+            main.state.rebind_workspace(tmp)
+            main.state.ollama = OllamaSupervisorClient(
+                base_url=f"http://127.0.0.1:{server.server_port}"
+            )
+            client = TestClient(main.app)
+            data = client.get("/models").json()
+            coder_warn = data["roles"]["coder"]["warning"]
+            thinker_warn = data["roles"]["thinker"]["warning"]
+            assert coder_warn is None  # template present, instruct tag present
+            assert thinker_warn is not None and "no chat template" in thinker_warn
+    finally:
+        server.shutdown(); server.server_close()

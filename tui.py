@@ -797,6 +797,7 @@ def show_help() -> None:
             "/cancel      cancel the in-progress run for this workspace\n"
             "/router <t>  show how a message would be routed (tier, scores, intent)\n"
             "/logs [role|events] [N]  tail the latest run's logs (default 60 lines)\n"
+            "/setup       machine calibration (writes calibration.json; asks y/N)\n"
             "/models      list installed Ollama models\n"
             "/clear       clear screen\n"
             "/quit        stop all services and exit",
@@ -959,16 +960,51 @@ def pluralize(n: int, word: str) -> str:
     return f"{n} {word}" + ("" if n == 1 else "s")
 
 
-def format_run_logs_text(workspace: str | Path, channel: str = "", lines: int = 60) -> str:
-    """Plain-text rendering of the active workspace's latest run logs.
+async def run_setup_slash(workspace: str) -> None:
+    """/setup — machine calibration (y/N gated, never auto-runs). Writes
+    calibration.json atomically per role; ceiling_for picks it up at once."""
+    answer = Prompt.ask(
+        "[yellow]Machine calibration probes every role model at several context "
+        "sizes against the GPU guard (loads/unloads models, a few minutes). "
+        "Continue?[/yellow] [dim]\\[y/N][/dim]",
+        default="n",
+    )
+    if answer.strip().lower() != "y":
+        console.print("[dim]Calibration skipped — nothing changed.[/dim]")
+        return
+    import calibrate
+    from ollama_client import AgentGateway, OllamaSupervisorClient
+
+    console.print("[dim]Calibrating… (models load/unload per probe)[/dim]")
+
+    async def _go():
+        async with _get_gpu_lock():
+            gateway = AgentGateway(OllamaSupervisorClient(base_url=OLLAMA_BASE))
+            return await calibrate.run_calibration(gateway)
+
+    try:
+        data = await _go()
+    except Exception as exc:
+        console.print(f"[red]Calibration failed: {exc}[/red]")
+        return
+    for role, entry in (data.get("roles") or {}).items():
+        note = " (cancelled)" if entry.get("cancelled") else ""
+        console.print(f"  {role}: ceiling={entry.get('ceiling')}{note}")
+    console.print(f"[dim]Written to {calibrate.CALIBRATION_PATH} — applies immediately.[/dim]")
+
+
+def format_run_logs_text(workspace: str | Path, channel: str = "", lines: int = 60,
+                         run_id: str = "") -> str:
+    """Plain-text rendering of a run's logs for the active workspace.
 
     Registry-driven (agent_core.run_state.LOG_CHANNELS): any channel added
-    there is readable here with zero code change. Used by the Rich TUI's
-    /logs and importable by tests; the Textual TUI renders the same data
-    with its own markup wrapper."""
+    there is readable here with zero code change. ``run_id`` selects a
+    specific run (exact or unique prefix); default is the latest run.
+    Used by the Rich TUI's /logs and importable by tests; the Textual TUI
+    renders the same data with its own markup wrapper."""
     from agent_core.run_state import format_run_logs, tail_run_logs
 
-    return format_run_logs(tail_run_logs(workspace, channel, lines))
+    return format_run_logs(tail_run_logs(workspace, channel, lines, run_id=run_id))
 
 
 def format_router_diagnosis(diag: dict, t2_note: str | None = None) -> str:
@@ -1451,14 +1487,30 @@ async def main() -> None:
             elif command.startswith("/router"):
                 await run_router_slash(text.strip()[len("/router"):].strip(), workspace)
 
+            elif command == "/setup":
+                await run_setup_slash(workspace)
+
             elif command.startswith("/logs"):
                 args = text.strip()[len("/logs"):].split()
-                channel = args[0] if args else ""
+                from agent_core.run_state import LOG_CHANNELS as _LOG_CH
+                channel, run_id = "", ""
                 count = 60
-                if len(args) > 1 and args[1].isdigit():
-                    count = int(args[1])
+                positional = [a for a in args if not a.isdigit()]
+                digits = [a for a in args if a.isdigit()]
+                if digits:
+                    count = int(digits[0])
+                if positional:
+                    if positional[0] in _LOG_CH:
+                        channel = positional[0]
+                    else:
+                        run_id = positional[0]
+                    if len(positional) > 1:
+                        if positional[1] in _LOG_CH:
+                            channel = positional[1]
+                        else:
+                            run_id = run_id or positional[1]
                 console.print(Panel(
-                    format_run_logs_text(workspace, channel, count),
+                    format_run_logs_text(workspace, channel, count, run_id=run_id),
                     title="logs", border_style="bright_blue",
                 ))
 
