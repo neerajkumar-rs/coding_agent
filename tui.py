@@ -56,7 +56,7 @@ def _set_fastapi_port(port: int) -> None:
     """Repoint every FastAPI URL at *port* (busy-port fallback)."""
     global FASTAPI_PORT, FASTAPI_BASE, HEALTH_URL
     global STATUS_URL, DEPLOY_URL, INIT_URL, RUN_URL, CANCEL_URL, EVENTS_URL
-    global ROUTER_URL, PENDING_CONFIRM_URL, CONFIRM_URL
+    global ROUTER_URL, PENDING_CONFIRM_URL, CONFIRM_URL, CONFIG_URL, ROLE_URL, MODELS_URL
     FASTAPI_PORT = port
     FASTAPI_BASE = f"http://{FASTAPI_HOST}:{port}"
     HEALTH_URL = FASTAPI_BASE + "/health"
@@ -69,6 +69,9 @@ def _set_fastapi_port(port: int) -> None:
     ROUTER_URL = FASTAPI_BASE + "/router/classify"
     PENDING_CONFIRM_URL = FASTAPI_BASE + "/agent/pending_confirm"
     CONFIRM_URL = FASTAPI_BASE + "/agent/confirm"
+    CONFIG_URL = FASTAPI_BASE + "/config"
+    ROLE_URL = FASTAPI_BASE + "/config/role"
+    MODELS_URL = FASTAPI_BASE + "/models"
 
 OLLAMA_EXE = shutil.which("ollama") or str(
     Path.home() / "AppData" / "Local" / "Programs" / "Ollama" / "ollama.exe"
@@ -606,6 +609,17 @@ def start_all_services(assume_yes: bool = False) -> None:
         _set_fastapi_port(fallback)
     _start_fastapi()
 
+    # 3. Wait for the FastAPI controller to answer /health (30 s, progress shown).
+    with Progress(
+        SpinnerColumn(), TextColumn("[dim]Waiting for FastAPI..."), transient=True, console=console
+    ) as prog:
+        prog.add_task("", total=None)
+        ok = _wait_for_http(HEALTH_URL, timeout=30)
+    if not ok:
+        _shutdown("FastAPI failed to start")
+        raise RuntimeError("FastAPI did not respond within 30 s")
+    console.print("  [bright_green]✓ FastAPI controller ready[/bright_green]")
+
 
 def _next_free_port(start: int) -> int | None:
     """First port in start..8010 with no LISTENING owner."""
@@ -613,17 +627,6 @@ def _next_free_port(start: int) -> int | None:
         if not _pids_on_port(candidate):
             return candidate
     return None
-
-    # 6. Wait for FastAPI
-    with Progress(
-        SpinnerColumn(), TextColumn("[dim]Waiting for FastAPI..."), transient=True, console=console
-    ) as prog:
-        prog.add_task("", total=None)
-        ok = _wait_for_http(HEALTH_URL, timeout=20)
-    if not ok:
-        _shutdown("FastAPI failed to start")
-        raise RuntimeError("FastAPI did not respond within 20 s")
-    console.print("  [bright_green]✓ FastAPI controller ready[/bright_green]")
 
 
 # ---------------------------------------------------------------------------

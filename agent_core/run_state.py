@@ -103,3 +103,61 @@ class RunJournal:
                 except json.JSONDecodeError:
                     continue
         return events
+
+    # ------------------------------------------------------------------
+    # Per-role logs + raw LLM call capture (the ONE logging path for a run)
+    # ------------------------------------------------------------------
+    RAW_LOG_CHARS = 20_000  # raw prompt/response truncated to this per call
+
+    def role_log_path(self, role: str) -> Path:
+        """thinker.log / coder.log / validator.log / sandbox.log under the run."""
+        return self.run_dir / f"{role}.log"
+
+    def log_role(self, role: str, content: str) -> None:
+        """Append a timestamped block to the role's log file."""
+        stamp = utc_now_iso()
+        header = f"\n{'='*70}\n[{stamp}]\n"
+        path = self.role_log_path(role)
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(header + content + "\n")
+        except OSError:
+            pass
+
+    def log_llm_call(
+        self,
+        role: str,
+        *,
+        model: str,
+        prompt: str,
+        response: str = "",
+        temperature: float | None = None,
+        num_ctx: int | None = None,
+        seconds: float | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Record one raw LLM call (prompt + response, each truncated to
+        RAW_LOG_CHARS) in the role's log, and emit an llm_call event."""
+        def _cut(text: str) -> str:
+            text = text or ""
+            return text if len(text) <= self.RAW_LOG_CHARS else (
+                text[: self.RAW_LOG_CHARS] + "\n...[truncated to 20KB]"
+            )
+
+        lines = [
+            f"MODEL: {model}",
+            f"num_ctx: {num_ctx}  temperature: {temperature}  seconds: {seconds}",
+            "--- PROMPT ---",
+            _cut(prompt),
+            "--- RESPONSE ---",
+            _cut(response),
+        ]
+        if error:
+            lines.append(f"--- ERROR ---\n{error}")
+        self.log_role(role, "\n".join(lines))
+        self.emit_event({
+            "event": "llm_call", "role": role, "model": model,
+            "seconds": seconds, "num_ctx": num_ctx,
+            "prompt_chars": len(prompt), "response_chars": len(response),
+            "error": error,
+        })

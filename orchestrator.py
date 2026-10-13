@@ -506,6 +506,9 @@ async def run_pipeline(
             "run_id": journal.run_id,
             "status": status,
             "request": user_request,
+            "intent": trace[0].get("note") if trace else "",
+            "roles": {"thinker": planner_model, "coder": coder_model},
+            "num_ctx": num_ctx,
             "llm_calls": llm_calls,
             "elapsed_seconds": round(time.monotonic() - pipeline_start, 3),
         }
@@ -523,9 +526,8 @@ async def run_pipeline(
 
     async def _llm(model: str, prompt: str, system: str = "", temperature: float = 0.2, **kwargs: Any) -> str:
         """Single LLM choke point: budget the prompt, count + cap the call,
-        and honour cancellation immediately before hitting the model. Extra
-        kwargs (num_predict, think, _format_schema) pass through to the
-        ``generate`` seam so the router's T2 call stays budget-guarded."""
+        honour cancellation immediately before hitting the model, and log the
+        raw call (truncated to 20KB) into the run journal under its role."""
         nonlocal llm_calls
         _check_cancel()
         _check_wall_time()
@@ -534,7 +536,23 @@ async def run_pipeline(
                 f"max total LLM calls exceeded ({budgets.max_llm_calls})"
             )
         llm_calls += 1
-        return await generate(model, budget.trim(prompt), system=system, temperature=temperature, **kwargs)
+        role = "coder" if model == coder_model else "thinker"
+        trimmed = budget.trim(prompt)
+        call_t0 = time.monotonic()
+        response = ""
+        error: str | None = None
+        try:
+            response = await generate(model, trimmed, system=system, temperature=temperature, **kwargs)
+            return response
+        except Exception as exc:
+            error = str(exc)
+            raise
+        finally:
+            journal.log_llm_call(
+                role, model=model, prompt=trimmed, response=response,
+                temperature=temperature, num_ctx=num_ctx,
+                seconds=round(time.monotonic() - call_t0, 3), error=error,
+            )
 
     _check_cancel()
 

@@ -201,6 +201,7 @@ class OllamaAgentApp(App):
         self._vitals_at = 0.0
         self._polling = False
         self._confirm_polling = False
+        self._status_bar_at = 0.0
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -216,17 +217,12 @@ class OllamaAgentApp(App):
         sidebar = self.query_one(Sidebar)
         sidebar.render_workspace(self.workspace)
         sidebar.render_last_run(list(tui._last_trace))
-        try:
-            from agent_config import load_agent_config
-
-            model = load_agent_config(self.workspace).coder_model
-        except Exception:
-            model = "qwen2.5-coder:3b"
-        self.query_one("#status-right", Static).update(f"coder: {model}")
+        self.query_one("#status-right", Static).update("loading…")
         self.query_one("#input-bar", Input).focus()
         self._write(f"[{DIM}]Workspace: {self.workspace} — type /help for commands.[/]")
         # Vitals polling every second, in a thread worker; UI never blocks.
         self.set_interval(1.0, self._tick)
+        self._refresh_status_bar()
 
     # ------------------------------------------------------------------ chat
 
@@ -246,6 +242,32 @@ class OllamaAgentApp(App):
             self.call_from_thread(self._store_vitals, lines)
         finally:
             self._polling = False
+
+    @work(thread=True)
+    def _refresh_status_bar(self) -> None:
+        """Status bar: all three roles + ctx + resident model + GPU%."""
+        try:
+            models = _post_get_sync(tui.MODELS_URL)
+            gpu = _vital_gpu()
+        except Exception:
+            return
+        roles = models.get("roles", {})
+        resident = next(
+            (c.get("model") for c in roles.values() if c.get("resident")), "—"
+        )
+        parts = [
+            f"T:{_short_model(roles.get('thinker', {}).get('model'))}@{roles.get('thinker', {}).get('num_ctx')}",
+            f"C:{_short_model(roles.get('coder', {}).get('model'))}@{roles.get('coder', {}).get('num_ctx')}",
+            f"V:{_short_model(roles.get('validator', {}).get('model'))}@{roles.get('validator', {}).get('num_ctx')}",
+            f"res:{_short_model(resident)}",
+        ]
+        gpu_pct = ""
+        if "%" in gpu:
+            gpu_pct = gpu.split("-")[-1].strip()
+        if gpu_pct:
+            parts.append(f"gpu:{gpu_pct}")
+        text = " ".join(parts)
+        self.call_from_thread(self.query_one("#status-right", Static).update, text)
 
     def _store_vitals(self, lines: list[str]) -> None:
         self._vitals_lines = lines
@@ -290,7 +312,7 @@ class OllamaAgentApp(App):
             self._prepare_save()
         elif command.startswith("/benchmark"):
             arg_string = text.strip()[len("/benchmark"):].strip()
-            asyncio.create_task(tui.run_benchmark_slash(arg_string, self.workspace))
+            self._benchmark_work(arg_string)
         elif command == "/status":
             self._status_work()
         elif command == "/workspace":
@@ -300,10 +322,21 @@ class OllamaAgentApp(App):
             self._cancel_work()
         elif command == "/models":
             self._models_work()
-        elif command == "/logs":
-            self._write(_tail_logs_text())
+        elif command.startswith("/logs"):
+            args = text.strip()[len("/logs"):].split()
+            role_or_run = args[0] if args else ""
+            count = 800
+            if len(args) > 1 and args[1].isdigit():
+                count = int(args[1])
+            self._write(_tail_logs_text(self.workspace, role_or_run, count))
         elif command.startswith("/router"):
             self._router_work(text.strip()[len("/router"):].strip())
+        elif command == "/roles":
+            self._roles_work()
+        elif command.startswith("/model"):
+            self._model_work(text.strip()[len("/model"):].strip())
+        elif command.startswith("/ctx"):
+            self._ctx_work(text.strip()[len("/ctx"):].strip())
         elif command == "/run":
             self._write(f"[{DIM}]Type the request directly — /run is the default pipeline.[/]")
         else:
@@ -362,6 +395,10 @@ class OllamaAgentApp(App):
             self._poll_vitals()
         if not self._confirm_polling:
             self._poll_confirm()
+        # status bar (roles/ctx/resident/GPU) refreshes every ~5s
+        if time.monotonic() - self._status_bar_at > 5.0:
+            self._status_bar_at = time.monotonic()
+            self._refresh_status_bar()
 
     @work(thread=True)
     def _poll_confirm(self) -> None:
@@ -402,6 +439,66 @@ class OllamaAgentApp(App):
             self.call_from_thread(self._write, f"[{RED}]{exc}[/]")
 
     @work(thread=True)
+    def _benchmark_work(self, arg_string: str) -> None:
+        """/benchmark [args] — GPU-locked against the pipeline; output goes to
+        the RichLog widget (never Rich console.print inside the Textual app)."""
+        import bench
+        import shlex
+
+        args = shlex.split(arg_string) if arg_string.strip() else []
+        if args and args[0] == "last":
+            bench_dir = Path(self.workspace) / ".agent_runs" / "bench"
+            reports = sorted(bench_dir.glob("bench-*.md"), reverse=True) if bench_dir.is_dir() else []
+            if not reports:
+                self.call_from_thread(self._write, f"[{DIM}]No benchmark reports yet.[/]")
+            else:
+                text = reports[0].read_text(encoding="utf-8", errors="replace")[:4000]
+                self.call_from_thread(self._write, f"[{DIM}]{text}[/]")
+            return
+        if args and args[0] == "apply":
+            self.call_from_thread(
+                self._write,
+                f"[{DIM}]Use the Rich TUI (no Textual) for /benchmark apply, or edit .agent directly.[/]",
+            )
+            return
+
+        lock = tui._get_gpu_lock()
+        if lock.locked():
+            self.call_from_thread(
+                self._write,
+                f"[{DIM}]GPU busy with another operation — try again when it finishes.[/]",
+            )
+            return
+        self.call_from_thread(self._write, f"[{DIM}]Benchmark running… (models unload when done)[/]")
+        bench_argv = ["--workspace", self.workspace, *args]
+
+        async def _run_bench():
+            async with lock:
+                return await asyncio.to_thread(bench.run, bench_argv)
+
+        try:
+            report, exit_code = asyncio.run(_run_bench())
+        except Exception as exc:
+            self.call_from_thread(self._write, f"[{RED}]Benchmark failed: {exc}[/]")
+            return
+        if exit_code == 2:
+            self.call_from_thread(self._write, f"[{RED}]Ollama unreachable — start it first.[/]")
+            return
+        # render the table into the widget
+        lines = ["[bold]Benchmark results[/]"]
+        for r in report.get("results", []):
+            ok = f"[{GREEN}]ok[/]" if r.get("ok") else f"[{RED}]FAIL[/]"
+            lines.append(
+                f"  {r.get('role', '')}/{r.get('model', '')}: {ok} "
+                f"{r.get('seconds', 0):.2f}s score={r.get('score', 0):.1f} "
+                f"[{DIM}]{r.get('error', '')}[/]"
+            )
+        best = report.get("best_per_role", {})
+        if best:
+            lines.append("[bold]Best per role:[/] " + ", ".join(f"{k}={v}" for k, v in best.items()))
+        self.call_from_thread(self._write, "\n".join(lines))
+
+    @work(thread=True)
     def _status_work(self) -> None:
         try:
             health = _post_get_sync(tui.HEALTH_URL)
@@ -423,9 +520,81 @@ class OllamaAgentApp(App):
     @work(thread=True)
     def _models_work(self) -> None:
         try:
-            data = _post_get_sync(OLLAMA_BASE + "/api/tags")
-            names = [m.get("name", "") for m in data.get("models", [])]
-            self.call_from_thread(self._write, f"[{DIM}]" + ("\n".join(names) or "(none)") + "[/]")
+            data = _post_get_sync(tui.MODELS_URL)
+            lines: list[str] = []
+            for role, card in data.get("roles", {}).items():
+                line = (f"{role}: {card.get('model')}  "
+                        f"ctx={card.get('num_ctx')}  "
+                        f"digest={card.get('digest') or '—'}  "
+                        f"size={card.get('size_gb') or '—'}GB  quant={card.get('quant') or '—'}  "
+                        f"{'resident' if card.get('resident') else 'not resident'}")
+                lines.append(line)
+                if card.get("warning"):
+                    lines.append(f"  [{RED}]{card['warning']}[/]")
+            self.call_from_thread(self._write, f"[{DIM}]" + ("\n".join(lines) or "(none)") + "[/]")
+        except Exception as exc:
+            self.call_from_thread(self._write, f"[{RED}]{exc}[/]")
+
+    @work(thread=True)
+    def _roles_work(self) -> None:
+        """/roles — the current per-role config table."""
+        try:
+            data = _post_get_sync(tui.CONFIG_URL)
+            roles = data.get("roles", {})
+            lines = [f"[bold]ROLES[/]  [{DIM}](workspace: {data.get('workspace')})[/]"]
+            for role in ("thinker", "coder", "validator"):
+                cfg = roles.get(role, {})
+                lines.append(
+                    f"  {role}: model={cfg.get('model')}  ctx={cfg.get('num_ctx')}  "
+                    f"predict={cfg.get('num_predict')}  temp={cfg.get('temperature')}  "
+                    f"keep_alive={cfg.get('keep_alive')}"
+                )
+            router = data.get("router", {})
+            lines.append(f"  router: min_confidence={router.get('min_confidence')}  "
+                         f"chat_use_llm={router.get('chat_use_llm')}")
+            self.call_from_thread(self._write, "\n".join(lines))
+        except Exception as exc:
+            self.call_from_thread(self._write, f"[{RED}]{exc}[/]")
+
+    @work(thread=True)
+    def _model_work(self, args: str) -> None:
+        """/model <thinker|coder|validator> <name> — validate + persist."""
+        parts = args.split()
+        if len(parts) != 2:
+            self.call_from_thread(self._write, f"[{DIM}]Usage: /model <thinker|coder|validator> <name>[/]")
+            return
+        role, name = parts
+        try:
+            res = _post_json_sync(tui.ROLE_URL, {
+                "role": role, "model": name, "workspace_dir": self.workspace,
+            })
+            cfg = res.get("config", {})
+            self.call_from_thread(
+                self._write,
+                f"[bold {ACCENT}]{res.get('role', role)} → {cfg.get('model')}[/] "
+                f"[{DIM}](ctx={cfg.get('num_ctx')}; applies on the next call)[/]",
+            )
+        except Exception as exc:
+            self.call_from_thread(self._write, f"[{RED}]{exc}[/]")
+
+    @work(thread=True)
+    def _ctx_work(self, args: str) -> None:
+        """/ctx <role> <n> — clamp to the role ceiling, persist."""
+        parts = args.split()
+        if len(parts) != 2 or not parts[1].isdigit():
+            self.call_from_thread(self._write, f"[{DIM}]Usage: /ctx <thinker|coder|validator> <n>[/]")
+            return
+        role, n = parts[0], int(parts[1])
+        try:
+            res = _post_json_sync(tui.ROLE_URL, {
+                "role": role, "num_ctx": n, "workspace_dir": self.workspace,
+            })
+            cfg = res.get("config", {})
+            self.call_from_thread(
+                self._write,
+                f"[bold {ACCENT}]{res.get('role', role)} ctx → {cfg.get('num_ctx')}[/] "
+                f"[{DIM}](clamped to the role ceiling)[/]",
+            )
         except Exception as exc:
             self.call_from_thread(self._write, f"[{RED}]{exc}[/]")
 
@@ -524,15 +693,67 @@ def _post_get_sync(url: str) -> dict:
         return _json.loads(r.read())
 
 
-def _tail_logs_text() -> str:
-    parts: list[str] = []
-    log_dir = Path(tui.PROJECT_ROOT) / ".agent_logs"
-    for log_file in ("planner.log", "coder.log", "sandbox.log"):
-        path = log_dir / log_file
+def _short_model(name) -> str:
+    """Compact model label for the status bar: strip org prefix and tag."""
+    if not name:
+        return "—"
+    base = str(name).split("/")[-1]
+    return base.split(":")[0]
+
+
+def _tail_logs_text(workspace: str, role_or_run: str = "", count: int = 800) -> str:
+    """Read the ACTIVE workspace's LATEST run logs from .agent_runs/<run_id>/.
+
+    ``role_or_run`` picks a role log (thinker/coder/validator/sandbox) or a
+    run_id; default = latest run, all role logs. When no run exists, the path
+    searched is printed. Never reads the stale .agent_logs dir.
+    """
+    from agent_core.run_state import RUNS_DIR_NAME
+
+    runs_dir = Path(workspace) / RUNS_DIR_NAME
+    if not runs_dir.is_dir():
+        return f"[{DIM}]No runs yet — searched {runs_dir}[/]"
+    run_dirs = sorted((d for d in runs_dir.iterdir() if d.is_dir()), reverse=True)
+    if not run_dirs:
+        return f"[{DIM}]No runs yet — searched {runs_dir}[/]"
+
+    # role_or_run may name a run dir or a role log
+    chosen = run_dirs[0]
+    role_filter = ""
+    if role_or_run:
+        candidate = runs_dir / role_or_run
+        if candidate.is_dir():
+            chosen = candidate
+        elif role_or_run in ("thinker", "coder", "validator", "sandbox"):
+            role_filter = role_or_run
+        else:
+            # try as a run id prefix
+            match = next((d for d in run_dirs if d.name.startswith(role_or_run)), None)
+            if match:
+                chosen = match
+            else:
+                role_filter = role_or_run
+
+    logs = ["thinker.log", "coder.log", "validator.log", "sandbox.log"]
+    if role_filter:
+        logs = [f"{role_filter}.log"]
+    parts: list[str] = [f"[{DIM}]--- latest run: {chosen.name} ---[/]"]
+    found = False
+    for log_file in logs:
+        path = chosen / log_file
         if path.exists():
-            tail = path.read_text(encoding="utf-8", errors="replace")[-800:]
+            found = True
+            tail = path.read_text(encoding="utf-8", errors="replace")[-count:]
             parts.append(f"[{DIM}]--- {log_file} ---\n{tail}[/]")
-    return "\n".join(parts) if parts else f"[{DIM}]No logs yet.[/]"
+    if not found:
+        # Fall back to events.jsonl so an empty role log still shows something.
+        events = chosen / "events.jsonl"
+        if events.exists():
+            tail = events.read_text(encoding="utf-8", errors="replace")[-count:]
+            parts.append(f"[{DIM}]--- events.jsonl ---\n{tail}[/]")
+        else:
+            parts.append(f"[{DIM}](no logs in {chosen})[/]")
+    return "\n".join(parts)
 
 
 def run_textual(workspace: str) -> None:

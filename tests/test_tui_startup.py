@@ -67,14 +67,27 @@ def test_terminate_pid_swallows_permission_error() -> None:
 
 
 def test_terminate_pid_taskkill_success() -> None:
+    """taskkill command construction is asserted on EVERY platform by patching
+    sys.platform (the win32 branch must not be Windows-only in tests)."""
     ok = MagicMock(returncode=0)
-    with patch("subprocess.run", return_value=ok) as run_mock:
-        with patch.dict(sys.modules, {"psutil": None}):
-            if sys.platform == "win32":
-                assert tui.terminate_pid(12345) is True
-                args = run_mock.call_args[0][0]
-                assert "taskkill" in args[0].lower()
-                assert "/PID" in args and "12345" in args
+    with patch("subprocess.run", return_value=ok) as run_mock, \
+         patch.dict(sys.modules, {"psutil": None}), \
+         patch.object(sys, "platform", "win32"):
+        assert tui.terminate_pid(12345) is True
+        args = run_mock.call_args[0][0]
+        assert "taskkill" in args[0].lower()
+        assert "/PID" in args and "12345" in args
+
+
+def test_terminate_pid_posix_sigkill_success() -> None:
+    """The POSIX branch (os.kill SIGTERM) is likewise platform-patched so it is
+    asserted on Windows too."""
+    with patch.dict(sys.modules, {"psutil": None}), \
+         patch.object(sys, "platform", "linux"), \
+         patch("os.kill", return_value=None) as kill_mock:
+        assert tui.terminate_pid(12345) is True
+        kill_mock.assert_called_once()
+        assert kill_mock.call_args[0][0] == 12345
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +190,57 @@ def test_state_roundtrip_atomic(tmp_path, monkeypatch) -> None:
     state = tui._load_tui_state()
     assert state["last_workspace"] == str(tmp_path)
     assert state["recent"][0] == str(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# start_all_services waits for FastAPI /health (the wait lives here, not in
+# _next_free_port where it was dead code after `return None`)
+# ---------------------------------------------------------------------------
+
+def _patch_services_common():
+    """Patches that take start_all_services straight to the FastAPI spawn."""
+    return (
+        patch.object(tui, "_check_ollama_running",
+                     return_value=tui.CheckResult("Ollama API", True, "up")),
+        patch.object(tui, "_check_stale_controller", return_value=True),
+        patch.object(tui, "_port_owner_is_our_controller", return_value=False),
+        patch.object(tui, "_kill_port", return_value=True),
+        patch.object(tui, "_start_fastapi", return_value=MagicMock(pid=424242)),
+    )
+
+
+def test_start_all_services_waits_for_health() -> None:
+    p1, p2, p3, p4, p5 = _patch_services_common()
+    with p1, p2, p3, p4, p5 as spawn_mock, \
+         patch.object(tui, "_wait_for_http", return_value=True) as wait_mock:
+        tui.start_all_services(assume_yes=True)
+        wait_mock.assert_called_once()
+        args, kwargs = wait_mock.call_args
+        assert args[0] == tui.HEALTH_URL
+        assert kwargs.get("timeout", args[1] if len(args) > 1 else None) == 30
+
+
+def test_start_all_services_health_timeout_raises() -> None:
+    p1, p2, p3, p4, p5 = _patch_services_common()
+    with p1, p2, p3, p4, p5, \
+         patch.object(tui, "_wait_for_http", return_value=False), \
+         patch.object(tui, "_shutdown") as shutdown_mock:
+        with pytest.raises(RuntimeError, match="FastAPI did not respond within 30 s"):
+            tui.start_all_services(assume_yes=True)
+        shutdown_mock.assert_called_once()
+
+
+def test_start_all_services_reuse_skips_wait() -> None:
+    """A healthy already-running controller is reused: no spawn, no wait."""
+    with patch.object(tui, "_check_ollama_running",
+                      return_value=tui.CheckResult("Ollama API", True, "up")), \
+         patch.object(tui, "_check_stale_controller", return_value=True), \
+         patch.object(tui, "_port_owner_is_our_controller", return_value=True), \
+         patch.object(tui, "_start_fastapi") as spawn_mock, \
+         patch.object(tui, "_wait_for_http") as wait_mock:
+        tui.start_all_services(assume_yes=True)
+        spawn_mock.assert_not_called()
+        wait_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

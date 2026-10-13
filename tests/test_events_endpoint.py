@@ -20,8 +20,8 @@ def client(tmp_path: Path):
     return TestClient(main.app)
 
 
-def _seed_run(workspace: Path) -> str:
-    journal = RunJournal(workspace)
+def _seed_run(workspace: Path, run_id: str | None = None) -> str:
+    journal = RunJournal(workspace, run_id=run_id or "")
     journal.emit_event({"event": "run_started", "run_id": journal.run_id})
     journal.emit_event({"event": "plan_ready", "tasks": 1})
     journal.emit_event({"event": "run_finished", "status": "completed"})
@@ -41,10 +41,15 @@ def test_events_endpoint_streams_sse(client, tmp_path: Path) -> None:
 
 
 def test_events_endpoint_latest_run_default(client, tmp_path: Path) -> None:
-    run_id = _seed_run(tmp_path)
+    # Two runs with unambiguous ordering; the default must pick the newer one.
+    older = _seed_run(tmp_path, run_id="20261012T000000Z-old000")
+    latest = _seed_run(tmp_path, run_id="20261013T000000Z-new999")
     response = client.get("/agent/events")
     assert response.status_code == 200
-    assert run_id.split("-")[-1] in response.text or "run_started" in response.text
+    # Exactly the latest run's events — the run id itself, no `or` fallback.
+    assert latest in response.text
+    assert "run_started" in response.text
+    assert older not in response.text
 
 
 def test_events_endpoint_404_without_runs(client, tmp_path: Path) -> None:

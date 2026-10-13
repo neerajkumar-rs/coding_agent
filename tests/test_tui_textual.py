@@ -140,3 +140,123 @@ def test_trace_line_question_has_no_skipped() -> None:
     line = trace_line(trace)
     assert "SKIPPED" not in line
     assert "ANSWER ok 0.7s" in line
+
+
+# --- Phase 5: /roles, /model, /ctx, /logs -------------------------------------
+
+_ROLES_PAYLOAD = {
+    "workspace": "E:/coding_agent",
+    "roles": {
+        "thinker": {"model": "deepseek-r1:1.5b", "num_ctx": 8192,
+                    "num_predict": 2048, "temperature": 0.2, "keep_alive": "5m"},
+        "coder": {"model": "qwen2.5-coder:3b-instruct", "num_ctx": 6144,
+                  "num_predict": 2048, "temperature": 0.1, "keep_alive": "5m"},
+        "validator": {"model": "deepseek-r1:1.5b", "num_ctx": 8192,
+                      "num_predict": 512, "temperature": 0.0, "keep_alive": "5m"},
+    },
+    "router": {"min_confidence": 0.7, "chat_use_llm": False},
+}
+
+
+async def test_roles_command_renders_table() -> None:
+    app = OllamaAgentApp(workspace="E:/coding_agent")
+    async with app.run_test() as pilot:
+        with patch("tui_textual._post_get_sync", return_value=_ROLES_PAYLOAD):
+            app.query_one("#input-bar").value = "/roles"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+        plain = "\n".join(_plain_lines(app))
+        assert "thinker" in plain and "deepseek-r1:1.5b" in plain
+        assert "coder" in plain and "qwen2.5-coder:3b-instruct" in plain
+        assert "validator" in plain
+        assert "min_confidence" in plain
+
+
+async def test_model_command_validates_and_persists() -> None:
+    app = OllamaAgentApp(workspace="E:/coding_agent")
+    captured: dict = {}
+
+    def fake_post(url, payload):
+        captured.update(payload)
+        return {"status": "ok", "role": "coder",
+                "config": {"model": payload["model"], "num_ctx": 6144}}
+
+    async with app.run_test() as pilot:
+        with patch("tui_textual._post_json_sync", side_effect=fake_post):
+            app.query_one("#input-bar").value = "/model coder qwen2.5-coder:3b-instruct"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+    assert captured["role"] == "coder"
+    assert captured["model"] == "qwen2.5-coder:3b-instruct"
+    assert captured["workspace_dir"] == "E:/coding_agent"
+
+
+async def test_ctx_command_clamps_and_persists() -> None:
+    app = OllamaAgentApp(workspace="E:/coding_agent")
+    captured: dict = {}
+
+    def fake_post(url, payload):
+        captured.update(payload)
+        return {"status": "ok", "role": payload["role"],
+                "config": {"model": "x", "num_ctx": payload["num_ctx"]}}
+
+    async with app.run_test() as pilot:
+        with patch("tui_textual._post_json_sync", side_effect=fake_post):
+            app.query_one("#input-bar").value = "/ctx coder 8192"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+    assert captured["role"] == "coder"
+    assert captured["num_ctx"] == 8192
+
+
+async def test_logs_command_reads_active_workspace_runs() -> None:
+    import json as _json
+    from tempfile import TemporaryDirectory
+
+    from agent_core.run_state import RUNS_DIR_NAME, RunJournal
+
+    with TemporaryDirectory() as tmp:
+        # a run outside the repo: journal with a coder log + events
+        journal = RunJournal(tmp)
+        journal.log_role("coder", "hello from coder")
+        journal.emit_event({"event": "run_started", "run_id": journal.run_id})
+        journal.save_state({"run_id": journal.run_id, "status": "completed"})
+
+        from tui_textual import _tail_logs_text
+
+        text = _tail_logs_text(tmp)
+        assert journal.run_id in text
+        assert "hello from coder" in text
+
+        # role filter
+        text = _tail_logs_text(tmp, "coder")
+        assert "coder.log" in text and "hello from coder" in text
+
+        # empty workspace -> the searched path is printed
+        with TemporaryDirectory() as empty:
+            text = _tail_logs_text(empty)
+            assert RUNS_DIR_NAME in text and "No runs yet" in text
+
+
+async def test_status_bar_shows_roles_and_gpu() -> None:
+    app = OllamaAgentApp(workspace="E:/coding_agent")
+    models_payload = {
+        "roles": {
+            "thinker": {"model": "deepseek-r1:1.5b", "num_ctx": 8192, "resident": True},
+            "coder": {"model": "qwen2.5-coder:3b-instruct", "num_ctx": 6144, "resident": False},
+            "validator": {"model": "deepseek-r1:1.5b", "num_ctx": 8192, "resident": False},
+        }
+    }
+    async with app.run_test() as pilot:
+        with patch("tui_textual._post_get_sync", return_value=models_payload), \
+             patch("tui_textual._vital_gpu", return_value="GPU: 1000/4094 MiB - 42%"):
+            app._refresh_status_bar()
+            await pilot.pause()
+            await pilot.pause()
+        bar = str(app.query_one("#status-right").render())
+        assert "deepseek-r1" in bar
+        assert "qwen2.5-coder" in bar
+        assert "42%" in bar

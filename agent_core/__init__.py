@@ -1,9 +1,23 @@
-"""agent_core: the single agentic pipeline engine.
+"""agent_core: the library the run_pipeline orchestrator is built from.
 
-All entry points (FastAPI endpoints, TUI, CLI) must go through
-``engine.run(request, workspace)``. There is exactly one pipeline.
+RunJournal (logs/events), StagingArea + safe_target (staging/safety),
+ContextBudget (prompt budgeting), schemas (structured output), verifier
+(deterministic checks), coder (output parsing), engine (budgets + the
+per-workspace cancel registry).
 """
 
-from agent_core.engine import Engine, RunRequest, RunReport
+from agent_core.engine import (
+    BudgetExhausted,
+    RunBudgets,
+    RunCancelled,
+    WorkspaceSession,
+    get_engine,
+)
 
-__all__ = ["Engine", "RunRequest", "RunReport"]
+__all__ = [
+    "BudgetExhausted",
+    "RunBudgets",
+    "RunCancelled",
+    "WorkspaceSession",
+    "get_engine",
+]

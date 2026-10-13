@@ -250,6 +250,58 @@ async def list_models() -> dict[str, Any]:
     return {"workspace": str(state.workspace_root), "roles": roles, "resident": resident}
 
 
+@app.get("/config")
+async def get_config() -> dict[str, Any]:
+    """The current per-role config (the single source of truth) + router opts."""
+    return {
+        "workspace": str(state.workspace_root),
+        "roles": {role: state.config.get_role_config(role)
+                  for role in ("thinker", "coder", "validator")},
+        "router": state.config.router,
+        "allowed_commands": state.config.allowed_commands,
+    }
+
+
+class RoleUpdateRequest(BaseModel):
+    role: str = Field(description="thinker | coder | validator")
+    model: str | None = Field(default=None, description="New model name (must be installed)")
+    num_ctx: int | None = Field(default=None, description="New context size (clamped to the role ceiling)")
+    workspace_dir: str | None = Field(default=None, description="Optional workspace override")
+
+
+@app.post("/config/role")
+async def update_role(payload: RoleUpdateRequest) -> dict[str, Any]:
+    """Change a role's model or num_ctx, persisted to .agent.
+
+    The change applies to the NEXT gateway call (never mid-generation): the
+    gateway reads the role config at the start of every generate. A model must
+    be installed (exact match against /api/tags); num_ctx is clamped to the
+    role ceiling.
+    """
+    state.ensure_workspace(payload.workspace_dir)
+    role = "thinker" if payload.role == "planner" else payload.role
+    if role not in ("thinker", "coder", "validator"):
+        raise HTTPException(status_code=400, detail=f"unknown role: {payload.role}")
+
+    if payload.model:
+        # Exact-match validate against installed models before accepting.
+        try:
+            resolved = await state.ollama.resolve_model_name(payload.model)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        state.config.roles[role]["model"] = resolved
+    if payload.num_ctx is not None:
+        from agent_config import ROLE_CTX_CEILINGS
+
+        ceiling = ROLE_CTX_CEILINGS.get(role, 16384)
+        state.config.roles[role]["num_ctx"] = max(512, min(int(payload.num_ctx), ceiling))
+
+    save_agent_config(state.config, state.workspace_root)
+    cfg = state.config.get_role_config(role)
+    logger.info(f"role {role} updated: model={cfg['model']} num_ctx={cfg['num_ctx']}")
+    return {"status": "ok", "role": role, "config": cfg}
+
+
 @app.post("/workspace/init")
 async def workspace_init(payload: InitRequest) -> dict[str, Any]:
     """1. POST /workspace/init
