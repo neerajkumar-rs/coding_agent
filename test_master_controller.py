@@ -34,7 +34,7 @@ def test_agent_config_and_recalculate() -> None:
 
         # 1. Save and load default config
         cfg = AgentConfig(
-            planner_model="deepseek-r1:1.5b",
+            planner_model="erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest",
             coder_5b_or_3b="qwen2.5-coder:3b",
             max_context_tokens=4096,
         )
@@ -42,7 +42,7 @@ def test_agent_config_and_recalculate() -> None:
         assert saved.exists()
 
         loaded = load_agent_config(tmp_path)
-        assert loaded.planner_model == "deepseek-r1:1.5b"
+        assert loaded.planner_model == "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
         assert loaded.coder_model == "qwen2.5-coder:3b"
         assert loaded.max_context_tokens == 4096
 

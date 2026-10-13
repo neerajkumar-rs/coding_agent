@@ -2,7 +2,7 @@
 
 Runs N probe prompts against a candidate planner model through Ollama's
 structured-output path and reports the failure rate. If the configured
-planner (default deepseek-r1:1.5b) fails schema validation on more than
+planner (default erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest) fails schema validation on more than
 PLANNER_FAILURE_THRESHOLD of the probes, the recommended fallback is
 qwen2.5-coder:3b.
 
@@ -55,7 +55,7 @@ def evaluate_planner(model: str, probes: int = len(PROBES)) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Planner schema-conformance benchmark")
-    parser.add_argument("--model", default="deepseek-r1:1.5b")
+    parser.add_argument("--model", default="erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest")
     parser.add_argument("--probes", type=int, default=len(PROBES))
     args = parser.parse_args(argv)
 

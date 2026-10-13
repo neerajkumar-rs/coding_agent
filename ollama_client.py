@@ -144,27 +144,38 @@ def _print_sysmem_hint_once() -> None:
     _print_sysmem_hint_once._done = True
 
 
-def strip_think_blocks(raw_text: str) -> tuple[str, str]:
-    """Remove ``<think>...</think>`` blocks; return ``(reasoning, answer)``.
+def strip_think(raw_text: str) -> tuple[str, str, int]:
+    """THE one think-block handler. Returns ``(answer, think_text, think_chars)``.
 
-    Handles an unterminated trailing ``<think>`` block (common when a reasoning
-    model is cut off mid-thought): its content is treated as reasoning and
-    removed from the answer.
+    Removes every closed ``<think>...</think>`` block and one unclosed trailing
+    ``<think>...`` block (a reasoning model cut off mid-thought). ``think_chars``
+    is the total character count of removed reasoning.
     """
     if not raw_text:
-        return "", ""
-    reasoning_parts = [m.strip() for m in _THINK_BLOCK_RE.findall(raw_text)]
+        return "", "", 0
+    think_parts = [m for m in _THINK_BLOCK_RE.findall(raw_text)]
     text = _THINK_BLOCK_RE.sub("", raw_text)
     open_match = _THINK_OPEN_RE.search(text)
     if open_match:
-        reasoning_parts.append(open_match.group(1).strip())
+        think_parts.append(open_match.group(1))
         text = text[: open_match.start()]
-    reasoning = "\n".join(part for part in reasoning_parts if part)
-    return reasoning, text.strip()
+    think_text = "\n".join(p.strip() for p in think_parts if p.strip())
+    think_chars = sum(len(p) for p in think_parts)
+    return text.strip(), think_text, think_chars
+
+
+def strip_think_blocks(raw_text: str) -> tuple[str, str]:
+    """Compatibility wrapper: return ``(reasoning, answer)`` (legacy order)."""
+    answer, reasoning, _ = strip_think(raw_text)
+    return reasoning, answer
 
 
 def is_reasoning_model(model_name: str) -> bool:
-    """Heuristic: models that emit ``<think>`` blocks by default."""
+    """Heuristic: models that emit ``<think>`` blocks by default.
+
+    Matches namespaced names too: ``erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest``
+    lowercased contains ``deepseek-r1``.
+    """
     lowered = model_name.lower()
     return "deepseek-r1" in lowered or "qwq" in lowered or lowered.startswith("r1")
 
@@ -422,10 +433,18 @@ class OllamaSupervisorClient:
         temperature: float = TEMPERATURE_PLAN,
         cancel_event: Any | None = None,
         format_schema: dict[str, Any] | None = None,
-    ) -> str:
+        think: bool | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         """Lock-free generate for a caller (AgentGateway) that already holds
         the single process lock. Identical to ``generate`` minus the mutex.
-        ``format_schema`` adds Ollama structured output (format=<json schema>)."""
+        ``format_schema`` adds Ollama structured output (format=<json schema>);
+        ``think`` (only ever False, only for models whose probe confirmed
+        support) is sent as the top-level Ollama ``think`` switch.
+
+        Returns ``(answer, meta)`` — answer is ``strip_think``-ed; meta carries
+        done_reason, prompt_eval_count, eval_count, load_duration, total/eval
+        durations and the raw think text for the per-call run-journal record.
+        """
         cfg = config or load_agent_config()
         resolved = await self.resolve_model_name(model_name or cfg.planner_model)
         effective_predict = num_predict if num_predict is not None else _default_num_predict(resolved)
@@ -435,6 +454,8 @@ class OllamaSupervisorClient:
         )
         if format_schema is not None:
             payload["format"] = format_schema
+        if think is not None:
+            payload["think"] = think
         data = await self._generate_transport(
             resolved, payload, cfg, effective_predict, temperature, cancel_event
         )
@@ -443,8 +464,20 @@ class OllamaSupervisorClient:
             raise OllamaTruncatedError(
                 f"response from {resolved} was cut off (done_reason=length); retry with a smaller prompt"
             )
-        _, answer = strip_think_blocks(raw_text)
-        return answer
+        answer, think_text, think_chars = strip_think(raw_text)
+        meta = {
+            "model": resolved,
+            "done_reason": data.get("done_reason") or "stop",
+            "prompt_eval_count": int(data.get("prompt_eval_count", 0) or 0),
+            "eval_count": int(data.get("eval_count", 0) or 0),
+            "load_duration": int(data.get("load_duration", 0) or 0),
+            "total_duration": int(data.get("total_duration", 0) or 0),
+            "eval_duration": int(data.get("eval_duration", 0) or 0),
+            "think_text": think_text,
+            "think_chars": think_chars,
+            "raw_response": raw_text,
+        }
+        return answer, meta
 
     async def generate(
         self,
@@ -614,6 +647,65 @@ class AgentGateway:
                 raise VramGuardError(f"could not unload resident models {others} within 15s")
             await asyncio.sleep(0.25)
 
+    def think_supported(self, model: str) -> bool | None:
+        """Cached capability probe result for *model* (by exact name), or None
+        when never probed. Probe lives in ``probe_capabilities``; nothing is
+        ever assumed."""
+        caps = (self.config.extra or {}).get("capabilities", {})
+        entry = caps.get(model) if isinstance(caps, dict) else None
+        if isinstance(entry, dict) and "supports_think_param" in entry:
+            return bool(entry["supports_think_param"])
+        return None
+
+    async def probe_capabilities(self, model: str) -> dict[str, Any]:
+        """Probe once per model: /api/show (capabilities, quant, template) then
+        one tiny call with ``think: false``. The result is cached in the
+        workspace ``.agent`` under extra.capabilities[<model>]; the caller
+        persists the config. Never assumed — always measured here.
+        """
+        resolved = await self.supervisor.resolve_model_name(model)
+        entry: dict[str, Any] = {"model": resolved}
+        async with self._lock:
+            async with httpx.AsyncClient(timeout=self.supervisor.timeout) as client:
+                try:
+                    show = await client.post(
+                        f"{self.base_url}/api/show", json={"name": resolved}
+                    )
+                    if show.status_code == 200:
+                        data = show.json()
+                        entry["capabilities"] = data.get("capabilities", [])
+                        details = data.get("details", {})
+                        entry["quant"] = details.get("quantization_level", "")
+                        entry["digest"] = details.get("digest", data.get("digest", ""))
+                        entry["template"] = str(data.get("template", ""))[:200]
+                except httpx.HTTPError as exc:
+                    entry["show_error"] = str(exc)
+                # Tiny think:false call; HTTP 400 "does not support thinking"
+                # (or any 4xx mentioning thinking) -> supports_think_param False.
+                entry["supports_think_param"] = True
+                try:
+                    await self._ensure_only_resident(client, resolved)
+                    resp = await client.post(
+                        self.supervisor.generate_url,
+                        json={
+                            "model": resolved, "prompt": "ping", "stream": False,
+                            "think": False, "keep_alive": 0,
+                            "options": {"num_ctx": 2048, "num_predict": 8},
+                        },
+                    )
+                    if resp.status_code == 400 and "think" in resp.text.lower():
+                        entry["supports_think_param"] = False
+                    elif resp.status_code >= 400:
+                        entry["probe_error"] = f"{resp.status_code}: {resp.text[:200]}"
+                except httpx.HTTPError as exc:
+                    entry["probe_error"] = str(exc)
+        caps = dict((self.config.extra or {}).get("capabilities", {}))
+        caps[resolved] = entry
+        extra = dict(self.config.extra or {})
+        extra["capabilities"] = caps
+        self.config.extra = extra
+        return entry
+
     async def generate(
         self,
         role: str,
@@ -624,6 +716,7 @@ class AgentGateway:
         num_predict: int | None = None,
         cancel_event: Any | None = None,
         keep_warm: bool = True,
+        think: bool | None = None,
         _format_schema: dict[str, Any] | None = None,
     ) -> str:
         """Role-based generation under the single lock, with the VRAM guard.
@@ -631,11 +724,27 @@ class AgentGateway:
         ``keep_warm`` (default True) leaves the model resident after the call so
         consecutive same-model phases (route+plan, all-code, ...) skip the
         reload; a different model triggers a logged swap in _ensure_only_resident.
+        Roles flagged ``inline_system`` (the reasoning thinker/validator) get
+        the system text prepended to the prompt, per DeepSeek's guidance.
+        ``think`` is only ever sent when it is not None — callers pass
+        ``think=False`` only for models whose capability probe confirmed it.
         """
         rc = self.config.get_role_config(role)
         model = str(rc["model"])
         resolved = await self.supervisor.resolve_model_name(model)
         temp = rc["temperature"] if temperature is None else temperature
+        if rc.get("inline_system") and system:
+            prompt = f"{system}\n\n{prompt}"
+            system = ""
+        # num_predict is shared between thinking and answer: when a reasoning
+        # model cannot disable thinking, add the role's think allowance on top.
+        effective_predict = num_predict if num_predict is not None else int(rc["num_predict"])
+        if (
+            think is not False
+            and is_reasoning_model(resolved)
+            and self.think_supported(resolved) is not True
+        ):
+            effective_predict += int(rc.get("think_budget", 512))
         rungs = [r for r in CTX_RUNGS if r <= int(rc["num_ctx"])]
         if not rungs:
             rungs = [CTX_RUNGS[0]]
@@ -648,9 +757,10 @@ class AgentGateway:
                 try:
                     return await self._generate_guarded(
                         resolved, prompt, system=system, num_ctx=ctx,
-                        num_predict=num_predict or int(rc["num_predict"]),
+                        num_predict=effective_predict,
                         temperature=temp, cancel_event=cancel_event,
                         keep_warm=keep_warm, format_schema=_format_schema,
+                        think=think, role=role,
                     )
                 except (VramGuardError,) as exc:
                     last_exc = exc
@@ -712,6 +822,8 @@ class AgentGateway:
         cancel_event: Any | None,
         keep_warm: bool,
         format_schema: dict[str, Any] | None = None,
+        think: bool | None = None,
+        role: str = "",
     ) -> str:
         async with httpx.AsyncClient(timeout=self.supervisor.timeout) as client:
             # 1) only `resolved` may be resident before we load
@@ -721,7 +833,7 @@ class AgentGateway:
             # 2) generate (load+run; we already hold the single lock, so use
             #    the lock-free supervisor path to avoid re-entrant deadlock)
             try:
-                text = await self.supervisor.generate_unlocked(
+                text, meta = await self.supervisor.generate_unlocked(
                     prompt=prompt,
                     system_prompt=system,
                     model_name=resolved,
@@ -730,6 +842,7 @@ class AgentGateway:
                     temperature=temperature,
                     cancel_event=cancel_event,
                     format_schema=format_schema,
+                    think=think,
                 )
             except OllamaCancelledError:
                 # Cancel: unload whatever is resident so nothing lingers on GPU.

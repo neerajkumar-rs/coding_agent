@@ -11,7 +11,7 @@ from tempfile import TemporaryDirectory
 
 from orchestrator import RUNS_DIR_NAME, RunBudgets, run_pipeline
 
-PLANNER = "deepseek-r1:1.5b"
+PLANNER = "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
 CODER = "qwen2.5-coder:3b"
 
 PLAN = json.dumps([

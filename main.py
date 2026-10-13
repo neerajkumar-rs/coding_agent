@@ -131,6 +131,19 @@ class RunRequestPayload(BaseModel):
     prompt: str = Field(min_length=1, description="Full user request for an autonomous run")
     workspace_dir: str | None = Field(default=None, description="Optional workspace override")
     auto_deploy: bool = Field(default=True, description="Deploy staged files on success")
+    confirm: bool = Field(default=False, description="Hold before staging until /agent/confirm answers")
+    history: list[str] | None = Field(default=None, description="Last conversation turns for the router")
+
+
+class ConfirmRequest(BaseModel):
+    workspace_dir: str | None = Field(default=None, description="Workspace whose pending plan to answer")
+    approved: bool = Field(default=False, description="Approve (stage+code) or decline the pending plan")
+
+
+class RouterClassifyRequest(BaseModel):
+    text: str = Field(min_length=1, description="Message to classify")
+    workspace_dir: str | None = Field(default=None, description="Optional workspace override")
+    history: list[str] | None = Field(default=None, description="Last conversation turns for context")
 
 
 class CancelRequest(BaseModel):
@@ -307,6 +320,11 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
         """Map a pipeline model name to its role (thinker vs coder)."""
         if model == state.config.coder_model:
             return "coder"
+        if model == str(state.config.get_role_config("validator")["model"]):
+            # validator shares the thinker model by default; route by name only
+            # when it differs from the thinker.
+            if model != state.config.planner_model:
+                return "validator"
         return "thinker"
 
     async def _generate(
@@ -316,6 +334,7 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
         temperature: float = 0.2,
         role: str | None = None,
         num_ctx: int | None = None,
+        **kwargs: Any,
     ) -> str:
         return await gateway.generate(
             role or _role_of(model),
@@ -323,6 +342,7 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
             system=system,
             temperature=temperature,
             cancel_event=cancel_event,
+            **kwargs,
         )
 
     async def _unload(model: str) -> None:
@@ -343,6 +363,36 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
             _role_of(model), prompt, schema, cancel_event=cancel_event
         )
 
+    # Confirm gate: when the client opts in (payload.confirm), the pipeline
+    # pauses after PLAN until /agent/confirm answers (or a 180 s timeout
+    # declines). --yes clients simply omit `confirm`.
+    # threading.Event (not asyncio.Event): the answering /agent/confirm request
+    # may run on a different event loop / thread than the parked run request.
+    confirm_cb = None
+    if payload.confirm:
+        async def confirm_cb(tasks: list[dict[str, Any]], intent_line: str) -> bool:  # type: ignore[misc]
+            import threading as _threading
+
+            key = str(state.workspace_root)
+            entry: dict[str, Any] = {
+                "event": _threading.Event(),
+                "decision": None,
+                "plan": [dict(t) for t in tasks],
+                "intent": intent_line,
+            }
+            _pending_confirms[key] = entry
+            try:
+                answered = await asyncio.to_thread(entry["event"].wait, 180.0)
+                if not answered:
+                    logger.info(f"confirm gate timed out for {key} — declining")
+                    return False
+                return bool(entry["decision"])
+            finally:
+                _pending_confirms.pop(key, None)
+
+    router_cfg = state.config.router
+    thinker_cfg = state.config.get_role_config("thinker")
+
     try:
         result = await run_pipeline(
             payload.prompt,
@@ -354,6 +404,12 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
             cancel_event=cancel_event,
             num_ctx=state.config.max_context_tokens,
             structured_generate=_structured_generate,
+            confirm=confirm_cb,
+            history=payload.history,
+            router_min_confidence=float(router_cfg.get("min_confidence", 0.7)),
+            chat_use_llm=bool(router_cfg.get("chat_use_llm", False)),
+            think_supported=gateway.think_supported(state.config.planner_model),
+            think_budget=int(thinker_cfg.get("think_budget", 512)),
         )
         if result.get("status") == "cancelled":
             # Cancel is a normal outcome, not a 500: unload whatever is resident.
@@ -376,6 +432,60 @@ async def agent_cancel(payload: CancelRequest | None = None) -> dict[str, Any]:
     engine = get_engine(workspace)
     engine.cancel()
     return {"status": "cancel_requested", "workspace": str(workspace)}
+
+
+# Pending plan-confirmation gates, one per workspace (keyed by resolved path).
+_pending_confirms: dict[str, dict[str, Any]] = {}
+
+
+@app.get("/agent/pending_confirm")
+async def agent_pending_confirm(workspace_dir: str | None = None) -> dict[str, Any]:
+    """The client polls this while a run is in flight; when a plan awaits
+    approval it returns the planned files + one-line intent."""
+    workspace = str(Path(workspace_dir).resolve()) if workspace_dir else str(state.workspace_root)
+    entry = _pending_confirms.get(workspace)
+    if entry is None:
+        return {"pending": False}
+    return {"pending": True, "plan": entry["plan"], "intent": entry["intent"]}
+
+
+@app.post("/agent/confirm")
+async def agent_confirm(payload: ConfirmRequest) -> dict[str, Any]:
+    """Answer a pending plan-confirmation gate (Enter/y -> approved)."""
+    workspace = str(Path(payload.workspace_dir).resolve()) if payload.workspace_dir else str(state.workspace_root)
+    entry = _pending_confirms.get(workspace)
+    if entry is None:
+        return {"status": "noop", "message": "no pending confirmation for this workspace"}
+    entry["decision"] = payload.approved
+    entry["event"].set()
+    return {"status": "answered", "approved": payload.approved}
+
+
+@app.post("/router/classify")
+async def router_classify(payload: RouterClassifyRequest) -> dict[str, Any]:
+    """`/router <text>` backend: tier, matched verb/deliverable, scores,
+    whether T2 ran, and the raw classifier JSON. T0/T1 never touch a model;
+    the T2 grey-zone call goes through the single gateway (same lock)."""
+    from router import diagnose
+
+    state.ensure_workspace(payload.workspace_dir)
+    thinker_cfg = state.config.get_role_config("thinker")
+
+    async def _gen(model: str, prompt: str, system: str = "", temperature: float = 0.0,
+                   **kwargs: Any) -> str:
+        return await state.gateway.generate(
+            "thinker", prompt, system=system, temperature=temperature, **kwargs
+        )
+
+    return await diagnose(
+        payload.text,
+        generate=_gen,
+        thinker_model=str(thinker_cfg["model"]),
+        history=payload.history,
+        min_confidence=float(state.config.router.get("min_confidence", 0.7)),
+        think_supported=state.gateway.think_supported(str(thinker_cfg["model"])),
+        think_budget=int(thinker_cfg.get("think_budget", 512)),
+    )
 
 
 @app.get("/agent/events")

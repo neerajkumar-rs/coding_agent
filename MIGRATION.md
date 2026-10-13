@@ -73,7 +73,7 @@ are consolidated into a single gateway lock in Phase 3.
 | Live progress | `GET /agent/events` (SSE) or the TUI task table |
 | Cancel a run | `POST /agent/cancel` (or `/cancel` in the TUI) |
 | Undo a deploy | `POST /agent/rollback` (restores `.agent_runs/<id>/backup/`) |
-| Planner health check | `python -m agent_core.planner_eval --model deepseek-r1:1.5b` |
+| Planner health check | `python -m agent_core.planner_eval --model erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest` |
 
 ### .agent profile additions
 
@@ -101,7 +101,7 @@ result = await run_pipeline(
     "make a blog site in html5 css and js",
     workspace,
     generate=my_generate,          # async (model, prompt, system=, temperature=) -> str
-    planner_model="deepseek-r1:1.5b",
+    planner_model="erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest",
     coder_model="qwen2.5-coder:3b",
 )
 result["staged_files"], result["failed_tasks"], result["trace"], result["run_id"]

@@ -49,7 +49,7 @@ COLOR_FOUR = "#4fc3f7"
 COLOR_PIE = "#ce93d8"
 WORDMARK = f"[{DIM}]<_[/][bold {COLOR_FOUR}]FOUR[/][{DIM}]_[/][bold {COLOR_PIE}]PIE[/]"
 
-QUESTION_LIKE_ROUTES = {"QUESTION", "FILE_QUESTION", "UNCLEAR"}
+QUESTION_LIKE_ROUTES = {"QUESTION", "FILE_QUESTION", "UNCLEAR", "CHAT", "COMMAND"}
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +70,8 @@ def collect_system_lines() -> list[str]:
 def _route_of(trace: list[dict]) -> str:
     for entry in trace:
         if entry.get("stage") == "ROUTE":
-            return str(entry.get("note", ""))
+            # note looks like "CODE_TASK (tier 1)" — compare on the intent word
+            return str(entry.get("note", "")).split(" ", 1)[0]
     return ""
 
 
@@ -195,9 +196,11 @@ class OllamaAgentApp(App):
         self.workspace = workspace
         self._save_pending = False
         self._workspace_pending = False
+        self._confirm_pending = False
         self._vitals_lines: list[str] = ["n/a", "n/a", "n/a"]
         self._vitals_at = 0.0
         self._polling = False
+        self._confirm_polling = False
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -235,14 +238,6 @@ class OllamaAgentApp(App):
         if at_bottom:
             chat.scroll_end(animate=False)
 
-    def _tick(self) -> None:
-        age = int(time.monotonic() - self._vitals_at) if self._vitals_at else 0
-        sidebar = self.query_one(Sidebar)
-        sidebar.render_system(self._vitals_lines, age)
-        sidebar.render_last_run(list(tui._last_trace))  # live as stages land
-        if not self._polling:
-            self._poll_vitals()
-
     @work(thread=True)
     def _poll_vitals(self) -> None:
         self._polling = True
@@ -261,10 +256,15 @@ class OllamaAgentApp(App):
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
         event.input.value = ""
-        if not text:
-            return
 
         # Inline prompts capture the next input (no modal, no "you" echo).
+        # Plan-confirm gate: Enter or y approves; anything else declines.
+        if self._confirm_pending:
+            self._confirm_pending = False
+            self._answer_confirm(text.lower() in ("", "y", "yes"))
+            return
+        if not text:
+            return
         if self._save_pending:
             self._save_pending = False
             await self._answer_save(text.lower())
@@ -283,7 +283,7 @@ class OllamaAgentApp(App):
             self.exit()
         elif command == "/help":
             self._write(f"[{DIM}]/run · /benchmark · /save · /status · /workspace · "
-                        f"/cancel · /models · /logs · /clear · /quit[/]\n")
+                        f"/cancel · /router <text> · /models · /logs · /clear · /quit[/]\n")
         elif command == "/clear":
             self.query_one("#chat", RichLog).clear()
         elif command in {"/save", "/deploy"}:
@@ -302,6 +302,8 @@ class OllamaAgentApp(App):
             self._models_work()
         elif command == "/logs":
             self._write(_tail_logs_text())
+        elif command.startswith("/router"):
+            self._router_work(text.strip()[len("/router"):].strip())
         elif command == "/run":
             self._write(f"[{DIM}]Type the request directly — /run is the default pipeline.[/]")
         else:
@@ -314,12 +316,90 @@ class OllamaAgentApp(App):
         try:
             _post_json_sync(INIT_URL, {"root_path": self.workspace})
             result = _post_json_sync(
-                tui.RUN_URL, {"prompt": request_text, "workspace_dir": self.workspace}
+                tui.RUN_URL,
+                {"prompt": request_text, "workspace_dir": self.workspace,
+                 # Plan-confirm gate (Phase 4): unless --yes, the run pauses
+                 # after PLAN until we answer via /agent/confirm (polled below).
+                 "confirm": not tui._cli_yes},
             )
         except Exception as exc:
             self.call_from_thread(self._pipeline_error, str(exc))
             return
         self.call_from_thread(self._pipeline_done, result)
+
+    @work(thread=True)
+    def _router_work(self, arg_text: str) -> None:
+        if not arg_text:
+            self.call_from_thread(self._write, f"[{DIM}]Usage: /router <text>[/]")
+            return
+        try:
+            diag = _post_json_sync(tui.ROUTER_URL,
+                                   {"text": arg_text, "workspace_dir": self.workspace})
+            self.call_from_thread(self._write, f"[{DIM}]" + tui.format_router_diagnosis(diag) + "[/]")
+            return
+        except Exception as exc:
+            err = exc
+        try:
+            from router import diagnose as local_diagnose
+
+            diag = asyncio.run(local_diagnose(arg_text))
+            note = f"skipped: {type(err).__name__} (server/Ollama unreachable)"
+            self.call_from_thread(
+                self._write,
+                f"[{DIM}]" + tui.format_router_diagnosis(diag, t2_note=note) + "[/]",
+            )
+        except Exception as exc2:
+            self.call_from_thread(self._write, f"[{RED}]/router failed: {exc2}[/]")
+
+    # ------------------------------------------------------- plan confirm gate
+
+    def _tick(self) -> None:
+        age = int(time.monotonic() - self._vitals_at) if self._vitals_at else 0
+        sidebar = self.query_one(Sidebar)
+        sidebar.render_system(self._vitals_lines, age)
+        sidebar.render_last_run(list(tui._last_trace))  # live as stages land
+        if not self._polling:
+            self._poll_vitals()
+        if not self._confirm_polling:
+            self._poll_confirm()
+
+    @work(thread=True)
+    def _poll_confirm(self) -> None:
+        """Poll the server's pending plan-confirm gate (one per second via
+        _tick). Never blocks the UI; no Rich prompts inside the app."""
+        from urllib.parse import quote
+
+        self._confirm_polling = True
+        try:
+            data = _post_get_sync(
+                tui.PENDING_CONFIRM_URL + "?workspace_dir=" + quote(self.workspace)
+            )
+            if data.get("pending") and not self._confirm_pending:
+                self.call_from_thread(self._show_confirm, data)
+        except Exception:
+            pass
+        finally:
+            self._confirm_polling = False
+
+    def _show_confirm(self, pending: dict) -> None:
+        lines = [f"[yellow]Plan ({pending.get('intent', '')}):[/]"]
+        for t in pending.get("plan", []):
+            lines.append(f"  {t.get('action', 'create')}  {t.get('path', '')}")
+        lines.append(f"[bold {ACCENT}]Stage and build? \\[Y/n] (Enter = yes)[/]")
+        self._write("\n".join(lines))
+        self._confirm_pending = True
+
+    def _answer_confirm(self, approved: bool) -> None:
+        self._write(f"[{DIM}]{'Approved — running the plan.' if approved else 'Declined — nothing will be staged.'}[/]")
+        self._answer_confirm_work(approved)
+
+    @work(thread=True)
+    def _answer_confirm_work(self, approved: bool) -> None:
+        try:
+            _post_json_sync(tui.CONFIRM_URL,
+                            {"workspace_dir": self.workspace, "approved": approved})
+        except Exception as exc:
+            self.call_from_thread(self._write, f"[{RED}]{exc}[/]")
 
     @work(thread=True)
     def _status_work(self) -> None:

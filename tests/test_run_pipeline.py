@@ -11,7 +11,7 @@ import pytest
 
 from orchestrator import classify_request, run_pipeline
 
-PLANNER = "deepseek-r1:1.5b"
+PLANNER = "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
 CODER = "qwen2.5-coder:3b"
 
 WEB_PLAN = json.dumps([
@@ -38,8 +38,10 @@ VALIDATE_OK = json.dumps({
 
 def make_fake_generate(routes: dict[str, str], default: str = ""):
     """routes: marker-in-prompt -> response. Coder routes by 'TARGET FILE: x'
-    (matched via regex so retry feedback above the marker still routes)."""
-    async def fake(model, prompt, system="", temperature=0.2):
+    (matched via regex so retry feedback above the marker still routes).
+    The router's T2 prompt routes on its own 'ROUTER INTENT JSON:' marker;
+    extra kwargs (num_predict, think, _format_schema) are accepted and ignored."""
+    async def fake(model, prompt, system="", temperature=0.2, **kwargs):
         import re
 
         target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
@@ -332,3 +334,154 @@ def test_verifier_passes_clean_python() -> None:
         ))
         assert result["staged_files"] == ["greet.py"]
         assert result["failed_tasks"] == []
+
+
+# --- Phase 4: confirm gate before staging -------------------------------------
+
+def test_confirm_gate_decline_stages_nothing_and_never_calls_coder() -> None:
+    coder_calls: list[str] = []
+
+    async def fake(model, prompt, system="", temperature=0.2, **kwargs):
+        if model == CODER:
+            coder_calls.append(prompt)
+        if "JSON array of tasks" in prompt:
+            return WEB_PLAN
+        return VALIDATE_OK
+
+    async def decline(tasks, intent_line):
+        assert {t["path"] for t in tasks} == {"index.html", "style.css", "script.js"}
+        assert "CODE_TASK" in intent_line
+        return False
+
+    with TemporaryDirectory() as tmp:
+        result = _run(run_pipeline(
+            "make a blog site in html5 css and js with dynamic content",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+            confirm=decline,
+        ))
+        assert result["status"] == "declined"
+        assert result["staged_files"] == []
+        assert not (Path(tmp) / ".agent_staging" / "index.html").exists()
+        state = json.loads(
+            (Path(tmp) / ".agent_runs" / result["run_id"] / "state.json").read_text(encoding="utf-8")
+        )
+        assert state["status"] == "declined"
+    assert coder_calls == []  # coder never ran
+
+
+def test_confirm_gate_approve_runs_full_pipeline() -> None:
+    fake = make_fake_generate({
+        "JSON array of tasks": WEB_PLAN,
+        "TARGET FILE: index.html": f"```html\n{INDEX_HTML}\n```",
+        "TARGET FILE: style.css": f"```css\n{STYLE_CSS}\n```",
+        "TARGET FILE: script.js": f"```javascript\n{SCRIPT_JS}\n```",
+        "satisfies_request": VALIDATE_OK,
+    })
+    seen: dict = {}
+
+    async def approve(tasks, intent_line):
+        seen["plan"] = [t["path"] for t in tasks]
+        seen["intent"] = intent_line
+        return True
+
+    with TemporaryDirectory() as tmp:
+        result = _run(run_pipeline(
+            "make a blog site in html5 css and js with dynamic content",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+            confirm=approve,
+        ))
+        assert set(result["staged_files"]) == {"index.html", "style.css", "script.js"}
+        assert seen["plan"] == sorted(result["staged_files"]) or sorted(seen["plan"]) == sorted(result["staged_files"])
+
+
+def test_confirm_none_skips_gate() -> None:
+    # confirm=None (direct API/tests/--yes): no gate, current behavior.
+    fake = make_fake_generate({
+        "JSON array of tasks": WEB_PLAN,
+        "TARGET FILE: index.html": f"```html\n{INDEX_HTML}\n```",
+        "TARGET FILE: style.css": f"```css\n{STYLE_CSS}\n```",
+        "TARGET FILE: script.js": f"```javascript\n{SCRIPT_JS}\n```",
+        "satisfies_request": VALIDATE_OK,
+    })
+    with TemporaryDirectory() as tmp:
+        result = _run(run_pipeline(
+            "make a blog site in html5 css and js",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+        ))
+        assert set(result["staged_files"]) == {"index.html", "style.css", "script.js"}
+
+
+# --- Phase 4: fallback only for confirmed CODE_TASK, else needs_human ----------
+
+def test_fallback_never_runs_for_non_code_intents() -> None:
+    calls: list[str] = []
+
+    async def fake(model, prompt, system="", temperature=0.2, **kw):
+        calls.append(prompt)
+        return "x"
+
+    with TemporaryDirectory() as tmp:
+        for text in ("hello", "make something", "what does the fix do"):
+            result = _run(run_pipeline(
+                text, tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+            ))
+            assert "staged_files" not in result, text
+    plan_calls = [p for p in calls if "JSON array of tasks" in p]
+    assert plan_calls == []  # the planner never ran for CHAT/UNCLEAR/QUESTION
+
+
+def test_fallback_without_deliverable_is_needs_human() -> None:
+    # Confirmed CODE_TASK ("create" + filename), planner fails twice, and the
+    # only filename in the request is a placeholder -> needs_human.
+    async def fake(model, prompt, system="", temperature=0.2, **kw):
+        if "JSON array of tasks" in prompt:
+            return "not json"
+        return "```python\npass\n```"
+
+    with TemporaryDirectory() as tmp:
+        result = _run(run_pipeline(
+            "create your_code.py with the logic",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+        ))
+        assert result["status"] == "needs_human"
+        assert result["staged_files"] == []
+        assert "name a target file" in result["summary"]
+
+
+def test_validator_follows_thinker_at_most_one_swap_pair() -> None:
+    """Validator = thinker model, so a full run is thinker phases and coder
+    phases only. The sequence of MODELS handed to generate must alternate at
+    most thinker -> coder -> thinker (one swap pair)."""
+    models: list[str] = []
+
+    async def fake(model, prompt, system="", temperature=0.2, **kw):
+        models.append(model)
+        if "JSON array of tasks" in prompt:
+            return WEB_PLAN
+        target = None
+        import re
+        m = re.search(r"TARGET FILE:\s*(\S+)", prompt)
+        if m:
+            target = m.group(1)
+        if target == "index.html":
+            return f"```html\n{INDEX_HTML}\n```"
+        if target == "style.css":
+            return f"```css\n{STYLE_CSS}\n```"
+        if target == "script.js":
+            return f"```javascript\n{SCRIPT_JS}\n```"
+        if "satisfies_request" in prompt:
+            return VALIDATE_OK
+        return ""
+
+    with TemporaryDirectory() as tmp:
+        _run(run_pipeline(
+            "make a blog site in html5 css and js",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+        ))
+    # compress consecutive duplicates -> the phase sequence
+    phases = [m for i, m in enumerate(models) if i == 0 or m != models[i - 1]]
+    # The thinker and validator share one model and the summary also runs on
+    # the thinker, so a full run is exactly: thinker (route/plan) -> coder
+    # (all code tasks) -> thinker (validate + summary) = ONE swap pair.
+    assert set(models) <= {PLANNER, CODER}
+    assert phases == [PLANNER, CODER, PLANNER], phases

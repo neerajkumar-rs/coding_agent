@@ -15,6 +15,7 @@ from ollama_client import (
     OllamaEngine,
     OllamaTruncatedError,
     is_reasoning_model,
+    strip_think,
     strip_think_blocks,
 )
 
@@ -61,9 +62,44 @@ def test_strip_empty_and_none_like() -> None:
     assert strip_think_blocks("") == ("", "")
 
 
+# --- strip_think: THE one think-block handler (answer, think_text, think_chars)
+
+def test_strip_think_closed_block() -> None:
+    answer, think, chars = strip_think("<think>let me think</think>{\"ok\": true}")
+    assert answer == '{"ok": true}'
+    assert think == "let me think"
+    assert chars == len("let me think")
+
+
+def test_strip_think_unclosed_trailing_block() -> None:
+    answer, think, chars = strip_think('{"partial": true}\n<think>cut off mid-thought')
+    assert answer == '{"partial": true}'
+    assert think == "cut off mid-thought"
+    assert chars > 0
+
+
+def test_strip_think_nested_looking() -> None:
+    answer, think, _ = strip_think("<think>a</think>answer<think>b</think> more")
+    assert answer == "answer more"
+    assert think == "a\nb"
+
+
+def test_strip_think_empty_and_missing_tag() -> None:
+    assert strip_think("") == ("", "", 0)
+    answer, think, chars = strip_think("plain answer, no tags")
+    assert answer == "plain answer, no tags"
+    assert think == ""
+    assert chars == 0
+
+
+def test_strip_think_only_a_block_and_empty_open() -> None:
+    assert strip_think("<think>nothing else</think>") == ("", "nothing else", len("nothing else"))
+    assert strip_think("<think>") == ("", "", len(""))
+
+
 def test_reasoning_model_detection() -> None:
-    assert is_reasoning_model("deepseek-r1:1.5b")
     assert is_reasoning_model("erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest")
+    assert is_reasoning_model("deepseek-r1:1.5b")
     assert not is_reasoning_model("qwen2.5-coder:3b")
 
 
@@ -238,7 +274,7 @@ def test_chat_strips_think_before_return() -> None:
                 config=AgentConfig(max_context_tokens=4096),
                 workspace_root=tmp,
             )
-            answer = engine.chat("deepseek-r1:1.5b", "ping", max_tokens=256)
+            answer = engine.chat("erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "ping", max_tokens=256)
         assert "<think>" not in answer
         assert answer == "COMPLETE"
     finally:

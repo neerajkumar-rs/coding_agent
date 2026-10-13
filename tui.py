@@ -56,6 +56,7 @@ def _set_fastapi_port(port: int) -> None:
     """Repoint every FastAPI URL at *port* (busy-port fallback)."""
     global FASTAPI_PORT, FASTAPI_BASE, HEALTH_URL
     global STATUS_URL, DEPLOY_URL, INIT_URL, RUN_URL, CANCEL_URL, EVENTS_URL
+    global ROUTER_URL, PENDING_CONFIRM_URL, CONFIRM_URL
     FASTAPI_PORT = port
     FASTAPI_BASE = f"http://{FASTAPI_HOST}:{port}"
     HEALTH_URL = FASTAPI_BASE + "/health"
@@ -65,14 +66,17 @@ def _set_fastapi_port(port: int) -> None:
     RUN_URL = FASTAPI_BASE + "/agent/run"
     CANCEL_URL = FASTAPI_BASE + "/agent/cancel"
     EVENTS_URL = FASTAPI_BASE + "/agent/events"
+    ROUTER_URL = FASTAPI_BASE + "/router/classify"
+    PENDING_CONFIRM_URL = FASTAPI_BASE + "/agent/pending_confirm"
+    CONFIRM_URL = FASTAPI_BASE + "/agent/confirm"
 
 OLLAMA_EXE = shutil.which("ollama") or str(
     Path.home() / "AppData" / "Local" / "Programs" / "Ollama" / "ollama.exe"
 )
 
 REQUIRED_MODELS = [
-    "deepseek-r1:1.5b",   # planner  — resolved via fuzzy match
-    "qwen2.5-coder:3b",   # coder    — exact or fuzzy
+    "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest",  # thinker/planner/validator
+    "qwen2.5-coder:3b-instruct",                    # coder
 ]
 
 OLLAMA_TAGS_URL = OLLAMA_BASE + "/api/tags"
@@ -756,7 +760,7 @@ def show_banner() -> None:
         Panel.fit(
             "[bold bright_cyan]OLLAMA MASTER CONTROLLER[/bold bright_cyan]\n"
             "[bright_magenta]Sequential VRAM Fencing | RTX 3050 4 GB ceiling[/bright_magenta]\n"
-            "[dim]deepseek-r1:1.5b (Planner)  |  qwen2.5-coder:3b (Coder)[/dim]\n"
+            "[dim]R1-Distill-1.5B (Thinker)  |  qwen2.5-coder-3b (Coder)[/dim]\n"
             "[dim]Reuses running Ollama · only own children are stopped on exit[/dim]\n"
             "[dim]CLI: --workspace PATH · --port N · --yes · --benchmark [bench args][/dim]",
             border_style="bright_blue",
@@ -788,6 +792,7 @@ def show_help() -> None:
             "/workspace   change the active workspace path\n"
             "/save        save staged files into the workspace (/deploy alias)\n"
             "/cancel      cancel the in-progress run for this workspace\n"
+            "/router <t>  show how a message would be routed (tier, scores, intent)\n"
             "/logs        tail planner · coder · sandbox logs\n"
             "/models      list installed Ollama models\n"
             "/clear       clear screen\n"
@@ -809,6 +814,43 @@ async def submit(request_text: str, workspace_dir: str) -> None:
         return
     async with lock:
         await _submit_locked(request_text, workspace_dir)
+
+
+async def _post_run_with_confirm(request_text: str, workspace_dir: str) -> dict:
+    """POST /agent/run with the plan-confirm gate enabled (unless --yes).
+
+    While the request is in flight we poll /agent/pending_confirm; when the
+    pipeline pauses after PLAN we show the planned files + one-line intent and
+    ask Enter/y (default y) before anything is staged."""
+    from urllib.parse import quote
+
+    payload = {"prompt": request_text, "workspace_dir": workspace_dir,
+               "confirm": not _cli_yes}
+    task = asyncio.create_task(post_json(RUN_URL, payload))
+    answered = False
+    while not task.done():
+        await asyncio.sleep(0.5)
+        if task.done() or answered:
+            continue
+        try:
+            pending = await get_json(
+                PENDING_CONFIRM_URL + "?workspace_dir=" + quote(workspace_dir)
+            )
+        except Exception:
+            continue
+        if not pending.get("pending"):
+            continue
+        console.print(f"[yellow]Plan ({pending.get('intent', '')}):[/yellow]")
+        for t in pending.get("plan", []):
+            console.print(f"  {t.get('action', 'create')}  {t.get('path', '')}")
+        answer = await asyncio.to_thread(
+            Prompt.ask, "[bold bright_green]Stage and build? [Y/n][/bold bright_green]",
+            choices=["y", "n"], default="y",
+        )
+        await post_json(CONFIRM_URL, {"workspace_dir": workspace_dir,
+                                      "approved": answer == "y"})
+        answered = True
+    return await task
 
 
 EXPECTED_STAGES = ["ROUTE", "PLAN", "CODE", "CHECK", "VALIDATE", "SUMMARY"]
@@ -914,6 +956,52 @@ def pluralize(n: int, word: str) -> str:
     return f"{n} {word}" + ("" if n == 1 else "s")
 
 
+def format_router_diagnosis(diag: dict, t2_note: str | None = None) -> str:
+    """`/router` output: tier, matched verb/deliverable, scores, T2 info."""
+    lines = [f"router: {diag.get('text', '')!r}"]
+    tier = diag.get("tier", "?")
+    lines.append(f"  tier: {tier}   intent: {diag.get('intent', '?')}   "
+                 f"confidence: {diag.get('confidence', 0.0):.2f}")
+    verb, deliv = diag.get("matched_verb"), diag.get("matched_deliverable")
+    if verb or deliv:
+        lines.append(f"  verb: {verb or '—'}   deliverable: {deliv or '—'}")
+    scores = diag.get("scores") or {}
+    if scores:
+        parts = "  ".join(f"{k} {v:+.0f}" for k, v in scores.items()
+                          if k != "total" and v)
+        lines.append(f"  score: {scores.get('total', 0):+.0f}   [{parts}]")
+    if diag.get("t2_ran"):
+        lines.append(f"  T2 ran. raw classifier JSON: {diag.get('t2_raw', '')[:300]!r}")
+    elif t2_note:
+        lines.append(f"  T2: {t2_note}")
+    else:
+        lines.append("  T2: not needed (decided by rules)")
+    if diag.get("clarifying_question"):
+        lines.append(f"  clarify: {diag['clarifying_question']}")
+    return "\n".join(lines)
+
+
+async def run_router_slash(arg_text: str, workspace_dir: str) -> None:
+    """/router <text> — classify with full diagnostics. T0/T1 work with no
+    Ollama running; the T2 grey zone goes through the server's gateway."""
+    from router import diagnose as local_diagnose
+
+    if not arg_text.strip():
+        console.print("[dim]Usage: /router <text>[/dim]")
+        return
+    try:
+        diag = await post_json(ROUTER_URL, {"text": arg_text, "workspace_dir": workspace_dir})
+        console.print(format_router_diagnosis(diag))
+    except Exception as exc:
+        # Server/Ollama unreachable: rules-only locally, T2 marked skipped.
+        try:
+            diag = await local_diagnose(arg_text)
+            console.print(format_router_diagnosis(
+                diag, t2_note=f"skipped: {type(exc).__name__} (server/Ollama unreachable)"))
+        except Exception as exc2:
+            console.print(f"[red]/router failed: {exc2}[/red]")
+
+
 async def _save_staged(workspace_dir: str) -> None:
     """List every staged file with (new)/(overwrites existing file), ask
     'Save? [y/N]' (default N), then save via the deploy endpoint."""
@@ -977,9 +1065,7 @@ async def _submit_locked(request_text: str, workspace_dir: str) -> None:
 
         # ── ONE call: ROUTE -> PLAN -> CODE -> CHECK -> VALIDATE -> SUMMARY ──
         console.print("[dim]⏳ Running pipeline (ROUTE → PLAN → CODE → CHECK → VALIDATE → SUMMARY)...[/dim]")
-        with Progress(SpinnerColumn(), TextColumn("[dim]Pipeline running..."), transient=True, console=console) as p:
-            p.add_task("", total=None)
-            result = await post_json(RUN_URL, {"prompt": request_text, "workspace_dir": workspace_dir})
+        result = await _post_run_with_confirm(request_text, workspace_dir)
 
         # 1. Trace (also feeds the header's "Last run" vitals)
         global _last_trace
@@ -1346,6 +1432,9 @@ async def main() -> None:
             elif command.startswith("/benchmark"):
                 arg_string = text.strip()[len("/benchmark"):].strip()
                 await run_benchmark_slash(arg_string, workspace)
+
+            elif command.startswith("/router"):
+                await run_router_slash(text.strip()[len("/router"):].strip(), workspace)
 
             elif command == "/logs":
                 for log_file in ("planner.log", "coder.log", "sandbox.log",

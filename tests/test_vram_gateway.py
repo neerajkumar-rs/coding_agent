@@ -23,7 +23,7 @@ from ollama_client import (
 )
 
 MODEL = "qwen2.5-coder:3b-instruct"
-THINKER = "deepseek-r1:1.5b"
+THINKER = "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
 
 
 class FakeOllama(BaseHTTPRequestHandler):

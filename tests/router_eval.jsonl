@@ -1,0 +1,62 @@
+{"text": "hello", "expected": "CHAT", "tier_max": 0}
+{"text": "hi there", "expected": "CHAT", "tier_max": 0}
+{"text": "hey bro", "expected": "CHAT", "tier_max": 0}
+{"text": "good morning", "expected": "CHAT", "tier_max": 0}
+{"text": "good evening", "expected": "CHAT", "tier_max": 0}
+{"text": "thanks", "expected": "CHAT", "tier_max": 0}
+{"text": "thanks a lot for that", "expected": "CHAT", "tier_max": 0}
+{"text": "thank you so much", "expected": "CHAT", "tier_max": 0}
+{"text": "thx", "expected": "CHAT", "tier_max": 0}
+{"text": "ok cool", "expected": "CHAT", "tier_max": 0}
+{"text": "got it thanks", "expected": "CHAT", "tier_max": 0}
+{"text": "hmm", "expected": "CHAT", "tier_max": 0}
+{"text": "bye", "expected": "CHAT", "tier_max": 0}
+{"text": "yes", "expected": "CHAT", "tier_max": 0}
+{"text": "hello lets work together", "expected": "CHAT", "tier_max": 0}
+{"text": "hi there, lets get started", "expected": "CHAT", "tier_max": 0}
+{"text": "lets start", "expected": "CHAT", "tier_max": 0}
+{"text": "lets work", "expected": "CHAT", "tier_max": 0}
+{"text": "continue", "expected": "CHAT", "tier_max": 0}
+{"text": "ok lets go", "expected": "CHAT", "tier_max": 0}
+{"text": "namaste", "expected": "CHAT", "tier_max": 0}
+{"text": "kya haal hai", "expected": "CHAT", "tier_max": 0}
+{"text": "kaise ho", "expected": "CHAT", "tier_max": 0}
+{"text": "shukriya", "expected": "CHAT", "tier_max": 0}
+{"text": "theek hai", "expected": "CHAT", "tier_max": 0}
+{"text": "chalo shuru karte hain", "expected": "CHAT", "tier_max": 0}
+{"text": "achha ok", "expected": "CHAT", "tier_max": 0}
+{"text": "dhanyavaad", "expected": "CHAT", "tier_max": 0}
+{"text": "make something", "expected": "UNCLEAR", "tier_max": 1}
+{"text": "build it", "expected": "UNCLEAR", "tier_max": 1}
+{"text": "fix this", "expected": "UNCLEAR", "tier_max": 1}
+{"text": "can you help me", "expected": "UNCLEAR", "tier_max": 1}
+{"text": "i need a website", "expected": "UNCLEAR", "tier_max": 1}
+{"text": "change it", "expected": "UNCLEAR", "tier_max": 1}
+{"text": "do something cool", "expected": "UNCLEAR", "tier_max": 1}
+{"text": "write code", "expected": "UNCLEAR", "tier_max": 1}
+{"text": "make a todo page in index.html", "expected": "CODE_TASK", "tier_max": 1}
+{"text": "create a python script that renames files", "expected": "CODE_TASK", "tier_max": 1}
+{"text": "add a /health endpoint to main.py", "expected": "CODE_TASK", "tier_max": 1}
+{"text": "fix the bug in utils.py", "expected": "CODE_TASK", "tier_max": 1}
+{"text": "write tests for the parser", "expected": "CODE_TASK", "tier_max": 1}
+{"text": "build a calculator app", "expected": "CODE_TASK", "tier_max": 1}
+{"text": "can you make a login form in login.html", "expected": "CODE_TASK", "tier_max": 1}
+{"text": "refactor server.js into modules", "expected": "CODE_TASK", "tier_max": 1}
+{"text": "create app.py with a calculator", "expected": "CODE_TASK", "tier_max": 1}
+{"text": "make a blog site in html css js", "expected": "CODE_TASK", "tier_max": 1}
+{"text": "implement an api endpoint for users", "expected": "CODE_TASK", "tier_max": 1}
+{"text": "remove the deprecated route from server.js", "expected": "CODE_TASK", "tier_max": 1}
+{"text": "what does the fix do", "expected": "QUESTION", "tier_max": 1}
+{"text": "why is the build slow", "expected": "QUESTION", "tier_max": 1}
+{"text": "what is a closure", "expected": "QUESTION", "tier_max": 1}
+{"text": "is flask better than fastapi", "expected": "QUESTION", "tier_max": 1}
+{"text": "tell me the difference between rust and python", "expected": "QUESTION", "tier_max": 1}
+{"text": "what is the difference between tcp and udp", "expected": "QUESTION", "tier_max": 1}
+{"text": "how does garbage collection work in python", "expected": "QUESTION", "tier_max": 1}
+{"text": "how do i make a todo page", "expected": "QUESTION", "tier_max": 2, "t2": {"intent": "QUESTION", "confidence": 0.9, "deliverable": "page", "clarifying_question": ""}}
+{"text": "what is the address of my file", "expected": "FILE_QUESTION", "tier_max": 1}
+{"text": "what does main.py do", "expected": "FILE_QUESTION", "tier_max": 0}
+{"text": "where is the config in settings.py", "expected": "FILE_QUESTION", "tier_max": 0}
+{"text": "explain index.html", "expected": "FILE_QUESTION", "tier_max": 0}
+{"text": "show me what utils.py exports", "expected": "FILE_QUESTION", "tier_max": 0}
+{"text": "summarize my files", "expected": "FILE_QUESTION", "tier_max": 1}

@@ -34,8 +34,8 @@ orchestrator.run_pipeline             ←  ROUTE → PLAN → CODE → CHECK →
         │
         ▼  one async lock on the hot path (OllamaSupervisorClient._vram_mutex)
 Local Ollama  http://localhost:11434
-        ├── deepseek-r1:1.5b          ←  Planner / Validator
-        └── qwen2.5-coder:3b          ←  Coder / Answers / Summaries
+        ├── erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest  ←  Thinker / Planner / Validator / Router T2
+        └── qwen2.5-coder:3b-instruct                    ←  Coder / Answers / Summaries
 ```
 
 **Run budgets** (per run): 900 s wall time, 40 LLM calls, 2 attempts per task.
@@ -48,19 +48,22 @@ Run statuses: `completed` | `failed` | `needs_human` | `budget_exhausted` | `can
 
 | Role | Model | Used by |
 |---|---|---|
-| Planner / Auditor | `deepseek-r1:1.5b` | planner, auditor, spec refinement |
-| Coder | `qwen2.5-coder:3b` (or `1.5b`) | code generation / SEARCH/REPLACE edits |
+| Thinker / Planner / Validator / Router T2 | `erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest` | routing grey zone, planning, validation, Q&A |
+| Coder | `qwen2.5-coder:3b-instruct` | code generation / SEARCH/REPLACE edits |
 
 ```powershell
-ollama pull deepseek-r1:1.5b
-ollama pull qwen2.5-coder:3b
+ollama pull erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest
+ollama pull qwen2.5-coder:3b-instruct
 ```
+
+Model names are matched **exactly** against `/api/tags` (the thinker name
+carries a namespace and a `:latest` tag — never stripped or normalized). A
+missing model raises with the exact `ollama pull <name>` hint.
 
 Check whether the planner model conforms to the Plan schema reliably:
 
 ```powershell
-.\env\Scripts\python.exe -m agent_core.planner_eval --model deepseek-r1:1.5b
-# >20% schema failure  ->  use --planner-model qwen2.5-coder:3b
+.\env\Scripts\python.exe -m agent_core.planner_eval --model erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest
 ```
 
 ---
@@ -88,13 +91,19 @@ Check whether the planner model conforms to the Plan schema reliably:
 
 ```json
 {
-  "planner_model": "deepseek-r1:1.5b",
-  "coder.5b_or_3b": "qwen2.5-coder:3b",
-  "max_context_tokens": 4096,
-  "keep_alive": "5m",
-  "allowed_commands": ["py_compile"]
+  "roles": {
+    "thinker":   {"model": "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "num_ctx": 8192, "num_predict": 2048, "temperature": 0.2, "keep_alive": "5m", "inline_system": true,  "think_budget": 512},
+    "coder":     {"model": "qwen2.5-coder:3b-instruct",                    "num_ctx": 6144, "num_predict": 2048, "temperature": 0.1, "keep_alive": "5m", "inline_system": false, "think_budget": 0},
+    "validator": {"model": "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "num_ctx": 8192, "num_predict": 512,  "temperature": 0.0, "keep_alive": "5m", "inline_system": true,  "think_budget": 512}
+  },
+  "allowed_commands": ["py_compile"],
+  "router": {"min_confidence": 0.7, "chat_use_llm": false}
 }
 ```
+
+Legacy keys (`planner_model`, `coder.5b_or_3b`, `max_context_tokens`,
+`keep_alive`) are migration inputs only: on load they fold into `roles` and
+are never read elsewhere.
 
 Every Ollama payload enforces exactly:
 
@@ -271,7 +280,7 @@ Reports land in `<workspace>\.agent_runs\bench\` (JSON + Markdown).
 # Headless from the shell (starts/reuses Ollama, NO FastAPI):
 .\env\Scripts\python.exe tui.py --benchmark --quick
 .\env\Scripts\python.exe tui.py --workspace E:\proj --benchmark --quick --coexist
-.\env\Scripts\python.exe tui.py --benchmark --compare validator=deepseek-r1:1.5b,qwen2.5-coder:3b --repeat 3
+.\env\Scripts\python.exe tui.py --benchmark --compare validator=erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest --repeat 3
 
 # Or directly:
 .\env\Scripts\python.exe bench.py --workspace . --quick
@@ -284,7 +293,7 @@ inference on the 4 GB card):
 /benchmark                                  all roles from .agent
 /benchmark --quick
 /benchmark --roles validator --repeat 3
-/benchmark --compare planner=deepseek-r1:1.5b,qwen2.5-coder:3b
+/benchmark --compare planner=erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest
 /benchmark --plan-mode two-stage
 /benchmark --coexist
 /benchmark last                             print the newest report

@@ -65,9 +65,44 @@ def test_fallback_plan_gives_three_web_files() -> None:
 
 
 def test_fallback_plan_non_web_is_single_python_file() -> None:
-    plan = _fallback_plan("fix the parser to handle empty lines")
+    plan = _fallback_plan("fix the parser to handle empty lines", deliverable="parser")
+    assert plan is not None
     assert len(plan) == 1
     assert plan[0]["path"].endswith(".py")
+
+
+def test_fallback_plan_never_uses_request_text_as_content() -> None:
+    """The fallback emits a fixed minimal template: the description is exactly
+    the template (only the deliverable noun slots in), never raw request text."""
+    request = "fix the flux capacitor calibration routine immediately please"
+    plan = _fallback_plan(request, deliverable="calibration")
+    assert plan is not None
+    assert plan[0]["description"] == (
+        "Python calibration stub implementing the requested "
+        "behavior with a TODO for the concrete details."
+    )
+    # and the web fallback is equally fixed
+    web = _fallback_plan("make a page about my grandmother's secret soup recipe")
+    assert web is not None
+    assert "grandmother" not in " ".join(t["description"] for t in web)
+    assert "soup" not in " ".join(t["description"] for t in web)
+
+
+def test_fallback_plan_without_deliverable_returns_none() -> None:
+    assert _fallback_plan("xyzzy the whole thing somehow") is None
+
+
+def test_fallback_plan_rejects_placeholder_filename_from_request() -> None:
+    # "create your_code.py please" is a confirmed CODE_TASK whose only
+    # filename is a placeholder -> no fallback (needs_human upstream).
+    assert _fallback_plan("create your_code.py please") is None
+
+
+def test_fallback_plan_uses_filename_from_request() -> None:
+    plan = _fallback_plan("fix the bug in utils.py")
+    assert plan is not None
+    assert plan[0]["path"] == "utils.py"
+    assert _valid_plan_task(plan[0]) is None
 
 
 # --- coder prompt contents -----------------------------------------------------

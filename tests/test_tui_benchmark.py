@@ -22,7 +22,7 @@ class FakeOllama(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path.endswith("/api/tags"):
             body = {"models": [
-                {"name": "deepseek-r1:1.5b"},
+                {"name": "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"},
                 {"name": "qwen2.5-coder:3b"},
                 {"name": "phi4-mini"},
             ]}
@@ -115,13 +115,13 @@ def test_bench_compare_override(fake_ollama: str) -> None:
         save_agent_config(AgentConfig(), tmp)
         report, code = bench.run([
             "--workspace", tmp, "--quick",
-            "--compare", "validator=deepseek-r1:1.5b,phi4-mini",
+            "--compare", "validator=erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest,phi4-mini",
             "--roles", "validator",
             "--ollama-url", fake_ollama,
         ])
         assert code == bench.EXIT_OK
         validator = [r for r in report["results"] if r["role"] == "validator"]
-        assert {r["model"] for r in validator} == {"deepseek-r1:1.5b", "phi4-mini"}
+        assert {r["model"] for r in validator} == {"erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "phi4-mini"}
         assert all(r["ok"] for r in validator)
 
 
@@ -161,26 +161,26 @@ def test_apply_writes_roles_only_after_yes() -> None:
     with TemporaryDirectory() as tmp:
         save_agent_config(AgentConfig(), tmp)
         tui._last_bench_report = {
-            "best_per_role": {"thinker": "deepseek-r1:1.5b", "coder": "qwen2.5-coder:3b-instruct"},
+            "best_per_role": {"thinker": "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "coder": "qwen2.5-coder:3b-instruct"},
         }
         # Answer "n" -> nothing written
         with patch.object(tui.Prompt, "ask", return_value="n"):
             asyncio.run(tui._apply_bench_roles(tmp))
         before = json.loads((Path(tmp) / ".agent").read_text(encoding="utf-8"))
-        assert before["roles"]["thinker"]["model"] == "deepseek-r1:1.5b"  # default, unchanged
+        assert before["roles"]["thinker"]["model"] == "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"  # default, unchanged
 
         # Answer "y" -> roles written and become the EFFECTIVE source; the
         # legacy planner_model is migrated (reflects roles), not left
         # contradicting it.
         tui._last_bench_report = {
-            "best_per_role": {"thinker": "deepseek-r1:1.5b", "coder": "qwen2.5-coder:3b-instruct"},
+            "best_per_role": {"thinker": "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "coder": "qwen2.5-coder:3b-instruct"},
         }
         with patch.object(tui.Prompt, "ask", return_value="y"):
             asyncio.run(tui._apply_bench_roles(tmp))
         loaded = load_agent_config(tmp)
         # roles is the effective source
         assert loaded.get_role_config("coder")["model"] == "qwen2.5-coder:3b-instruct"
-        assert loaded.get_role_config("thinker")["model"] == "deepseek-r1:1.5b"
+        assert loaded.get_role_config("thinker")["model"] == "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
         # compat views read FROM roles (migrated, never contradicting)
         assert loaded.planner_model == loaded.get_role_config("thinker")["model"]
         assert loaded.coder_model == loaded.get_role_config("coder")["model"]

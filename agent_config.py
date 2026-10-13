@@ -16,7 +16,9 @@ from typing import Any
 
 logger = logging.getLogger("agent_config")
 
-DEFAULT_PLANNER_MODEL = "deepseek-r1:1.5b"
+# Reference models (exact names; the thinker carries a namespace + :latest tag —
+# never strip, lowercase or "normalize" for matching).
+DEFAULT_PLANNER_MODEL = "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
 DEFAULT_CODER_MODEL = "qwen2.5-coder:3b-instruct"
 DEFAULT_CONTEXT_TOKENS = 4096
 DEFAULT_KEEP_ALIVE = "5m"
@@ -36,6 +38,11 @@ def _default_roles() -> dict[str, dict[str, Any]]:
             "num_predict": 2048,
             "temperature": 0.2,
             "keep_alive": DEFAULT_KEEP_ALIVE,
+            # Reasoning distill: DeepSeek advises instructions in the user turn.
+            "inline_system": True,
+            # Answer budget gets this think allowance on top when thinking
+            # cannot be disabled (num_predict is shared between think+answer).
+            "think_budget": 512,
         },
         "coder": {
             "model": DEFAULT_CODER_MODEL,
@@ -43,6 +50,8 @@ def _default_roles() -> dict[str, dict[str, Any]]:
             "num_predict": 2048,
             "temperature": 0.1,
             "keep_alive": DEFAULT_KEEP_ALIVE,
+            "inline_system": False,
+            "think_budget": 0,  # instruct model: no reasoning mode, never send think
         },
         "validator": {
             "model": DEFAULT_PLANNER_MODEL,
@@ -50,6 +59,8 @@ def _default_roles() -> dict[str, dict[str, Any]]:
             "num_predict": 512,
             "temperature": 0.0,
             "keep_alive": DEFAULT_KEEP_ALIVE,
+            "inline_system": True,
+            "think_budget": 512,
         },
     }
 
@@ -68,6 +79,7 @@ class AgentConfig:
     _KNOWN_KEYS = {
         "planner_model", "coder.5b_or_3b", "coder_5b_or_3b", "coder_model",
         "max_context_tokens", "keep_alive", "allowed_commands", "roles",
+        "router",
     }
 
     def __init__(
@@ -75,6 +87,7 @@ class AgentConfig:
         roles: dict[str, dict[str, Any]] | None = None,
         allowed_commands: list[str] | None = None,
         extra: dict[str, Any] | None = None,
+        router: dict[str, Any] | None = None,
         # Legacy constructor inputs (migration only; folded into roles below):
         planner_model: str | None = None,
         coder_5b_or_3b: str | None = None,
@@ -121,6 +134,11 @@ class AgentConfig:
         self.roles = merged
         self.allowed_commands = allowed_commands
         self.extra = extra
+        # Router v2 settings. min_confidence: below it, the T2 classifier's
+        # answer is treated as UNCLEAR (never guessed).
+        self.router: dict[str, Any] = {"min_confidence": 0.7, "chat_use_llm": False}
+        if isinstance(router, dict):
+            self.router.update(router)
 
     # --- compat views: read from roles (migration inputs, never the source) ---
 
@@ -159,6 +177,7 @@ class AgentConfig:
         data: dict[str, Any] = dict(self.extra or {})
         data["roles"] = self.roles
         data["allowed_commands"] = self.allowed_commands or ["py_compile"]
+        data["router"] = self.router
         return data
 
     @classmethod
@@ -171,6 +190,7 @@ class AgentConfig:
             roles=data.get("roles") if isinstance(data.get("roles"), dict) else None,
             allowed_commands=allowed,
             extra=extra or None,
+            router=data.get("router") if isinstance(data.get("router"), dict) else None,
             planner_model=data.get("planner_model"),
             coder_5b_or_3b=(
                 data.get("coder.5b_or_3b")
@@ -311,7 +331,7 @@ def parse_and_recalculate(args: list[str] | None = None) -> AgentConfig | None:
         "--planner-model",
         type=str,
         default=None,
-        help="Planner model (e.g., deepseek-r1:1.5b)",
+        help="Planner model (e.g., erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest)",
     )
     parser.add_argument(
         "--coder-model",

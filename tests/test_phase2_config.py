@@ -30,9 +30,9 @@ def test_roles_defaults_and_ceilings() -> None:
     from agent_config import ROLE_CTX_CEILINGS
 
     c = AgentConfig()
-    assert c.roles["thinker"]["model"] == "deepseek-r1:1.5b"
+    assert c.roles["thinker"]["model"] == "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
     assert c.roles["coder"]["model"] == "qwen2.5-coder:3b-instruct"
-    assert c.roles["validator"]["model"] == "deepseek-r1:1.5b"
+    assert c.roles["validator"]["model"] == "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
     # per-spec defaults
     assert c.roles["thinker"]["num_ctx"] == 8192
     assert c.roles["coder"]["num_ctx"] == 6144
@@ -48,16 +48,16 @@ def test_roles_defaults_and_ceilings() -> None:
 def test_legacy_keys_fold_into_roles_on_load() -> None:
     with TemporaryDirectory() as tmp:
         (Path(tmp) / ".agent").write_text(json.dumps({
-            "planner_model": "deepseek-r1:1.5b",
+            "planner_model": "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest",
             "coder.5b_or_3b": "qwen2.5-coder:3b",
             "max_context_tokens": 4096,
         }), encoding="utf-8")
         c = load_agent_config(tmp)
-        assert c.planner_model == "deepseek-r1:1.5b"
+        assert c.planner_model == "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
         assert c.coder_model == "qwen2.5-coder:3b"
         assert c.max_context_tokens == 4096
         # and they became roles (the single source of truth)
-        assert c.roles["thinker"]["model"] == "deepseek-r1:1.5b"
+        assert c.roles["thinker"]["model"] == "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
         assert c.roles["coder"]["model"] == "qwen2.5-coder:3b"
         assert c.roles["thinker"]["num_ctx"] == 4096
 
@@ -78,13 +78,13 @@ def test_recalculate_preserves_everything() -> None:
         assert loaded.roles["thinker"]["keep_alive"] == "30m"
         assert loaded.roles["validator"]["temperature"] == 0.3
         assert loaded.coder_model == "qwen2.5-coder:3b"
-        assert loaded.planner_model == "deepseek-r1:1.5b"
+        assert loaded.planner_model == "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
 
 
 # --- exact-match resolver, never substitute ---------------------------------
 
 class _TagsHandler(BaseHTTPRequestHandler):
-    models = ["qwen2.5-coder:3b-instruct", "deepseek-r1:1.5b"]
+    models = ["qwen2.5-coder:3b-instruct", "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"]
 
     def do_GET(self) -> None:
         if self.path.endswith("/api/tags"):
@@ -112,7 +112,7 @@ def test_exact_match_resolver_no_substitution() -> None:
     try:
         client = OllamaSupervisorClient(base_url=base)
         # exact pass
-        assert asyncio.run(client.resolve_model_name("deepseek-r1:1.5b")) == "deepseek-r1:1.5b"
+        assert asyncio.run(client.resolve_model_name("erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest")) == "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
         # fuzzy request (old behavior would substitute 3b-instruct) now raises
         with pytest.raises(ModelNotInstalled) as ei:
             asyncio.run(client.resolve_model_name("qwen2.5-coder:3b"))
@@ -131,7 +131,7 @@ class _ModelsHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path.endswith("/api/tags"):
             body = json.dumps({"models": [
-                {"name": "deepseek-r1:1.5b", "digest": "sha256:abc123def4567890", "size": 1_100_000_000},
+                {"name": "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "digest": "sha256:abc123def4567890", "size": 1_100_000_000},
                 {"name": "qwen2.5-coder:3b-instruct", "digest": "sha256:9999888877776666", "size": 1_900_000_000},
             ]}).encode()
             self.send_response(200)
@@ -139,7 +139,7 @@ class _ModelsHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers(); self.wfile.write(body)
         elif self.path.endswith("/api/ps"):
-            body = json.dumps({"models": [{"name": "deepseek-r1:1.5b"}]}).encode()
+            body = json.dumps({"models": [{"name": "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"}]}).encode()
             self.send_response(200); self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
         else:
@@ -194,4 +194,4 @@ def test_base_model_warning_heuristic() -> None:
 
     assert _base_model_warning("qwen2.5:3b", "Q4_K_M") is not None  # no instruct tag -> warn
     assert _base_model_warning("qwen2.5-coder:3b-instruct", "Q4_K_M") is None
-    assert _base_model_warning("deepseek-r1:1.5b", "Q4_0") is None  # r1 tag ok
+    assert _base_model_warning("erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "Q4_0") is None  # r1 tag ok

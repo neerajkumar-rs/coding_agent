@@ -44,6 +44,15 @@ class ValidateResult(BaseModel):
     summary: str = Field(default="", max_length=500)
 
 
+class RouterIntent(BaseModel):
+    """T2 router classifier output."""
+
+    intent: str = Field(pattern="^(CHAT|CODE_TASK|QUESTION|FILE_QUESTION|COMMAND|UNCLEAR)$")
+    confidence: float = Field(ge=0.0, le=1.0)
+    deliverable: str | None = None
+    clarifying_question: str = ""
+
+
 class AuditIssue(BaseModel):
     severity: str = Field(pattern="^(info|warning|critical)$")
     message: str = Field(min_length=1, max_length=500)

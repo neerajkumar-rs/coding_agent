@@ -122,7 +122,7 @@ def test_agent_config_ignores_removed_models() -> None:
             "max_context_tokens": 4096,
         }), encoding="utf-8")
         config = load_agent_config(tmp)
-        assert config.planner_model == "deepseek-r1:1.5b"
+        assert config.planner_model == "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
         assert config.coder_model == "qwen2.5-coder:3b-instruct"
         # supported names still load fine
         save_agent_config(AgentConfig(), tmp)
