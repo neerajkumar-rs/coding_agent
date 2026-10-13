@@ -3,6 +3,26 @@
 All changes offline-verified: **292 tests pass** (`pytest tests/ test_master_controller.py`),
 26 test files. Live Ollama verification done on this machine (see below).
 
+## Bench rewrite (2026-10-13, item 7)
+
+- **Quality-scored probes**: deterministic per-role checks on the actual
+  answer — planner (JSON task array + files + spec), coder (fenced `def
+  greet(` returning a string), validator (PASS/CONCERNS first line), writer
+  (clean prose, no think tags). A role is "ok" only at quality 100.
+- **Score = quality × tok/s** (tok/s from Ollama `eval_count/eval_duration`,
+  chars/s fallback). A fast wrong answer can never beat a slower right one.
+- New plumbing: `AgentGateway.generate(..., out_meta=[])` hands the Ollama
+  meta dict to callers that need it (bench, future tooling) without the
+  per-run journal hook.
+- `--roles` and `--compare` accept the writer role; reports (JSON/MD/console)
+  carry quality, tok/s, per-check detail.
+- Live run on this machine: planner/validator quality 100 @ 97.7 tok/s,
+  coder quality 100 @ 51.4 tok/s.
+- The repo's own `.agent` profile was still pre-rename legacy keys; rewritten
+  to current role defaults.
+- Dropped the vestigial `--plan-mode` flag (the two-stage planner concept
+  died with the retired Engine pipeline).
+
 ## Backlog round (2026-10-13)
 
 - **Textual hygiene grep test** — AST scan of `tui_textual.py`: no

@@ -825,6 +825,7 @@ class AgentGateway:
         think: bool | None = None,
         schema: dict[str, Any] | None = None,
         _format_schema: dict[str, Any] | None = None,
+        out_meta: list[dict[str, Any]] | None = None,
     ) -> str:
         """Role-based generation under the single lock, with the VRAM guard.
 
@@ -836,6 +837,9 @@ class AgentGateway:
         ``think`` is only ever sent when it is not None — callers pass
         ``think=False`` only for models whose capability probe confirmed it.
         ``schema`` (alias ``_format_schema``) adds Ollama structured output.
+        ``out_meta``: callers that need Ollama meta (eval_count/eval_duration
+        for tok/s, done_reason, think_chars) pass an empty list; the meta dict
+        is appended after a successful call (left empty on failure).
         A response cut off mid-think (done_reason=length) is retried ONCE with
         a doubled num_predict (bounded by MAX_NUM_PREDICT), then raised as
         OllamaTruncatedError — a truncation is a failure, never a valid answer.
@@ -882,7 +886,7 @@ class AgentGateway:
                             num_predict=predict,
                             temperature=temp, cancel_event=cancel_event,
                             keep_warm=keep_warm, format_schema=_format_schema,
-                            think=think, role=role,
+                            think=think, role=role, out_meta=out_meta,
                         )
                     except OllamaTruncatedError:
                         bigger = min(predict * 2, MAX_NUM_PREDICT)
@@ -957,6 +961,7 @@ class AgentGateway:
         format_schema: dict[str, Any] | None = None,
         think: bool | None = None,
         role: str = "",
+        out_meta: list[dict[str, Any]] | None = None,
     ) -> str:
         async with httpx.AsyncClient(timeout=self.supervisor.timeout) as client:
             # 1) only `resolved` may be resident before we load
@@ -994,6 +999,10 @@ class AgentGateway:
                     "error": str(exc), "swaps": swaps,
                 })
                 raise
+            if out_meta is not None:
+                meta = dict(meta)
+                meta["num_ctx"] = num_ctx
+                out_meta.append(meta)
             # 3) verify GPU residency
             resident = await self._ps(client)
             entry = next((m for m in resident if m.get("name") == resolved), None)

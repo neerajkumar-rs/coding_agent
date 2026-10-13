@@ -55,12 +55,25 @@ class FakeOllama(BaseHTTPRequestHandler):
             return
         size = type(self).MODEL_SIZES.get(model, 1_000_000_000)
         type(self).loaded[model] = {"size": size, "size_vram": size}
+        # Answer must pass the role's quality checks: coder probe asks for a
+        # fenced greet function; the planner/validator/writer probes get the
+        # same text plus the shapes they check for.
+        prompt = payload.get("prompt", "")
+        if "atomic tasks as JSON" in prompt:
+            text = '[{"id": 1, "name": "greet", "target_files": ["hello.py"], "spec": "greet function"}]'
+        elif "PASS or CONCERNS" in prompt:
+            text = "PASS\nThe diff satisfies the spec."
+        elif "two plain sentences" in prompt:
+            text = "The function builds a greeting string. It returns Hello followed by the name."
+        else:
+            text = "```python\nhello.py\ndef greet(name: str) -> str:\n    return f'Hello, {name}!'\n```"
         self._json({
-            "response": "ok " * 40,
+            "response": text,
             "done": True,
             "done_reason": "stop",
             "eval_count": 40,
-            "total_duration": 500_000_000,
+            "eval_duration": 500_000_000,
+            "total_duration": 600_000_000,
         })
 
     def _json(self, body: dict) -> None:
@@ -150,6 +163,57 @@ def test_bench_coexist_verdict(fake_ollama: str) -> None:
             "--workspace", tmp, "--quick", "--coexist", "--ollama-url", fake_ollama,
         ])
         assert report["coexist_verdict"]
+
+
+# ---------------------------------------------------------------------------
+# Quality scoring: deterministic per-role checks; ok requires 100
+# ---------------------------------------------------------------------------
+
+def test_quality_score_planner() -> None:
+    q, detail = bench._quality_score(
+        "planner",
+        '[{"id": 1, "name": "greet", "target_files": ["hello.py"], "spec": "greet function"}]',
+    )
+    assert q == 100.0
+    assert all(d.endswith(":PASS") for d in detail)
+    q_bad, _ = bench._quality_score("planner", "I cannot make a plan, sorry.")
+    assert q_bad < 100.0
+
+
+def test_quality_score_coder_and_validator() -> None:
+    q, _ = bench._quality_score("coder", "```python\ndef greet(name: str) -> str:\n    return f'Hello'\n```")
+    assert q == 100.0
+    q_bad, _ = bench._quality_score("coder", "here is your code, no fence")
+    assert q_bad < 100.0
+    q_v, _ = bench._quality_score("validator", "PASS\nlooks fine")
+    assert q_v == 100.0
+    q_vbad, _ = bench._quality_score("validator", "seems okay I guess")
+    assert q_vbad < 100.0
+
+
+def test_quality_score_writer_rejects_think_tags() -> None:
+    q, _ = bench._quality_score("writer", "The function greets the user. It returns a string.")
+    assert q == 100.0
+    q_bad, _ = bench._quality_score("writer", "<think>hmm</think>It greets.")
+    assert q_bad < 100.0
+
+
+def test_score_is_quality_times_throughput(fake_ollama: str) -> None:
+    """A quality-failing model never lands in best_per_role."""
+    with TemporaryDirectory() as tmp:
+        save_agent_config(AgentConfig(), tmp)
+        report, code = bench.run([
+            "--workspace", tmp, "--quick", "--roles", "coder",
+            "--ollama-url", fake_ollama,
+        ])
+        assert code == bench.EXIT_OK
+        coder = next(r for r in report["results"] if r["role"] == "coder")
+        assert coder["ok"] is True
+        assert coder["quality"] == 100.0
+        # 40 eval tokens / 0.5s eval_duration = 80 tok/s; score = 100 * 80
+        assert coder["tok_per_s"] == 80.0
+        assert coder["score"] == 8000.0
+        assert coder["checks"] and all(":PASS" in c for c in coder["checks"])
 
 
 # ---------------------------------------------------------------------------

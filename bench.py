@@ -1,4 +1,11 @@
-"""Model role benchmark for the local Ollama pipeline.
+"""Model role benchmark for the local Ollama pipeline — quality-scored.
+
+Not "did the model respond" but "did it respond with something USABLE for the
+role": every probe answer passes deterministic per-role quality checks (JSON
+task shape for the planner, a fenced greet function for the coder, a
+PASS/CONCERNS verdict line for the validator, clean prose for the writer).
+Score = quality(0..100) x tok/s — a fast wrong answer never beats a slower
+right one.
 
 Headless and TUI-embeddable: run(argv) does the work and returns
 (report_dict, exit_code) without sys.exit; main() is a thin wrapper.
@@ -12,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -27,21 +35,83 @@ DEFAULT_OLLAMA = "http://localhost:11434"
 EXIT_OK = 0
 EXIT_OLLAMA_UNREACHABLE = 2
 
-# Role -> probe prompt. Small, schema-shaped where relevant.
-ROLE_PROBES: dict[str, str] = {
-    "planner": (
-        "Break this request into atomic tasks as JSON: "
-        '{"tasks": [{"id": 1, "name": "...", "target_files": ["..."], "spec": "..."}]}. '
-        "Request: create a Python CLI that greets the user by name."
-    ),
-    "coder": (
-        "Return one ```FILE: hello.py``` block containing a function "
-        "def greet(name: str) -> str that returns a greeting."
-    ),
-    "validator": (
-        "Reply PASS or CONCERNS on the first line, then one short reason. "
-        "Diff: +def greet(name): return f'Hello, {name}!'. Spec: greet by name."
-    ),
+
+# --- role probes: prompt + deterministic quality checks ----------------------
+# Each check is (name, predicate). Quality = 100 * passed / total; a role is
+# "ok" only at 100 (all checks pass).
+
+def _checks_planner(text: str) -> list[tuple[str, bool]]:
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    tasks: Any = None
+    if match:
+        try:
+            tasks = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            tasks = None
+    first = tasks[0] if isinstance(tasks, list) and tasks and isinstance(tasks[0], dict) else {}
+    files = first.get("target_files") or ([first.get("path")] if first.get("path") else [])
+    return [
+        ("json task array", isinstance(tasks, list) and len(tasks) >= 1),
+        ("task has files", bool(files)),
+        ("task has spec", bool(first.get("spec") or first.get("description"))),
+    ]
+
+
+def _checks_coder(text: str) -> list[tuple[str, bool]]:
+    has_fence = bool(re.search(r"```(?:\w+)?\n.*?```", text, re.DOTALL))
+    return [
+        ("fenced block", has_fence),
+        ("greet function", "def greet(" in text),
+        ("returns a string", "return" in text),
+    ]
+
+
+def _checks_validator(text: str) -> list[tuple[str, bool]]:
+    first = text.strip().splitlines()[0].strip().upper() if text.strip() else ""
+    return [
+        ("verdict first line", first.startswith(("PASS", "CONCERNS"))),
+        ("has a reason", len(text.strip().splitlines()) >= 1 and len(text.strip()) > 4),
+    ]
+
+
+def _checks_writer(text: str) -> list[tuple[str, bool]]:
+    stripped = text.strip()
+    return [
+        ("prose without think tags", "<think>" not in stripped.lower()),
+        ("at least one sentence", len(stripped) >= 20 and "." in stripped),
+    ]
+
+
+ROLE_PROBES: dict[str, dict[str, Any]] = {
+    "planner": {
+        "prompt": (
+            "Break this request into atomic tasks as JSON: "
+            '{"tasks": [{"id": 1, "name": "...", "target_files": ["..."], "spec": "..."}]}. '
+            "Request: create a Python CLI that greets the user by name."
+        ),
+        "checks": _checks_planner,
+    },
+    "coder": {
+        "prompt": (
+            "Return one ```FILE: hello.py``` block containing a function "
+            "def greet(name: str) -> str that returns a greeting."
+        ),
+        "checks": _checks_coder,
+    },
+    "validator": {
+        "prompt": (
+            "Reply PASS or CONCERNS on the first line, then one short reason. "
+            "Diff: +def greet(name): return f'Hello, {name}!'. Spec: greet by name."
+        ),
+        "checks": _checks_validator,
+    },
+    "writer": {
+        "prompt": (
+            "In two plain sentences, describe what a function named greet(name) "
+            "that returns f'Hello, {name}!' does. No code blocks, no preamble."
+        ),
+        "checks": _checks_writer,
+    },
 }
 
 
@@ -53,7 +123,10 @@ class RoleResult:
     seconds: float = 0.0
     output_chars: int = 0
     error: str = ""
-    score: float = 0.0  # higher = better (throughput proxy)
+    quality: float = 0.0   # 0..100: fraction of the role's checks passed
+    tok_per_s: float = 0.0  # Ollama eval tokens/s when reported, else chars/s
+    score: float = 0.0      # quality x tok/s (higher = better)
+    checks: list[str] = field(default_factory=list)  # "name:PASS/FAIL"
 
 
 @dataclass
@@ -98,7 +171,7 @@ def _role_models(config: AgentConfig, args: argparse.Namespace) -> dict[str, lis
 
 
 # Role names as the gateway knows them ("planner" is the thinker role there).
-_GATEWAY_ROLE = {"planner": "thinker", "coder": "coder", "validator": "validator"}
+_GATEWAY_ROLE = {"planner": "thinker", "coder": "coder", "validator": "validator", "writer": "writer"}
 
 
 class _BenchConfig:
@@ -131,18 +204,31 @@ class _BenchConfig:
 
 async def _probe_gateway(
     gateway: Any, role: str, prompt: str, num_predict: int
-) -> tuple[bool, float, int, str]:
+) -> tuple[bool, float, str, dict[str, Any], str]:
     """One probe through THE AgentGateway: single lock, VRAM guard, role
-    config. Returns (ok, seconds, output_chars, error)."""
+    config. Returns (ok, seconds, text, meta, error)."""
+    meta_box: list[dict[str, Any]] = []
     start = time.monotonic()
     try:
         text = await gateway.generate(
-            role, prompt, num_predict=num_predict, keep_warm=False
+            role, prompt, num_predict=num_predict, keep_warm=False,
+            out_meta=meta_box,
         )
         seconds = round(time.monotonic() - start, 3)
-        return True, seconds, len(text), ""
+        return True, seconds, text, (meta_box[0] if meta_box else {}), ""
     except Exception as exc:
-        return False, round(time.monotonic() - start, 3), 0, str(exc)[:300]
+        return False, round(time.monotonic() - start, 3), "", {}, str(exc)[:300]
+
+
+def _quality_score(role: str, text: str) -> tuple[float, list[str]]:
+    """Deterministic per-role checks -> (0..100, ["name:PASS/FAIL", ...])."""
+    checks_fn = ROLE_PROBES.get(role, ROLE_PROBES["coder"])["checks"]
+    results = checks_fn(text)
+    passed = sum(1 for _name, ok in results if ok)
+    total = len(results)
+    quality = round(100.0 * passed / total, 1) if total else 0.0
+    detail = [f"{name}:{'PASS' if ok else 'FAIL'}" for name, ok in results]
+    return quality, detail
 
 
 def _installed_models(client: httpx.Client, base: str) -> list[str]:
@@ -167,13 +253,14 @@ def _write_reports(report: BenchReport, workspace: Path) -> tuple[Path, Path]:
         f"# Benchmark report — {report.started_at}",
         f"Workspace: {report.workspace}",
         "",
-        "| Role | Model | OK | Seconds | Chars | Score | Error |",
-        "|---|---|---|---|---|---|---|",
+        "| Role | Model | OK | Quality | tok/s | Seconds | Score | Checks | Error |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for r in report.results:
         lines.append(
             f"| {r.role} | {r.model} | {'yes' if r.ok else 'no'} | "
-            f"{r.seconds:.2f} | {r.output_chars} | {r.score:.1f} | {r.error} |"
+            f"{r.quality:.0f} | {r.tok_per_s:.1f} | {r.seconds:.2f} | "
+            f"{r.score:.1f} | {', '.join(r.checks)} | {r.error} |"
         )
     lines.append("")
     lines.append("## Best per role")
@@ -186,12 +273,12 @@ def _write_reports(report: BenchReport, workspace: Path) -> tuple[Path, Path]:
 
 
 def _print_table(report: BenchReport) -> None:
-    print("\nBenchmark results")
-    print(f"{'Role':<12}{'Model':<30}{'OK':<5}{'Secs':>8}{'Chars':>8}{'Score':>8}  Error")
+    print("\nBenchmark results (score = quality x tok/s)")
+    print(f"{'Role':<12}{'Model':<30}{'OK':<5}{'Qual':>6}{'tok/s':>8}{'Secs':>8}{'Score':>8}  Error")
     for r in report.results:
         print(
-            f"{r.role:<12}{r.model:<30}{str(r.ok):<5}{r.seconds:>8.2f}"
-            f"{r.output_chars:>8}{r.score:>8.1f}  {r.error}"
+            f"{r.role:<12}{r.model:<30}{str(r.ok):<5}{r.quality:>6.0f}"
+            f"{r.tok_per_s:>8.1f}{r.seconds:>8.2f}{r.score:>8.1f}  {r.error}"
         )
     print("\nBest per role:")
     for role, model in report.best_per_role.items():
@@ -204,13 +291,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bench", description="Model role benchmark")
     parser.add_argument("--workspace", default=str(Path.cwd()))
     parser.add_argument("--quick", action="store_true", help="1 repeat, small probes")
-    parser.add_argument("--roles", default=None, help="comma list: planner,coder,validator")
+    parser.add_argument("--roles", default=None, help="comma list: planner,coder,validator,writer")
     parser.add_argument(
         "--compare", action="append", default=None,
         help="role=model1,model2 (repeatable)",
     )
     parser.add_argument("--repeat", type=int, default=2)
-    parser.add_argument("--plan-mode", default="single", choices=["single", "two-stage"])
     parser.add_argument("--coexist", action="store_true", help="test model coexistence")
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA)
     return parser
@@ -250,7 +336,8 @@ def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
         supervisor = OllamaSupervisorClient(base_url=args.ollama_url)
         gateway = AgentGateway(supervisor, config)
         for role, models in role_models.items():
-            prompt = ROLE_PROBES.get(role, ROLE_PROBES["coder"])
+            probe = ROLE_PROBES.get(role, ROLE_PROBES["coder"])
+            prompt = probe["prompt"]
             gw_role = _GATEWAY_ROLE.get(role, "coder")
             for model in models:
                 if model not in installed:
@@ -267,23 +354,42 @@ def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
                 best_score = -1.0
                 total_seconds = 0.0
                 ok_any = False
+                best_quality = 0.0
+                best_tps = 0.0
+                best_checks: list[str] = []
                 error = ""
                 for _ in range(repeat):
-                    ok, seconds, chars, error = await _probe_gateway(
+                    ok, seconds, text, meta, error = await _probe_gateway(
                         gateway, gw_role, prompt, num_predict
                     )
                     ok_any = ok_any or ok
                     total_seconds += seconds
-                    if ok and seconds > 0:
-                        best_score = max(best_score, chars / seconds)
+                    if not ok or seconds <= 0:
+                        continue
+                    quality, detail = _quality_score(role, text)
+                    eval_count = int(meta.get("eval_count", 0) or 0)
+                    eval_dur = int(meta.get("eval_duration", 0) or 0)
+                    tps = (eval_count / (eval_dur / 1e9)) if eval_dur else (len(text) / seconds)
+                    score = quality * tps
+                    if score > best_score:
+                        best_score = score
+                        best_quality = quality
+                        best_tps = tps
+                        best_checks = detail
                 avg = round(total_seconds / repeat, 3)
+                # ok = at least one call succeeded AND passed all quality checks
+                passed_all = ok_any and best_quality >= 100.0
                 result = RoleResult(
-                    role=role, model=model, ok=ok_any,
-                    seconds=avg, output_chars=0, error="" if ok_any else error,
+                    role=role, model=model, ok=passed_all,
+                    seconds=avg, output_chars=0,
+                    error="" if passed_all else (error or "quality checks failed"),
+                    quality=best_quality, tok_per_s=round(best_tps, 1),
                     score=round(best_score, 1) if best_score > 0 else 0.0,
+                    checks=best_checks,
                 )
                 report.results.append(result)
-                print(f"{role}/{model}: {'ok' if ok_any else 'FAIL'} ({avg}s avg)")
+                print(f"{role}/{model}: {'ok' if passed_all else 'FAIL'} "
+                      f"q={best_quality:.0f} {best_tps:.1f}tok/s ({avg}s avg)")
                 # keep_warm=False on each probe already unloaded; belt+braces:
                 await gateway.unload(model)
         gateway.config = config  # restore

@@ -313,7 +313,12 @@ while loading — that is normal and not a VRAM leak.
 
 ## Benchmarking
 
-Compare candidate models per role (planner / coder / validator) on real probes.
+Quality-scored role benchmark (planner / coder / validator / writer). Every
+probe answer passes deterministic per-role checks — planner: JSON task array
+with files+spec; coder: fenced `def greet(` returning a string; validator:
+PASS/CONCERNS verdict line; writer: clean prose, no think tags. A role is
+"ok" only at quality 100. **Score = quality × tok/s** (tok/s from Ollama's
+eval counts), so a fast wrong answer never beats a slower right one.
 Reports land in `<workspace>\.agent_runs\bench\` (JSON + Markdown).
 
 ```powershell
@@ -326,24 +331,24 @@ Reports land in `<workspace>\.agent_runs\bench\` (JSON + Markdown).
 .\env\Scripts\python.exe bench.py --workspace . --quick
 ```
 
-Inside the TUI (GPU-locked against plan/step so a benchmark never overlaps
+Inside the TUI (GPU-locked against runs so a benchmark never overlaps
 inference on the 4 GB card):
 
 ```
 /benchmark                                  all roles from .agent
 /benchmark --quick
-/benchmark --roles validator --repeat 3
-/benchmark --compare planner=erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest
-/benchmark --plan-mode two-stage
+/benchmark --roles writer --repeat 3
+/benchmark --compare coder=qwen2.5-coder:3b-instruct,qwen2.5-coder:1.5b
 /benchmark --coexist
 /benchmark last                             print the newest report
 /benchmark apply                            write recommended models into
                                             .agent "roles" (asks y/N first)
 ```
 
-Missing models are skipped with an `ollama pull <name>` hint. Models are
-unloaded (`keep_alive=0`) when the benchmark finishes. Ctrl-C cancels the
-benchmark and returns to the prompt without touching services.
+Missing models are skipped with an `ollama pull <name>` hint. All probes go
+through the single AgentGateway (one lock + VRAM guard); models are unloaded
+when the benchmark finishes. Ctrl-C cancels the benchmark and returns to the
+prompt without touching services.
 
 ---
 

@@ -600,6 +600,33 @@ def test_coder_never_gets_think_switch() -> None:
         server.shutdown(); server.server_close()
 
 
+# --- 12b. out_meta: callers can read Ollama meta without the on_call hook ----
+
+def test_out_meta_delivers_eval_counts() -> None:
+    server, base = _serve()
+    try:
+        gw = _gateway(base)
+        box: list[dict] = []
+        out = _run(gw.generate("coder", "ping", out_meta=box))
+        assert out == "OK"
+        assert len(box) == 1
+        meta = box[0]
+        assert meta["eval_count"] == 2
+        assert meta["eval_duration"] == 500_000
+        assert meta["done_reason"] == "stop"
+        assert meta["num_ctx"] == 6144  # the rung actually used
+        # failure leaves the box empty
+        FakeOllama.fail_times = 99  # every generate 500s -> all rungs OOM
+        box2: list[dict] = []
+        try:
+            _run(gw.generate("coder", "ping", out_meta=box2))
+        except Exception:
+            pass
+        assert box2 == []
+    finally:
+        server.shutdown(); server.server_close()
+
+
 # --- 12c. probe_ctx: one tiny generation at an exact ctx, no step-down -------
 
 def test_probe_ctx_ok_and_fraction() -> None:
