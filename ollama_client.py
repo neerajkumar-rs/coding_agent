@@ -598,7 +598,22 @@ class AgentGateway:
         self._lock = asyncio.Lock()
         self.supervisor._vram_mutex = self._lock
         self._resident_model: str | None = None
+        # Optional per-run observability hook: set by the server for the
+        # duration of one run to stream a full per-call record (prompt,
+        # answer, think_chars, done_reason, eval_count, num_ctx used,
+        # size_vram/size, swaps) into the run journal. Never breaks a run:
+        # hook exceptions are swallowed.
+        self.on_call: Any | None = None
         _print_sysmem_hint_once()
+
+    def _fire_on_call(self, record: dict[str, Any]) -> None:
+        hook = self.on_call
+        if hook is None:
+            return
+        try:
+            hook(record)
+        except Exception:
+            logger.warning("on_call hook failed", exc_info=True)
 
     @property
     def base_url(self) -> str:
@@ -622,13 +637,24 @@ class AgentGateway:
         except httpx.HTTPError as exc:
             logger.warning(f"unload {model} failed: {exc}")
 
+    async def unload(self, model: str) -> None:
+        """Public keep_alive=0 unload — the ONLY sanctioned /api/generate post
+        outside a guarded generate. Callers (the server's cancel path, bench)
+        use this instead of posting to /api/generate themselves."""
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            await self._unload(client, model)
+            if self._resident_model == model:
+                self._resident_model = None
+
     async def _ensure_only_resident(
         self, client: httpx.AsyncClient, target: str
-    ) -> None:
+    ) -> list[dict[str, Any]]:
         """Before loading `target`: unload every other resident model and poll
-        /api/ps until only `target` (or nothing) remains. 15 s timeout."""
+        /api/ps until only `target` (or nothing) remains. 15 s timeout.
+        Returns the swaps performed: [{"from", "to", "seconds"}]."""
         import time as _time
 
+        swaps: list[dict[str, Any]] = []
         deadline = _time.monotonic() + 15.0
         while True:
             resident = [m.get("name", "") for m in await self._ps(client)]
@@ -637,23 +663,39 @@ class AgentGateway:
                 if len(resident) > 1:
                     raise VramGuardError(f"two models resident: {resident} (expected at most one)")
                 self._resident_model = resident[0] if resident else None
-                return
+                return swaps
             for m in others:
                 t0 = _time.monotonic()
                 logger.info(f"[VRAM guard] unloading {m} to make room for {target}")
                 await self._unload(client, m)
-                logger.info(f"[VRAM guard] swap {m} -> {target} took {_time.monotonic()-t0:.2f}s")
+                seconds = round(_time.monotonic() - t0, 3)
+                swaps.append({"from": m, "to": target, "seconds": seconds})
+                logger.info(f"[VRAM guard] swap {m} -> {target} took {seconds:.2f}s")
             if _time.monotonic() > deadline:
                 raise VramGuardError(f"could not unload resident models {others} within 15s")
             await asyncio.sleep(0.25)
 
-    def think_supported(self, model: str) -> bool | None:
-        """Cached capability probe result for *model* (by exact name), or None
-        when never probed. Probe lives in ``probe_capabilities``; nothing is
-        ever assumed."""
+    def capability_entry(self, model: str) -> dict[str, Any]:
+        """The cached capability entry for a model name, or {} when never
+        probed. The cache is keyed by digest12 (falling back to the model
+        name when no digest was seen); every entry carries its resolved
+        ``model``, so a small scan finds it regardless of the key."""
         caps = (self.config.extra or {}).get("capabilities", {})
-        entry = caps.get(model) if isinstance(caps, dict) else None
-        if isinstance(entry, dict) and "supports_think_param" in entry:
+        if not isinstance(caps, dict):
+            return {}
+        direct = caps.get(model)
+        if isinstance(direct, dict):
+            return direct
+        for entry in caps.values():
+            if isinstance(entry, dict) and entry.get("model") == model:
+                return entry
+        return {}
+
+    def think_supported(self, model: str) -> bool | None:
+        """Cached capability probe result for *model*, or None when never
+        probed. Probe lives in ``probe_capabilities``; nothing is assumed."""
+        entry = self.capability_entry(model)
+        if "supports_think_param" in entry:
             return bool(entry["supports_think_param"])
         return None
 
@@ -700,7 +742,11 @@ class AgentGateway:
                 except httpx.HTTPError as exc:
                     entry["probe_error"] = str(exc)
         caps = dict((self.config.extra or {}).get("capabilities", {}))
-        caps[resolved] = entry
+        # Keyed by digest12 when known (a re-pulled name gets a fresh entry);
+        # the resolved model name is the fallback key.
+        digest = str(entry.get("digest", "")).removeprefix("sha256:")
+        entry["digest12"] = digest[:12] or None
+        caps[digest[:12] or resolved] = entry
         extra = dict(self.config.extra or {})
         extra["capabilities"] = caps
         self.config.extra = extra
@@ -717,6 +763,7 @@ class AgentGateway:
         cancel_event: Any | None = None,
         keep_warm: bool = True,
         think: bool | None = None,
+        schema: dict[str, Any] | None = None,
         _format_schema: dict[str, Any] | None = None,
     ) -> str:
         """Role-based generation under the single lock, with the VRAM guard.
@@ -728,7 +775,13 @@ class AgentGateway:
         the system text prepended to the prompt, per DeepSeek's guidance.
         ``think`` is only ever sent when it is not None — callers pass
         ``think=False`` only for models whose capability probe confirmed it.
+        ``schema`` (alias ``_format_schema``) adds Ollama structured output.
+        A response cut off mid-think (done_reason=length) is retried ONCE with
+        a doubled num_predict (bounded by MAX_NUM_PREDICT), then raised as
+        OllamaTruncatedError — a truncation is a failure, never a valid answer.
         """
+        if schema is not None:
+            _format_schema = schema
         rc = self.config.get_role_config(role)
         model = str(rc["model"])
         resolved = await self.supervisor.resolve_model_name(model)
@@ -754,23 +807,36 @@ class AgentGateway:
             last_exc: Exception | None = None
             for attempt_ctx in reversed(rungs):
                 ctx = attempt_ctx
-                try:
-                    return await self._generate_guarded(
-                        resolved, prompt, system=system, num_ctx=ctx,
-                        num_predict=effective_predict,
-                        temperature=temp, cancel_event=cancel_event,
-                        keep_warm=keep_warm, format_schema=_format_schema,
-                        think=think, role=role,
-                    )
-                except (VramGuardError,) as exc:
-                    last_exc = exc
-                    logger.warning(f"[VRAM guard] {exc}; stepping num_ctx down to next rung")
-                except OllamaError as exc:
-                    # OOM / runner stopped / HTTP 500 -> same step-down retry
-                    if "memory" in str(exc).lower() or "runner stopped" in str(exc).lower() or "500" in str(exc):
+                predict = effective_predict
+                for trunc_retry in range(2):  # one truncation retry per rung
+                    try:
+                        return await self._generate_guarded(
+                            resolved, prompt, system=system, num_ctx=ctx,
+                            num_predict=predict,
+                            temperature=temp, cancel_event=cancel_event,
+                            keep_warm=keep_warm, format_schema=_format_schema,
+                            think=think, role=role,
+                        )
+                    except OllamaTruncatedError:
+                        bigger = min(predict * 2, MAX_NUM_PREDICT)
+                        if trunc_retry == 0 and bigger > predict:
+                            logger.warning(
+                                f"[truncation] {resolved} cut off at num_predict={predict}; "
+                                f"retrying once with num_predict={bigger}"
+                            )
+                            predict = bigger
+                            continue
+                        raise
+                    except (VramGuardError,) as exc:
                         last_exc = exc
                         logger.warning(f"[VRAM guard] {exc}; stepping num_ctx down to next rung")
-                    else:
+                        break
+                    except OllamaError as exc:
+                        # OOM / runner stopped / HTTP 500 -> same step-down retry
+                        if "memory" in str(exc).lower() or "runner stopped" in str(exc).lower() or "500" in str(exc):
+                            last_exc = exc
+                            logger.warning(f"[VRAM guard] {exc}; stepping num_ctx down to next rung")
+                            break
                         raise
             raise VramGuardError(
                 f"{resolved} never reached GPU fraction >= {self.min_gpu_fraction} "
@@ -827,7 +893,7 @@ class AgentGateway:
     ) -> str:
         async with httpx.AsyncClient(timeout=self.supervisor.timeout) as client:
             # 1) only `resolved` may be resident before we load
-            await self._ensure_only_resident(client, resolved)
+            swaps = await self._ensure_only_resident(client, resolved)
             if self.watchdog:
                 _log_vram("before load")
             # 2) generate (load+run; we already hold the single lock, so use
@@ -848,6 +914,18 @@ class AgentGateway:
                 # Cancel: unload whatever is resident so nothing lingers on GPU.
                 await self._unload(client, resolved)
                 self._resident_model = None
+                self._fire_on_call({
+                    "role": role, "model": resolved, "prompt": prompt,
+                    "response": "", "temperature": temperature, "num_ctx": num_ctx,
+                    "error": "cancelled", "swaps": swaps,
+                })
+                raise
+            except Exception as exc:
+                self._fire_on_call({
+                    "role": role, "model": resolved, "prompt": prompt,
+                    "response": "", "temperature": temperature, "num_ctx": num_ctx,
+                    "error": str(exc), "swaps": swaps,
+                })
                 raise
             # 3) verify GPU residency
             resident = await self._ps(client)
@@ -859,6 +937,17 @@ class AgentGateway:
             fraction = (size_vram / size) if size else 0.0
             if self.watchdog:
                 _log_vram("after load")
+            self._fire_on_call({
+                "role": role, "model": resolved, "prompt": prompt, "response": text,
+                "temperature": temperature, "num_ctx": num_ctx,
+                "seconds": round(meta.get("total_duration", 0) / 1e9, 3),
+                "think_chars": meta.get("think_chars"),
+                "done_reason": meta.get("done_reason"),
+                "eval_count": meta.get("eval_count"),
+                "eval_duration_ns": meta.get("eval_duration"),
+                "size_vram": size_vram, "size_total": size,
+                "swaps": swaps,
+            })
             if fraction < self.min_gpu_fraction:
                 await self._unload(client, resolved)
                 self._resident_model = None

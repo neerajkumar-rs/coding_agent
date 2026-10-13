@@ -180,6 +180,23 @@ async def health_check() -> dict[str, Any]:
     }
 
 
+def _capability_entry(caps: Any, model: str) -> dict[str, Any]:
+    """Find the capability-probe cache entry for a model name.
+
+    The cache may be keyed by digest or by name (probe-time keying); entries
+    always carry their resolved ``model``, so a small scan works for both.
+    """
+    if not isinstance(caps, dict):
+        return {}
+    direct = caps.get(model)
+    if isinstance(direct, dict):
+        return direct
+    for entry in caps.values():
+        if isinstance(entry, dict) and entry.get("model") == model:
+            return entry
+    return {}
+
+
 def _base_model_warning(name: str, quant: str) -> str | None:
     """Heuristic: a name with no instruct/chat/code suffix, or a base quant,
     is likely a base (non-instruction-tuned) model — warn for the thinker."""
@@ -279,25 +296,26 @@ async def update_role(payload: RoleUpdateRequest) -> dict[str, Any]:
     role ceiling.
     """
     state.ensure_workspace(payload.workspace_dir)
-    role = "thinker" if payload.role == "planner" else payload.role
-    if role not in ("thinker", "coder", "validator"):
+    from agent_config import ROLE_NAMES, RoleRegistry, canonical_role
+
+    role = canonical_role(payload.role)
+    if role not in ROLE_NAMES:
         raise HTTPException(status_code=400, detail=f"unknown role: {payload.role}")
 
+    registry = RoleRegistry(state.config, state.workspace_root)
+    updates: dict[str, Any] = {}
     if payload.model:
         # Exact-match validate against installed models before accepting.
         try:
-            resolved = await state.ollama.resolve_model_name(payload.model)
+            updates["model"] = await state.ollama.resolve_model_name(payload.model)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        state.config.roles[role]["model"] = resolved
     if payload.num_ctx is not None:
-        from agent_config import ROLE_CTX_CEILINGS
-
-        ceiling = ROLE_CTX_CEILINGS.get(role, 16384)
-        state.config.roles[role]["num_ctx"] = max(512, min(int(payload.num_ctx), ceiling))
-
-    save_agent_config(state.config, state.workspace_root)
-    cfg = state.config.get_role_config(role)
+        updates["num_ctx"] = payload.num_ctx
+    try:
+        cfg = registry.set(role, **updates)  # validates, clamps, persists
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     logger.info(f"role {role} updated: model={cfg['model']} num_ctx={cfg['num_ctx']}")
     return {"status": "ok", "role": role, "config": cfg}
 
@@ -305,9 +323,10 @@ async def update_role(payload: RoleUpdateRequest) -> dict[str, Any]:
 @app.post("/workspace/init")
 async def workspace_init(payload: InitRequest) -> dict[str, Any]:
     """1. POST /workspace/init
-    
-    Accepts root path. Initializes or parses .agent configuration, builds
-    staging (.agent_staging/), and creates logging structures (.agent_logs/).
+
+    Accepts root path. Initializes or parses .agent configuration and builds
+    the staging sandbox (.agent_staging/). Run logging is per-run under
+    .agent_runs/<run_id>/ (created when a run starts).
     """
     target_root = Path(payload.root_path).resolve()
     target_root.mkdir(parents=True, exist_ok=True)
@@ -343,7 +362,7 @@ async def workspace_init(payload: InitRequest) -> dict[str, Any]:
         "workspace_root": str(state.workspace_root),
         "agent_config": state.config.to_dict(),
         "staging_dir": str(state.staging.staging_dir),
-        "logs_dir": str(state.staging.logs_dir),
+        "runs_dir": str(state.workspace_root / ".agent_runs"),
         "system_awareness": awareness["summary"],
     }
 
@@ -399,11 +418,7 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
 
     async def _unload(model: str) -> None:
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                await client.post(
-                    f"{state.ollama.base_url}/api/generate",
-                    json={"model": model, "prompt": "", "keep_alive": 0, "stream": False},
-                )
+            await gateway.unload(model)
         except Exception as exc:
             logger.warning(f"model unload failed for {model}: {exc}")
 
@@ -445,6 +460,29 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
     router_cfg = state.config.router
     thinker_cfg = state.config.get_role_config("thinker")
 
+    # Per-run journal, created HERE so the gateway's on_call hook streams the
+    # full per-call record (prompt, answer, think_chars, done_reason,
+    # eval_count, num_ctx used, size_vram/size, swaps) into it. The pipeline
+    # logs nothing itself on this path (log_llm_calls=False) — one logging
+    # path, exactly one record per call.
+    from agent_core.run_state import RunJournal
+
+    journal = RunJournal(state.workspace_root)
+    run_swaps: list[dict[str, Any]] = []
+    num_ctx_used: list[dict[str, Any]] = []
+
+    def _on_call(record: dict[str, Any]) -> None:
+        rec = dict(record)
+        for sw in rec.pop("swaps", None) or []:
+            run_swaps.append(sw)
+            journal.emit_event({"event": "model_swap", **sw})
+        role = str(rec.pop("role", "") or "thinker")
+        num_ctx_used.append(
+            {"role": role, "model": rec.get("model"), "num_ctx": rec.get("num_ctx")}
+        )
+        journal.log_llm_call(role, **rec)
+
+    gateway.on_call = _on_call
     try:
         result = await run_pipeline(
             payload.prompt,
@@ -454,6 +492,7 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
             coder_model=state.config.coder_model,
             unload=_unload,
             cancel_event=cancel_event,
+            journal=journal,
             num_ctx=state.config.max_context_tokens,
             structured_generate=_structured_generate,
             confirm=confirm_cb,
@@ -462,17 +501,42 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
             chat_use_llm=bool(router_cfg.get("chat_use_llm", False)),
             think_supported=gateway.think_supported(state.config.planner_model),
             think_budget=int(thinker_cfg.get("think_budget", 512)),
+            log_llm_calls=False,
         )
         if result.get("status") == "cancelled":
             # Cancel is a normal outcome, not a 500: unload whatever is resident.
             await _unload(state.config.coder_model)
             await _unload(state.config.planner_model)
+        # Enrich state.json with what only the server knows: swaps with
+        # seconds, num_ctx actually used per call, per-role cards (model,
+        # digest12, supports_think_param from the capability probe cache).
+        try:
+            state_data = json.loads(journal.state_path.read_text(encoding="utf-8"))
+            caps = (state.config.extra or {}).get("capabilities", {})
+            roles_state: dict[str, Any] = {}
+            for role_name in ("thinker", "coder", "validator"):
+                rc = state.config.get_role_config(role_name)
+                entry = _capability_entry(caps, str(rc.get("model")))
+                roles_state[role_name] = {
+                    "model": rc.get("model"),
+                    "num_ctx": rc.get("num_ctx"),
+                    "digest12": str(entry.get("digest", ""))[:12] or None,
+                    "supports_think_param": entry.get("supports_think_param"),
+                }
+            state_data["roles"] = roles_state
+            state_data["swaps"] = run_swaps
+            state_data["num_ctx_used"] = num_ctx_used
+            journal.save_state(state_data)
+        except Exception:
+            logger.warning("state.json enrichment failed", exc_info=True)
         return result
     except HTTPException:
         raise
     except Exception as exc:
         logger.error(f"agent run failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        gateway.on_call = None
 
 
 @app.post("/agent/cancel")

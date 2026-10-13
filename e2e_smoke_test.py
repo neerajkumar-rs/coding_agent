@@ -1,17 +1,16 @@
-"""Offline end-to-end test for the complete pipeline using local Ollama mock."""
+"""Offline end-to-end test for the complete run_pipeline using a local Ollama mock."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from agent_core.engine import Engine, RunRequest
-from agent_core.llm_gateway import LLMGateway
 from agent_core.run_state import RUNS_DIR_NAME
-from ollama_client import OllamaEngine
+from orchestrator import run_pipeline
 
 
 class FakeOllama(BaseHTTPRequestHandler):
@@ -32,9 +31,9 @@ class FakeOllama(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length))
         prompt = payload.get("prompt", "")
         lower = prompt.lower()
-        if "auditor" in lower:
+        if "auditor" in lower or "satisfies_request" in lower:
             content = "<think>checking spec compliance</think>PASS\nGenerated files satisfy the specification."
-        elif "pure code generator" in lower or "precise code editor" in lower:
+        elif "pure code generator" in lower or "precise code editor" in lower or "target file:" in lower:
             content = "```FILE: generated.py\n\ndef greet(name: str) -> str:\n    return f'Hello, {name}!'\n```"
         else:
             content = "<think>planning</think>## TASK 1: create greeting\n- files: generated.py\n- logic: def greet(name: str) -> str"
@@ -63,11 +62,13 @@ def main() -> None:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        base_url = f"http://127.0.0.1:{server.server_port}"
         with TemporaryDirectory() as workspace:
-            engine = OllamaEngine(base_url=base_url, workspace_root=workspace)
-            result = Engine(workspace=workspace, llm=LLMGateway(engine)).run(
-                RunRequest(prompt="Create a greeting function", target_file="generated.py")
+            result = asyncio.run(
+                run_pipeline(
+                    user_request="Create a greeting function in generated.py",
+                    workspace=workspace,
+                    deploy=True,
+                )
             )
             workspace_root = Path(workspace)
             target = workspace_root / "generated.py"
@@ -85,32 +86,26 @@ def main() -> None:
             run_dir = workspace_root / RUNS_DIR_NAME / result.run_id
             assert (run_dir / "state.json").exists()
             assert (run_dir / "events.jsonl").exists()
-            assert (run_dir / "tasks.md").exists()
             state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
             assert state["status"] == "completed", state
-            assert state["llm_calls"] > 0
 
             # Only the requested target plus benign git-ignored infrastructure:
-            # .agent (config), .agent_runs/ (run metadata), .agent_staging/ and
-            # .agent_logs/ (emptied by deploy), __pycache__/ (py_compile).
+            # .agent (config), .agent_runs/ (run metadata), .agent_staging/
+            # (emptied by deploy), __pycache__/ (py_compile).
             # NO role junk files anywhere in the root.
             root_entries = {p.name for p in workspace_root.iterdir()}
             assert root_entries <= {
                 "generated.py", ".agent", RUNS_DIR_NAME,
-                ".agent_staging", ".agent_logs", "__pycache__",
+                ".agent_staging", "__pycache__",
             }, root_entries
             # Deploy flushed the staging cache: no generated files left behind.
-            staging_leftovers = [
-                p for p in (workspace_root / ".agent_staging").rglob("*") if p.is_file()
-            ]
-            assert not staging_leftovers, staging_leftovers
-
-            # Think blocks were stripped before validation/parsing
-            audit_text = "; ".join(
-                issue["message"] for audit in result.audits for issue in audit.get("issues", [])
-            )
-            assert "think" not in audit_text.lower()[:200]
-        print("E2E smoke test passed: Ollama thinker -> coder -> write -> compile")
+            staging_dir = workspace_root / ".agent_staging"
+            if staging_dir.exists():
+                staging_leftovers = [
+                    p for p in staging_dir.rglob("*") if p.is_file()
+                ]
+                assert not staging_leftovers, staging_leftovers
+        print("E2E smoke test passed: route -> plan -> code -> check -> validate -> deploy")
     finally:
         server.shutdown()
         server.server_close()

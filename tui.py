@@ -86,7 +86,7 @@ OLLAMA_TAGS_URL = OLLAMA_BASE + "/api/tags"
 _set_fastapi_port(FASTAPI_PORT)  # initializes HEALTH_URL/RUN_URL/... consistently
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-LOG_DIR = PROJECT_ROOT / ".agent_logs"
+LOG_DIR = PROJECT_ROOT / "logs"  # service logs only (ollama_service.log, fastapi_service.log)
 LOG_DIR.mkdir(exist_ok=True)
 
 console = Console()
@@ -796,7 +796,7 @@ def show_help() -> None:
             "/save        save staged files into the workspace (/deploy alias)\n"
             "/cancel      cancel the in-progress run for this workspace\n"
             "/router <t>  show how a message would be routed (tier, scores, intent)\n"
-            "/logs        tail planner · coder · sandbox logs\n"
+            "/logs [role|events] [N]  tail the latest run's logs (default 60 lines)\n"
             "/models      list installed Ollama models\n"
             "/clear       clear screen\n"
             "/quit        stop all services and exit",
@@ -957,6 +957,18 @@ def print_header(workspace: str) -> None:
 def pluralize(n: int, word: str) -> str:
     """'1 file' / '2 files'."""
     return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def format_run_logs_text(workspace: str | Path, channel: str = "", lines: int = 60) -> str:
+    """Plain-text rendering of the active workspace's latest run logs.
+
+    Registry-driven (agent_core.run_state.LOG_CHANNELS): any channel added
+    there is readable here with zero code change. Used by the Rich TUI's
+    /logs and importable by tests; the Textual TUI renders the same data
+    with its own markup wrapper."""
+    from agent_core.run_state import format_run_logs, tail_run_logs
+
+    return format_run_logs(tail_run_logs(workspace, channel, lines))
 
 
 def format_router_diagnosis(diag: dict, t2_note: str | None = None) -> str:
@@ -1439,13 +1451,16 @@ async def main() -> None:
             elif command.startswith("/router"):
                 await run_router_slash(text.strip()[len("/router"):].strip(), workspace)
 
-            elif command == "/logs":
-                for log_file in ("planner.log", "coder.log", "sandbox.log",
-                                 "ollama_service.log", "fastapi_service.log"):
-                    p = LOG_DIR / log_file
-                    if p.exists():
-                        tail = p.read_text(encoding="utf-8", errors="replace")[-1500:]
-                        console.print(Panel(tail, title=log_file, border_style="bright_blue"))
+            elif command.startswith("/logs"):
+                args = text.strip()[len("/logs"):].split()
+                channel = args[0] if args else ""
+                count = 60
+                if len(args) > 1 and args[1].isdigit():
+                    count = int(args[1])
+                console.print(Panel(
+                    format_run_logs_text(workspace, channel, count),
+                    title="logs", border_style="bright_blue",
+                ))
 
             elif text.strip():
                 await submit(text, workspace)

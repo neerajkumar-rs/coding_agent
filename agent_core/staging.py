@@ -15,7 +15,7 @@ from agent_core.coder import ALLOWED_TARGET_SUFFIXES
 from workspace_staging import WorkspaceStagingManager
 
 # Path segments that must never be written or deployed to.
-PROTECTED_SEGMENTS = {".git", ".agent", ".agent_runs", ".agent_staging", ".agent_logs", "env", ".venv", "__pycache__"}
+PROTECTED_SEGMENTS = {".git", ".agent", ".agent_runs", ".agent_staging", "env", ".venv", "__pycache__"}
 
 
 class PathEscapeError(ValueError):

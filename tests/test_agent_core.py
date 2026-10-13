@@ -1,43 +1,25 @@
-"""Phase 2 tests: structured outputs, planner fallback, engine sessions."""
+"""agent_core library tests: schemas, coder parsing, session registry.
+
+The Engine/VibeOrchestrator pipeline is retired; run_pipeline is the only
+pipeline. The two old ``engine.run(...)`` behaviour tests are ported here onto
+run_pipeline's fake ``generate`` seam (auto-deploy + staging retention).
+"""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from agent_core.engine import get_engine
+from agent_core.schemas import AuditResult, Plan
+from orchestrator import run_pipeline
+
 import pytest
 
-from agent_core.engine import Engine, RunRequest, get_engine
-from agent_core.llm_gateway import LegacyLLMAdapter, StructuredOutputError
-from agent_core.planner import parse_markdown_tasks, plan_tasks
-from agent_core.schemas import AuditResult, Plan
-
-
-class FakeStructuredLLM:
-    """Scriptable llm with native structured support (like LLMGateway)."""
-
-    supports_structured = True
-
-    def __init__(self, structured_payloads=None, text_responses=None, fail_structured=0):
-        self.structured_payloads = list(structured_payloads or [])
-        self.text_responses = list(text_responses or [])
-        self.fail_structured = fail_structured
-        self.structured_calls = 0
-        self.text_calls = 0
-
-    def text(self, model, prompt, **kwargs):
-        self.text_calls += 1
-        return self.text_responses.pop(0) if self.text_responses else "PASS\nok"
-
-    def structured(self, model, prompt, schema, **kwargs):
-        self.structured_calls += 1
-        if self.fail_structured > 0:
-            self.fail_structured -= 1
-            raise StructuredOutputError("bad schema", retryable=False)
-        payload = self.structured_payloads.pop(0)
-        return schema.model_validate(payload)
-
+PLANNER = "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
+CODER = "qwen2.5-coder:3b-instruct"
 
 PLAN_PAYLOAD = {
     "tasks": [
@@ -49,8 +31,42 @@ PLAN_PAYLOAD = {
         }
     ]
 }
-GOOD_CODE = "```FILE: generated.py\n\ndef greet(name: str) -> str:\n    return f'Hello, {name}!'\n```"
-AUDIT_PAYLOAD = {"verdict": "pass", "issues": []}
+GREETER_PLAN = json.dumps([
+    {"path": "generated.py", "action": "create",
+     "description": "Python module with a greet(name) -> str function"},
+])
+GREETER_CODE = (
+    "```python\n"
+    "def greet(name: str) -> str:\n"
+    "    return f'Hello, {name}!'\n"
+    "```"
+)
+VALIDATE_OK = json.dumps({
+    "satisfies_request": True, "problems": [], "summary": "Greeter module."
+})
+
+
+def _fake_generate(routes: dict[str, str]):
+    import re
+
+    async def fake(model, prompt, system="", temperature=0.2, **kwargs):
+        target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
+        if target and f"TARGET FILE: {target.group(1)}" in routes:
+            return routes[f"TARGET FILE: {target.group(1)}"]
+        for marker in sorted(routes, key=len, reverse=True):
+            if marker in prompt:
+                return routes[marker]
+        return ""
+
+    return fake
+
+
+def _greeter_fake():
+    return _fake_generate({
+        "JSON array of tasks": GREETER_PLAN,
+        "TARGET FILE: generated.py": GREETER_CODE,
+        "satisfies_request": VALIDATE_OK,
+    })
 
 
 def test_plan_schema_validation() -> None:
@@ -68,69 +84,44 @@ def test_audit_schema_validation() -> None:
         AuditResult.model_validate({"verdict": "maybe", "issues": []})
 
 
-def test_structured_planner_path_used_when_supported() -> None:
-    llm = FakeStructuredLLM(structured_payloads=[PLAN_PAYLOAD])
-    tasks, raw = plan_tasks(llm, "planner", "make a greeter", "(empty)", "/tmp/ws")
-    assert llm.structured_calls == 1 and llm.text_calls == 0
-    assert tasks[0]["name"] == "create greeting"
-    assert tasks[0]["target_files"] == ["generated.py"]
-
-
-def test_planner_falls_back_to_markdown_on_structured_failure() -> None:
-    llm = FakeStructuredLLM(
-        fail_structured=1,
-        text_responses=["## TASK 1: greeter\n- files: generated.py\n- logic: greet func"],
-    )
-    tasks, _ = plan_tasks(llm, "planner", "make a greeter", "(empty)", "/tmp/ws")
-    assert llm.structured_calls == 1 and llm.text_calls == 1
-    assert tasks[0]["name"] == "greeter"
-    assert tasks[0]["target_files"] == ["generated.py"]
-
-
-def test_markdown_task_parser_minimal_fallback() -> None:
-    tasks = parse_markdown_tasks("some prose with no task headers")
-    assert len(tasks) == 1
-    assert tasks[0]["name"] == "primary implementation"
-
-
-def test_engine_happy_path_via_structured_llm() -> None:
+def test_run_pipeline_happy_path_deploys() -> None:
+    """Ported from the retired Engine.run happy-path test: a full run through
+    run_pipeline stages the file, and /save-style deploy lands it on disk."""
     with TemporaryDirectory() as tmp:
-        llm = FakeStructuredLLM(
-            structured_payloads=[PLAN_PAYLOAD, AUDIT_PAYLOAD],
-            text_responses=[GOOD_CODE],
-        )
-        engine = Engine(workspace=tmp, llm=llm)
-        report = engine.run(RunRequest(prompt="Create a greeting function"))
-        assert report.status == "completed", report
+        result = asyncio.run(run_pipeline(
+            "create generated.py with a greeting function",
+            tmp,
+            generate=_greeter_fake(),
+            planner_model=PLANNER,
+            coder_model=CODER,
+        ))
+        assert result["staged_files"] == ["generated.py"]
+        # run_pipeline stages; deploy happens via the staging manager (/save).
+        from workspace_staging import WorkspaceStagingManager
+        mgr = WorkspaceStagingManager(tmp)
+        outcome = mgr.deploy_staged_files()
+        assert outcome["status"] == "success"
+        assert "generated.py" in outcome["deployed_files"]
         assert (Path(tmp) / "generated.py").exists()
-        assert report.llm_calls == 3  # plan + code + audit
-        # Staging flushed after auto-deploy
+        # Staging flushed after deploy
         assert not list((Path(tmp) / ".agent_staging").rglob("*"))
 
 
-def test_engine_without_auto_deploy_keeps_staging() -> None:
+def test_run_pipeline_stages_without_deploy() -> None:
+    """Ported from the retired Engine.run auto_deploy=False test: the file is
+    staged under .agent_staging/ and the workspace root stays untouched until
+    the user explicitly saves."""
     with TemporaryDirectory() as tmp:
-        llm = FakeStructuredLLM(
-            structured_payloads=[PLAN_PAYLOAD, AUDIT_PAYLOAD],
-            text_responses=[GOOD_CODE],
-        )
-        engine = Engine(workspace=tmp, llm=llm)
-        report = engine.run(RunRequest(prompt="g", auto_deploy=False))
-        assert report.status == "completed"
+        result = asyncio.run(run_pipeline(
+            "create generated.py with a greeting function",
+            tmp,
+            generate=_greeter_fake(),
+            planner_model=PLANNER,
+            coder_model=CODER,
+        ))
+        assert result["staged_files"] == ["generated.py"]
         assert not (Path(tmp) / "generated.py").exists()
         assert (Path(tmp) / ".agent_staging" / "generated.py").exists()
-
-
-def test_legacy_adapter_routes_chat_and_blocks_structured() -> None:
-    class Stub:
-        def chat(self, model, prompt, system="", max_tokens=None, temperature=0.1):
-            return "raw text"
-
-    adapter = LegacyLLMAdapter(Stub())
-    assert adapter.supports_structured is False
-    assert adapter.text("m", "p") == "raw text"
-    with pytest.raises(StructuredOutputError):
-        adapter.structured("m", "p", Plan)
 
 
 def test_session_registry_is_per_workspace() -> None:
@@ -139,3 +130,7 @@ def test_session_registry_is_per_workspace() -> None:
         assert ea is not eb
         assert get_engine(a) is ea  # same workspace -> same session
         assert get_engine(Path(a) / ".") is ea
+        # The registry exists only to carry one cancel event per workspace.
+        ea.cancel()
+        assert ea._cancel_event.is_set()
+        assert not eb._cancel_event.is_set()

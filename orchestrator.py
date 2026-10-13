@@ -99,7 +99,7 @@ def classify_request(user_request: str) -> str:
 # FILE_QUESTION: deterministic workspace facts (depth-2 tree + per-file stats)
 # ---------------------------------------------------------------------------
 
-FILE_Q_SKIP_DIRS = {".git", ".agent_staging", ".agent_runs", ".agent_logs",
+FILE_Q_SKIP_DIRS = {".git", ".agent_staging", ".agent_runs",
                     "node_modules", "__pycache__", "env", ".venv", "venv"}
 FILE_Q_MAX_ENTRIES = 200
 FILE_Q_MAX_DETAIL = 20
@@ -454,6 +454,7 @@ async def run_pipeline(
     chat_use_llm: bool = False,
     think_supported: bool | None = None,
     think_budget: int = 512,
+    log_llm_calls: bool = True,
 ) -> dict[str, Any]:
     """ROUTE -> PLAN -> CODE -> CHECK -> VALIDATE -> SUMMARY.
 
@@ -536,7 +537,7 @@ async def run_pipeline(
                 f"max total LLM calls exceeded ({budgets.max_llm_calls})"
             )
         llm_calls += 1
-        role = "coder" if model == coder_model else "thinker"
+        role = kwargs.get("role") or ("coder" if model == coder_model else "thinker")
         trimmed = budget.trim(prompt)
         call_t0 = time.monotonic()
         response = ""
@@ -548,11 +549,15 @@ async def run_pipeline(
             error = str(exc)
             raise
         finally:
-            journal.log_llm_call(
-                role, model=model, prompt=trimmed, response=response,
-                temperature=temperature, num_ctx=num_ctx,
-                seconds=round(time.monotonic() - call_t0, 3), error=error,
-            )
+            # On the server path the gateway's on_call hook logs every call
+            # with full Ollama meta (log_llm_calls=False there); the pipeline
+            # logs only when it owns the generate seam (tests, headless use).
+            if log_llm_calls:
+                journal.log_llm_call(
+                    role, model=model, prompt=trimmed, response=response,
+                    temperature=temperature, num_ctx=num_ctx,
+                    seconds=round(time.monotonic() - call_t0, 3), error=error,
+                )
 
     _check_cancel()
 
@@ -920,10 +925,11 @@ async def run_pipeline(
             for name in generated
             if name.endswith(".py")
         }
+        verify_result: Any | None = None
         if python_staged and not infra_error:
             v0 = time.monotonic()
             try:
-                verify = await asyncio.to_thread(
+                verify_result = await asyncio.to_thread(
                     verify_files, python_staged, staging.staging_dir, None, workspace
                 )
             except Exception as exc:  # verifier crashed -> infra error, no retry
@@ -931,8 +937,8 @@ async def run_pipeline(
                 check_seconds += time.monotonic() - v0
             else:
                 check_seconds += time.monotonic() - v0
-                if not verify.passed:
-                    diagnostics = tail_lines(verify.diagnostics(), 30)
+                if not verify_result.passed:
+                    diagnostics = tail_lines(verify_result.diagnostics(), 30)
                     for name in python_staged:
                         staging.get_staged_file_path(name).unlink(missing_ok=True)
                         generated.pop(name, None)
@@ -949,6 +955,23 @@ async def run_pipeline(
         record("CHECK", "failed" if (failed_tasks or infra_error) else "ok",
                check_seconds,
                infra_error or f"{len(generated)} passed, {len(failed_tasks)} failed")
+
+        # sandbox channel: every deterministic CHECK outcome, one block per
+        # run (per-file checks + the verifier step chain + infra errors).
+        sandbox_lines: list[str] = []
+        for name in sorted(generated):
+            sandbox_lines.append(f"[PASS] {name}")
+        for t in failed_tasks:
+            sandbox_lines.append(f"[FAIL] {t['path']}: {t['error']}")
+        if verify_result is not None:
+            for step in verify_result.steps:
+                status = "SKIP" if step.skipped else ("PASS" if step.passed else "FAIL")
+                sandbox_lines.append(f"[{status}] verifier.{step.step}")
+                if step.output and not step.passed:
+                    sandbox_lines.append(step.output[:2_000])
+        if infra_error:
+            sandbox_lines.append(f"[INFRA] {infra_error}")
+        journal.log_role("sandbox", "\n".join(sandbox_lines) or "(no checks ran)")
 
         # --------------------------------------------------------------- VALIDATE
         validate_note = ""
@@ -991,6 +1014,7 @@ async def run_pipeline(
                         planner_model, validate_prompt,
                         system="You are a strict reviewer outputting only JSON.",
                         temperature=TEMPERATURE_PLAN,
+                        role="validator",
                     )
                     _, clean = strip_think_blocks(raw)
                     match = re.search(r"\{.*\}", clean, re.DOTALL)

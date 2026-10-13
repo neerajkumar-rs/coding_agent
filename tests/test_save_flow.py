@@ -141,7 +141,7 @@ def test_no_lfm_references_in_repo() -> None:
         if path.name == Path(__file__).name:
             continue  # this test holds the pattern (built, not spelled)
         if any(part in {"env", ".git", "node_modules", "__pycache__",
-                        ".agent_runs", ".agent_staging", ".agent_logs"}
+                        ".agent_runs", ".agent_staging"}
                for part in path.parts):
             continue
         try:

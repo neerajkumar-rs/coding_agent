@@ -17,17 +17,29 @@ from agent_config import load_agent_config, save_agent_config, AgentConfig
 
 
 class FakeOllama(BaseHTTPRequestHandler):
-    """Extends the e2e pattern: /api/tags, /api/generate, /api/ps, /api/chat."""
+    """Extends the e2e pattern: /api/tags, /api/generate, /api/ps, /api/chat.
+
+    Tracks residency in memory so the AgentGateway's VRAM guard passes:
+    a generate loads the model (size_vram == size => fraction 1.0);
+    keep_alive=0 unloads it."""
+
+    loaded: dict[str, dict] = {}
+
+    MODEL_SIZES = {
+        "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest": 1_100_000_000,
+        "qwen2.5-coder:3b-instruct": 1_900_000_000,
+        "qwen2.5-coder:1.5b": 986_000_000,
+    }
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.loaded = {}
 
     def do_GET(self) -> None:
         if self.path.endswith("/api/tags"):
-            body = {"models": [
-                {"name": "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"},
-                {"name": "qwen2.5-coder:3b"},
-                {"name": "phi4-mini"},
-            ]}
+            body = {"models": [{"name": m} for m in type(self).MODEL_SIZES]}
         elif self.path.endswith("/api/ps"):
-            body = {"models": []}
+            body = {"models": [{"name": n, **v} for n, v in type(self).loaded.items()]}
         else:
             body = {"status": "ok"}
         self._json(body)
@@ -35,10 +47,14 @@ class FakeOllama(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         payload = json.loads(self.rfile.read(length))
+        model = payload.get("model", "")
         # keep_alive=0 = unload request
         if payload.get("keep_alive") == 0:
+            type(self).loaded.pop(model, None)
             self._json({"done": True})
             return
+        size = type(self).MODEL_SIZES.get(model, 1_000_000_000)
+        type(self).loaded[model] = {"size": size, "size_vram": size}
         self._json({
             "response": "ok " * 40,
             "done": True,
@@ -61,11 +77,13 @@ class FakeOllama(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def fake_ollama():
+    FakeOllama.reset()
     server = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllama)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     yield f"http://127.0.0.1:{server.server_port}"
     server.shutdown()
+    FakeOllama.reset()
 
 
 # ---------------------------------------------------------------------------
@@ -115,13 +133,13 @@ def test_bench_compare_override(fake_ollama: str) -> None:
         save_agent_config(AgentConfig(), tmp)
         report, code = bench.run([
             "--workspace", tmp, "--quick",
-            "--compare", "validator=erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest,phi4-mini",
+            "--compare", "validator=erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest,qwen2.5-coder:1.5b",
             "--roles", "validator",
             "--ollama-url", fake_ollama,
         ])
         assert code == bench.EXIT_OK
         validator = [r for r in report["results"] if r["role"] == "validator"]
-        assert {r["model"] for r in validator} == {"erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "phi4-mini"}
+        assert {r["model"] for r in validator} == {"erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "qwen2.5-coder:1.5b"}
         assert all(r["ok"] for r in validator)
 
 

@@ -305,7 +305,7 @@ class OllamaAgentApp(App):
             self.exit()
         elif command == "/help":
             self._write(f"[{DIM}]/run · /benchmark · /save · /status · /workspace · "
-                        f"/cancel · /router <text> · /models · /logs · /clear · /quit[/]\n")
+                        f"/cancel · /router <text> · /models · /logs [role|events] [N] · /clear · /quit[/]\n")
         elif command == "/clear":
             self.query_one("#chat", RichLog).clear()
         elif command in {"/save", "/deploy"}:
@@ -324,11 +324,11 @@ class OllamaAgentApp(App):
             self._models_work()
         elif command.startswith("/logs"):
             args = text.strip()[len("/logs"):].split()
-            role_or_run = args[0] if args else ""
-            count = 800
+            channel = args[0] if args else ""
+            count = 60
             if len(args) > 1 and args[1].isdigit():
                 count = int(args[1])
-            self._write(_tail_logs_text(self.workspace, role_or_run, count))
+            self._write(_tail_logs_text(self.workspace, channel, count))
         elif command.startswith("/router"):
             self._router_work(text.strip()[len("/router"):].strip())
         elif command == "/roles":
@@ -701,58 +701,30 @@ def _short_model(name) -> str:
     return base.split(":")[0]
 
 
-def _tail_logs_text(workspace: str, role_or_run: str = "", count: int = 800) -> str:
+def _tail_logs_text(workspace: str, channel: str = "", count: int = 60) -> str:
     """Read the ACTIVE workspace's LATEST run logs from .agent_runs/<run_id>/.
 
-    ``role_or_run`` picks a role log (thinker/coder/validator/sandbox) or a
-    run_id; default = latest run, all role logs. When no run exists, the path
-    searched is printed. Never reads the stale .agent_logs dir.
+    Thin markup wrapper over the registry-driven reader in
+    agent_core.run_state: ``channel`` is any registered channel
+    (thinker/coder/validator/sandbox/events), ``count`` is a LINE count.
+    When no run exists, the exact path searched is printed.
     """
-    from agent_core.run_state import RUNS_DIR_NAME
+    from agent_core.run_state import tail_run_logs
 
-    runs_dir = Path(workspace) / RUNS_DIR_NAME
-    if not runs_dir.is_dir():
-        return f"[{DIM}]No runs yet — searched {runs_dir}[/]"
-    run_dirs = sorted((d for d in runs_dir.iterdir() if d.is_dir()), reverse=True)
-    if not run_dirs:
-        return f"[{DIM}]No runs yet — searched {runs_dir}[/]"
-
-    # role_or_run may name a run dir or a role log
-    chosen = run_dirs[0]
-    role_filter = ""
-    if role_or_run:
-        candidate = runs_dir / role_or_run
-        if candidate.is_dir():
-            chosen = candidate
-        elif role_or_run in ("thinker", "coder", "validator", "sandbox"):
-            role_filter = role_or_run
+    result = tail_run_logs(workspace, channel, count)
+    if result.get("run_id") is None:
+        return f"[{DIM}]No runs yet — searched {result.get('searched')}[/]"
+    parts: list[str] = [f"[{DIM}]--- latest run: {result['run_id']} ---[/]"]
+    sections = result.get("sections", [])
+    if not sections:
+        parts.append(f"[{DIM}](no logs in {result.get('searched')})[/]")
+    from agent_core.run_state import LOG_CHANNELS
+    for section in sections:
+        filename = LOG_CHANNELS.get(section["channel"], section["channel"])
+        if "error" in section:
+            parts.append(f"[{DIM}]--- {filename} ---\n(unreadable: {section['error']})[/]")
         else:
-            # try as a run id prefix
-            match = next((d for d in run_dirs if d.name.startswith(role_or_run)), None)
-            if match:
-                chosen = match
-            else:
-                role_filter = role_or_run
-
-    logs = ["thinker.log", "coder.log", "validator.log", "sandbox.log"]
-    if role_filter:
-        logs = [f"{role_filter}.log"]
-    parts: list[str] = [f"[{DIM}]--- latest run: {chosen.name} ---[/]"]
-    found = False
-    for log_file in logs:
-        path = chosen / log_file
-        if path.exists():
-            found = True
-            tail = path.read_text(encoding="utf-8", errors="replace")[-count:]
-            parts.append(f"[{DIM}]--- {log_file} ---\n{tail}[/]")
-    if not found:
-        # Fall back to events.jsonl so an empty role log still shows something.
-        events = chosen / "events.jsonl"
-        if events.exists():
-            tail = events.read_text(encoding="utf-8", errors="replace")[-count:]
-            parts.append(f"[{DIM}]--- events.jsonl ---\n{tail}[/]")
-        else:
-            parts.append(f"[{DIM}](no logs in {chosen})[/]")
+            parts.append(f"[{DIM}]--- {filename} ---\n" + "\n".join(section["lines"]) + "[/]")
     return "\n".join(parts)
 
 

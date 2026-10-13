@@ -10,7 +10,11 @@ This document describes the CURRENT architecture, what changed, and how to adapt
 ROUTE -> PLAN -> CODE -> CHECK -> VALIDATE -> SUMMARY
 ```
 
-- **ROUTE** is rules-only (no model): `QUESTION` / `FILE_QUESTION` / `CODE_TASK` / `UNCLEAR`.
+- **ROUTE** is the router v2: T0/T1 word-boundary rules first (no model),
+  then the T2 grey-zone classifier (one thinker call) only when the rules are
+  unsure. Intents: `CHAT` (canned reply, zero model calls), `COMMAND`,
+  `QUESTION`, `FILE_QUESTION`, `CODE_TASK`, `UNCLEAR` (one clarifying
+  question). There is no CODE_TASK fall-through — unclassifiable is UNCLEAR.
 - **PLAN** produces tasks in the single unified format `{path, action, description}`.
   With a `structured_generate` seam it uses Ollama `format` + pydantic
   (`agent_core.schemas.PipelinePlan`) first, then falls back to the JSON-regex path.
@@ -28,7 +32,21 @@ The retired `POST /agent/plan` + `POST /agent/step` queue is gone; `/agent/run`
 supersedes it. `run_pipeline` enforces budgets (900 s wall / 40 LLM calls /
 2 attempts), the no-progress rule (identical diagnostic twice => marked
 needs-human), and per-run observability via `RunJournal`
-(`.agent_runs/<run_id>/state.json` + `events.jsonl`).
+(`.agent_runs/<run_id>/state.json` + `events.jsonl` + per-channel logs).
+
+### Per-run logs (current)
+
+Every run writes one block per LLM call into the channel logs
+(`thinker.log` / `coder.log` / `validator.log`) and one per CHECK into
+`sandbox.log`, driven by the `LOG_CHANNELS` registry in
+`agent_core.run_state` (adding a channel is a one-line entry). Call records
+carry prompt, answer, `think_chars`, `done_reason`, `eval_count`, tok/s,
+num_ctx actually used, and `size_vram/size`. `state.json` is enriched by the
+server with the intent, per-role cards (model, digest12,
+supports_think_param), swaps with seconds, and per-call num_ctx.
+Both TUIs read them with `/logs [thinker|coder|validator|sandbox|events] [N]`
+(default: latest run, 60 lines). The retired workspace-level log dir is gone
+(a grep test enforces it).
 
 ### Cancellation
 
@@ -38,12 +56,18 @@ stages; the supervisor races the in-flight HTTP request against the event and
 closes the connection on cancel, then the caller unloads the resident model.
 A cancelled run returns `status: "cancelled"` and stages nothing further.
 
-### Lock count (honest, pre-Phase-3)
+### Lock count (honest, current)
 
-Today there is ONE async lock on the hot path: the supervisor's `_vram_mutex`
-(`/agent/run` goes through it). The sync `OllamaEngine._sync_lock`, the
-`agent_core.llm_gateway` process lock, and the TUI `_gpu_lock` still exist and
-are consolidated into a single gateway lock in Phase 3.
+There is exactly **ONE process-wide asyncio lock** on the hot path:
+`AgentGateway._lock` in `ollama_client.py`. The supervisor's `_vram_mutex`
+is the *same object* (injected by the gateway), and bench probes go through
+the same gateway. The retired sync `OllamaEngine._sync_lock` and the
+`agent_core.llm_gateway` process lock are gone with the retired Engine
+pipeline. The TUI keeps a client-side UI mutex (`_gpu_lock`) so an in-TUI
+benchmark never overlaps a TUI-submitted run — it is UX serialization, not
+GPU safety; GPU safety is the gateway lock + the VRAM guard, and it cannot
+serialize a headless bench against a server run (cross-process; the guard's
+unload-others step is the honest mechanism there).
 
 ## For users
 
@@ -79,11 +103,30 @@ are consolidated into a single gateway lock in Phase 3.
 
 ```json
 {
-  "keep_alive": "5m",
-  "allowed_commands": ["py_compile"]
+  "roles": {
+    "thinker":   {"model": "...", "num_ctx": 8192, "num_predict": 2048,
+                  "temperature": 0.2, "keep_alive": "5m",
+                  "inline_system": true,  "think_budget": 512},
+    "coder":     {"model": "...", "num_ctx": 6144, "num_predict": 2048,
+                  "temperature": 0.1, "keep_alive": "5m",
+                  "inline_system": false, "think_budget": 0},
+    "validator": {"model": "...", "num_ctx": 8192, "num_predict": 512,
+                  "temperature": 0.0, "keep_alive": "5m",
+                  "inline_system": true,  "think_budget": 512}
+  },
+  "allowed_commands": ["py_compile"],
+  "router": {"min_confidence": 0.7, "chat_use_llm": false}
 }
 ```
 
+- `roles` is the single source of truth. Legacy top-level keys
+  (`planner_model`, `coder.5b_or_3b`, `max_context_tokens`, `keep_alive`)
+  fold into `roles` on load and are never read elsewhere.
+- Every `num_ctx` is clamped through `agent_config.ceiling_for(role)`
+  (static ceilings today; a calibration phase swaps in measured values later).
+- Live switching: `POST /config/role` (or `/model` `/ctx` in the Textual TUI)
+  goes through `RoleRegistry` — validated, persisted, applied on the next
+  gateway call.
 - `allowed_commands` gates the sandbox: any custom validation command must be
   one of these **names** (free-form shell is rejected). Add `"pytest"` to enable
   the pytest vector.
@@ -107,10 +150,13 @@ result = await run_pipeline(
 result["staged_files"], result["failed_tasks"], result["trace"], result["run_id"]
 ```
 
-`agent_core.engine.Engine` still exists as the per-workspace session object
-behind `get_engine` / `POST /agent/cancel` / `POST /agent/rollback` /
-`GET /agent/events`. Its internal `run()` loop (structured planner, auditor)
-is retained for those consumers but is NOT the `/agent/run` path.
+`agent_core.engine` no longer contains a pipeline. It holds the shared budget
+dataclass/exceptions (`RunBudgets`, `BudgetExhausted`, `RunCancelled`) and a
+slim per-workspace session object (`WorkspaceSession`, alias `Engine`) behind
+`get_engine` — the only cross-request state is the cancel event set by
+`POST /agent/cancel`. The old `Engine.run` loop, `agent_core.llm_gateway`,
+`agent_core.planner` and `agent_core.auditor` are deleted; their behavior
+tests were ported onto `run_pipeline` (`tests/test_agent_core.py`).
 
 ### The pipeline contract
 
@@ -140,19 +186,26 @@ is retained for those consumers but is NOT the `/agent/run` path.
 | `tests/test_llm_client.py` | think-stripping, truncation retry, in-flight cancel |
 | `tests/test_run_pipeline.py` | ROUTE/PLAN/CODE/CHECK/VALIDATE/SUMMARY, journal, cancel, verifier gate |
 | `tests/test_orchestrator.py` | run_pipeline budgets, no-progress, no-junk regression |
-| `tests/test_router.py` | rules-only classify_request |
+| `tests/test_router.py` | router v2 rules + T2 battery + guards |
+| `tests/test_router_eval.py` | 62-phrase eval set, accuracy gate |
+| `tests/test_confirm_gate.py` | plan-confirm endpoints (timeout, decline, approve) |
 | `tests/test_plan_quality.py` | plan validation rules, fallback |
 | `tests/test_summary.py` | summary skeleton + guarded prose, UNVERIFIED |
 | `tests/test_save_flow.py` | save prompt, --yes, config fallback, no removed-model strings |
 | `tests/test_check_sandbox.py` | in-process CHECK, infra vs content errors, plausibility |
 | `tests/test_queue_bug.py` | build_id stale-server guard, junk filter, target rejection |
-| `tests/test_agent_core.py` | structured outputs, planner fallback, engine sessions |
+| `tests/test_agent_core.py` | schemas, coder parsing, session registry (ported off Engine.run) |
 | `tests/test_edits.py` | SEARCH/REPLACE applier, token budgeter, repo map |
 | `tests/test_verifier.py` | deterministic step chain |
 | `tests/test_safety.py` | path escape, protected paths, sandbox allowlist, rollback |
 | `tests/test_events_endpoint.py` | SSE events, cancel, rollback endpoints |
+| `tests/test_run_logs.py` | /logs readers, LOG_CHANNELS registry, retired-dir grep test |
+| `tests/test_vram_gateway.py` | single lock, VRAM guard, swaps, probe, truncation, hook |
+| `tests/test_role_registry.py` | ceiling_for, RoleRegistry validate/clamp/persist |
+| `tests/test_phase2_config.py` | roles defaults, exact-match resolver, round-trip |
+| `tests/test_phase5_live_switching.py` | /config/role endpoint (model + num_ctx) |
 | `tests/test_tui_textual.py` | Textual UI (sidebar, save prompt, wordmark) |
-| `tests/test_tui_startup.py` | TUI startup, workspace picker, CLI args |
-| `tests/test_tui_benchmark.py` | benchmark run/main, gpu lock, config roles |
-| `test_master_controller.py` | legacy FastAPI lifecycle (now via /agent/run) |
-| `e2e_smoke_test.py` | full Engine pipeline against a mock Ollama |
+| `tests/test_tui_startup.py` | TUI startup, workspace picker, CLI args, health wait |
+| `tests/test_tui_benchmark.py` | benchmark via gateway, config roles, apply flow |
+| `test_master_controller.py` | legacy FastAPI lifecycle (via /agent/run) |
+| `e2e_smoke_test.py` | full run_pipeline against a mock Ollama |

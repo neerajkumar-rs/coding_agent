@@ -28,11 +28,14 @@ orchestrator.run_pipeline             ←  ROUTE → PLAN → CODE → CHECK →
         │                            import smoke → pytest* (*skipped when tool absent)
         ├── agent_core.staging.py    path-escape + protected paths, backups/rollback
         ├── agent_core.run_state.py  RunJournal: .agent_runs/<run_id>/{state.json,
-        │                            events.jsonl}
+        │                            events.jsonl, thinker/coder/validator/sandbox.log}
+        │                            + LOG_CHANNELS registry (the plug-and-play
+        │                            log channel map — adding a channel is 1 line)
         ├── workspace_staging.py     .agent_staging/ → difflib → atomic deploy
         └── sandbox.py               in-process plausibility CHECK (non-Python)
         │
-        ▼  one async lock on the hot path (OllamaSupervisorClient._vram_mutex)
+        ▼  ONE process-wide lock (AgentGateway._lock — the supervisor's
+           _vram_mutex is the same object, injected by the gateway)
 Local Ollama  http://localhost:11434
         ├── erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest  ←  Thinker / Planner / Validator / Router T2
         └── qwen2.5-coder:3b-instruct                    ←  Coder / Answers / Summaries
@@ -139,10 +142,19 @@ All endpoints accept and return JSON.
 ```
 
 Runs the single pipeline `orchestrator.run_pipeline`: ROUTE → PLAN → CODE →
-CHECK → VALIDATE → SUMMARY. Stages CHECK-passed files (never auto-deploys).
-Response carries `summary`, `staged_files`, `failed_tasks`, `trace`, `run_id`
-for code tasks, or `answer`, `trace`, `run_id` for questions, plus `status`
-on cancel/budget stop.
+CHECK → VALIDATE → SUMMARY. ROUTE is the router v2 (T0/T1 word-boundary rules
+first, T2 grey-zone classifier only when the rules are unsure; CHAT gets a
+canned reply with zero model calls). Stages CHECK-passed files (never
+auto-deploys). Response carries `summary`, `staged_files`, `failed_tasks`,
+`trace`, `run_id` for code tasks, or `answer`, `trace`, `run_id` for
+questions, plus `status` on cancel/budget stop.
+
+Every LLM call is recorded in the run journal
+(`.agent_runs/<run_id>/{thinker,coder,validator}.log` + `sandbox.log` for
+CHECK output) with prompt, answer, `think_chars`, `done_reason`, `eval_count`,
+tok/s, the num_ctx actually used, and `size_vram/size`; `state.json` carries
+the intent, per-role cards (model, digest12, supports_think_param), swaps with
+seconds, and per-call num_ctx.
 
 `POST /agent/plan` and `POST /agent/step` were **retired** — `/agent/run`
 supersedes them. `/agent/run` never auto-deploys: it stages CHECK-passed files
@@ -175,36 +187,56 @@ Server-sent events stream of a run's `events.jsonl` (replays history;
 
 Requests cancellation of the in-progress run for a workspace.
 
+### `GET /agent/pending_confirm` · `POST /agent/confirm`
+
+The plan-confirm gate: when a run is started with `"confirm": true`, it pauses
+after PLAN; the client polls `/agent/pending_confirm` and answers via
+`/agent/confirm` (`{"approved": true|false}`). 180 s timeout declines.
+
+### `POST /router/classify`
+
+`/router <text>` backend: tier, matched verb/deliverable, scores, whether the
+T2 grey-zone classifier ran, and the raw classifier JSON. T0/T1 rules never
+touch a model; T2 goes through the same gateway lock.
+
+### `GET /config` · `POST /config/role`
+
+The live per-role config (thinker/coder/validator: model, num_ctx,
+num_predict, temperature, keep_alive, inline_system, think_budget) and the
+validated update path. Changes persist to `.agent` and apply on the NEXT
+gateway call, never mid-generation. num_ctx is clamped through
+`ceiling_for(role)`.
+
 ---
 
 ## Project Structure
 
 ```
 e:\coding_agent\
-├── agent_core/            ← THE pipeline
-│   ├── engine.py          ← Engine.run(request): budgets, no-progress, sessions
-│   ├── llm_gateway.py     ← structured outputs (format=schema + pydantic, 1 retry)
-│   ├── schemas.py         ← Plan / AuditResult pydantic models
-│   ├── planner.py         ← structured plan + markdown fallback
-│   ├── coder.py           ← full blocks + SEARCH/REPLACE edits
+├── agent_core/            ← the LIBRARY run_pipeline is built from
+│   ├── engine.py          ← budgets + the per-workspace cancel registry
+│   │                          (the Engine.run pipeline is retired)
+│   ├── schemas.py         ← PipelinePlan / ValidateResult / AuditResult
+│   ├── coder.py           ← full blocks + SEARCH/REPLACE edits, output parsing
 │   ├── verifier.py        ← py_compile → ruff → import smoke → pytest
-│   ├── auditor.py         ← diff review, never blocks a deterministic pass
 │   ├── staging.py         ← staging + path safety + backups/rollback
-│   ├── run_state.py       ← .agent_runs journal (state/events/tasks)
+│   ├── run_state.py       ← .agent_runs journal + LOG_CHANNELS registry
 │   ├── context.py         ← AST repo map + token budgeter
-│   └── planner_eval.py    ← planner schema-conformance benchmark
+│   └── planner_eval.py    ← planner schema-conformance benchmark (dev tool)
 │
 ├── main.py                ← FastAPI controller (all endpoints)
 ├── orchestrator.py        ← run_pipeline: THE single pipeline behind /agent/run
-├── agent_config.py        ← .agent profile + --recalculate CLI
-├── ollama_client.py       ← think-stripping + truncation-guarded LLM layer
+├── router.py              ← router v2: T0/T1 rules + T2 grey-zone classifier
+├── agent_config.py        ← .agent profile + RoleRegistry + ceiling_for
+├── ollama_client.py       ← AgentGateway (THE lock + VRAM guard + capability
+│                              probe) + think-stripping/truncation guards
 ├── workspace_staging.py   ← staging manager + difflib + atomic deploy
 ├── sandbox.py             ← in-process plausibility CHECK + allowlisted commands
 ├── scanner.py             ← workspace scanner (file questions)
 ├── tui.py                 ← Rich TUI (reuses running Ollama)
 ├── tui_textual.py         ← Textual TUI (two-column, sidebar, save prompt)
 │
-├── tests/                 ← pytest suite (160 tests, offline)
+├── tests/                 ← pytest suite (24 files, offline)
 ├── test_master_controller.py  ← legacy lifecycle suite (offline, via /agent/run)
 ├── e2e_smoke_test.py          ← end-to-end with mock Ollama server
 └── scripts/live_smoke.py      ← live Ollama connection check (not pytest)
@@ -213,8 +245,8 @@ e:\coding_agent\
 Workspace-side artifacts (all git-ignored):
 
 ```
-.agent             profile        .agent_logs/     role logs
-.agent_staging/    code cache     .agent_runs/<id>/ state.json · events.jsonl · tasks.md · backup/
+.agent             profile        .agent_runs/<id>/ state.json · events.jsonl · role logs · backup/
+.agent_staging/    code cache     (one run dir per run: thinker/coder/validator/sandbox logs)
 ```
 
 The workspace root itself only ever receives the **requested target files**
@@ -225,8 +257,8 @@ The workspace root itself only ever receives the **requested target files**
 ## Testing
 
 ```powershell
-# Unit tests (160, offline)
-.\env\Scripts\python.exe -m pytest tests/ -q
+# Unit tests (267 incl. the root lifecycle suite, offline)
+.\env\Scripts\python.exe -m pytest tests/ test_master_controller.py -q
 
 # Legacy lifecycle suite (offline)
 .\env\Scripts\python.exe test_master_controller.py

@@ -13,7 +13,7 @@ IGNORED_DIRS = {
     ".git",
     "__pycache__",
     ".agent_staging",
-    ".agent_logs",
+    ".agent_runs",
     "env",
     ".env",
     "venv",

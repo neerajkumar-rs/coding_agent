@@ -36,6 +36,12 @@ class FakeOllama(BaseHTTPRequestHandler):
     fail_times: int = 0          # fail the next N generates with HTTP 500
     oom_until_ctx: int = 0       # 500-OOM when num_ctx > this (0 = off)
     requests: list[dict] = []    # observed payloads
+    # length_times: next N generates answer done_reason="length" (truncated);
+    # reject_think: HTTP 400 on any payload carrying "think" (the probe's
+    # supports_think_param=False path); response_text: canned answer override.
+    length_times: int = 0
+    reject_think: bool = False
+    response_text: str = "OK"
 
     MODEL_SIZES = {MODEL: 1_900_000_000, THINKER: 1_100_000_000}
 
@@ -46,6 +52,9 @@ class FakeOllama(BaseHTTPRequestHandler):
         cls.fail_times = 0
         cls.oom_until_ctx = 0
         cls.requests = []
+        cls.length_times = 0
+        cls.reject_think = False
+        cls.response_text = "OK"
 
     # -- helpers -------------------------------------------------------------
 
@@ -63,11 +72,28 @@ class FakeOllama(BaseHTTPRequestHandler):
             self.send_response(404); self.end_headers(); return
         self._send(body)
 
+    def _do_show(self) -> None:
+        body = json.dumps({
+            "capabilities": ["completion"],
+            "details": {"quantization_level": "Q4_K_M",
+                        "digest": "sha256:abcdef1234567890"},
+            "template": "{{ .Prompt }}",
+        }).encode()
+        self._send(body)
+
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         payload = json.loads(self.rfile.read(length) or b"{}")
-        type(self).requests.append(payload)
         model = payload.get("model", "")
+
+        if self.path.endswith("/api/show"):
+            self._do_show(); return
+
+        type(self).requests.append(payload)
+
+        if "think" in payload and type(self).reject_think:
+            self._send(json.dumps({"error": "model does not support thinking"}).encode(), 400)
+            return
 
         if payload.get("keep_alive") == 0:  # unload
             type(self).loaded.pop(model, None)
@@ -96,9 +122,20 @@ class FakeOllama(BaseHTTPRequestHandler):
             "size": self.MODEL_SIZES[model],
             "size_vram": int(self.MODEL_SIZES[model] * self._frac(num_ctx)),
         }
+        if type(self).length_times > 0:
+            type(self).length_times -= 1
+            body = json.dumps({
+                "response": type(self).response_text, "done": True,
+                "done_reason": "length",
+                "prompt_eval_count": 10, "eval_count": 2,
+                "total_duration": 1_000_000, "eval_duration": 500_000,
+            }).encode()
+            self._send(body)
+            return
         body = json.dumps({
-            "response": "OK", "done": True, "done_reason": "stop",
+            "response": type(self).response_text, "done": True, "done_reason": "stop",
             "prompt_eval_count": 10, "eval_count": 2, "total_duration": 1_000_000,
+            "eval_duration": 500_000,
         }).encode()
         self._send(body)
 
@@ -335,5 +372,173 @@ def test_phase_batched_swaps_logged() -> None:
         gens = [r for r in FakeOllama.requests if r.get("prompt") in
                 ("route", "plan", "code1", "code2", "validate")]
         assert len(gens) == 5  # each prompt generated once
+    finally:
+        server.shutdown(); server.server_close()
+
+
+# --- 9. inline_system: thinker folds system into the prompt, coder doesn't ---
+
+def test_inline_system_folds_system_into_prompt() -> None:
+    server, base = _serve()
+    try:
+        gw = _gateway(base)
+        _run(gw.generate("thinker", "do this", system="SYSTEM TEXT"))
+        gen = [r for r in FakeOllama.requests if "SYSTEM TEXT" in str(r.get("prompt", ""))
+               or r.get("system") == "SYSTEM TEXT"]
+        assert gen, FakeOllama.requests
+        payload = gen[-1]
+        # thinker (inline_system=True): system folded into the user prompt,
+        # and the system field itself is empty
+        assert payload["system"] == ""
+        assert payload["prompt"].startswith("SYSTEM TEXT\n\ndo this")
+    finally:
+        server.shutdown(); server.server_close()
+
+
+def test_coder_sends_system_separately() -> None:
+    server, base = _serve()
+    try:
+        gw = _gateway(base)
+        _run(gw.generate("coder", "do this", system="SYSTEM TEXT"))
+        payload = FakeOllama.requests[-1]
+        assert payload["system"] == "SYSTEM TEXT"
+        assert payload["prompt"] == "do this"
+        # the coder never receives a think switch
+        assert "think" not in payload
+    finally:
+        server.shutdown(); server.server_close()
+
+
+# --- 10. capability probe: supports_think_param both ways, cached by digest ---
+
+def test_probe_capabilities_accepts_think() -> None:
+    server, base = _serve()
+    try:
+        gw = _gateway(base)
+        entry = _run(gw.probe_capabilities(THINKER))
+        assert entry["supports_think_param"] is True
+        assert entry["digest12"] == "abcdef123456"
+        assert entry["quant"] == "Q4_K_M"
+        assert entry["template"]
+        # cached under the digest12 key
+        caps = gw.config.extra["capabilities"]
+        assert "abcdef123456" in caps
+        # think_supported finds it by model name via the entry scan
+        assert gw.think_supported(THINKER) is True
+    finally:
+        server.shutdown(); server.server_close()
+
+
+def test_probe_capabilities_think_rejected() -> None:
+    server, base = _serve()
+    try:
+        FakeOllama.reject_think = True
+        gw = _gateway(base)
+        entry = _run(gw.probe_capabilities(THINKER))
+        assert entry["supports_think_param"] is False
+        assert gw.think_supported(THINKER) is False
+    finally:
+        server.shutdown(); server.server_close()
+
+
+# --- 11. truncation: one bigger-budget retry, then OllamaTruncatedError -------
+
+def test_truncation_retries_once_with_bigger_budget() -> None:
+    server, base = _serve()
+    try:
+        FakeOllama.length_times = 1  # first call cut off, second fine
+        gw = _gateway(base)
+        out = _run(gw.generate("coder", "ping"))
+        assert out == "OK"
+        gens = [r for r in FakeOllama.requests if r.get("prompt") == "ping"]
+        assert len(gens) == 2  # exactly one retry
+        first = gens[0]["options"]["num_predict"]
+        second = gens[1]["options"]["num_predict"]
+        assert second == min(first * 2, 4096)
+    finally:
+        server.shutdown(); server.server_close()
+
+
+def test_truncation_twice_raises() -> None:
+    from ollama_client import OllamaTruncatedError
+
+    server, base = _serve()
+    try:
+        FakeOllama.length_times = 2  # both attempts cut off
+        gw = _gateway(base)
+        with pytest.raises(OllamaTruncatedError):
+            _run(gw.generate("coder", "ping"))
+    finally:
+        server.shutdown(); server.server_close()
+
+
+# --- 12. public unload(): the only sanctioned unload path ---------------------
+
+def test_gateway_unload_public() -> None:
+    server, base = _serve()
+    try:
+        gw = _gateway(base)
+        _run(gw.generate("coder", "ping", keep_warm=True))
+        assert MODEL in FakeOllama.loaded
+        _run(gw.unload(MODEL))
+        assert FakeOllama.loaded == {}
+        assert gw._resident_model is None
+    finally:
+        server.shutdown(); server.server_close()
+
+
+# --- 12b. only the gateway module posts to /api/generate ---------------------
+
+def test_only_gateway_module_posts_to_generate() -> None:
+    """Grep proof: no other repo module contains a literal /api/generate or
+    /api/chat post target (bench, main, orchestrator, router all go through
+    AgentGateway). Test files (fakes) are exempt."""
+    import re
+    from pathlib import Path as _P
+
+    root = _P(__file__).resolve().parents[1]
+    offenders: list[str] = []
+    for path in root.rglob("*.py"):
+        if any(part in {"env", ".git", "node_modules", "__pycache__",
+                        "tests", ".agent_runs", ".agent_staging"}
+               for part in path.parts):
+            continue
+        if path.name in {"ollama_client.py", "e2e_smoke_test.py",
+                         "planner_eval.py"}:
+            continue  # the gateway home, the mock server, dev tooling
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for match in re.finditer(r'["\'][^"\']*/api/(?:generate|chat)["\']', text):
+            offenders.append(f"{path.name}: {match.group(0)}")
+    assert offenders == [], f"direct Ollama endpoints outside the gateway: {offenders}"
+
+
+# --- 13. on_call hook: full per-call record, and swap records -----------------
+
+def test_on_call_hook_receives_full_record() -> None:
+    server, base = _serve()
+    try:
+        gw = _gateway(base)
+        records: list[dict] = []
+        gw.on_call = records.append
+        _run(gw.generate("coder", "ping", keep_warm=True))
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["role"] == "coder" and rec["model"] == MODEL
+        assert rec["prompt"] == "ping" and rec["response"] == "OK"
+        assert rec["done_reason"] == "stop"
+        assert rec["eval_count"] == 2 and rec["eval_duration_ns"] == 500_000
+        assert rec["num_ctx"] == 6144  # the coder's configured rung
+        assert rec["size_vram"] == rec["size_total"]  # 100% GPU
+        assert rec["swaps"] == []
+
+        # A swap is included in the next call's record
+        _run(gw.generate("thinker", "route", keep_warm=True))
+        assert records[1]["swaps"][0]["from"] == MODEL
+        assert records[1]["swaps"][0]["to"] == THINKER
+        assert "seconds" in records[1]["swaps"][0]
+
+        # Hook failure never breaks a call
+        gw.on_call = lambda _r: 1 / 0
+        assert _run(gw.generate("thinker", "still fine", keep_warm=False)) == "OK"
     finally:
         server.shutdown(); server.server_close()

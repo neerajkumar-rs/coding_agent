@@ -261,13 +261,8 @@ class ExecutionSandbox:
             success = error is None
             stdout = "[SANDBOX] Content plausibility check passed." if success else ""
             stderr = "" if success else f"[SANDBOX] {error}"
-            self.staging_manager.log_sandbox(
-                command=f"in-process plausibility: {target_rel_path}",
-                exit_code=0 if success else 1,
-                stdout=stdout,
-                stderr=stderr,
-                duration_s=duration_s,
-            )
+            # Per-run sandbox output is logged by the caller (run_pipeline's
+            # CHECK stage writes it to the run journal's sandbox channel).
             return {
                 "success": success,
                 "exit_code": 0 if success else 1,
@@ -310,14 +305,8 @@ class ExecutionSandbox:
         duration_s = round(time.time() - start_time, 3)
         success = exit_code == 0
 
-        # Discrete operational logging to sandbox.log (full text in the log).
-        self.staging_manager.log_sandbox(
-            command=cmd,
-            exit_code=exit_code,
-            stdout=stdout,
-            stderr=stderr,
-            duration_s=duration_s,
-        )
+        # Per-run sandbox output is logged by the caller (run_pipeline's CHECK
+        # stage writes it to the run journal's sandbox channel).
 
         return {
             "success": success,

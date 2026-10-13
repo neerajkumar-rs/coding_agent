@@ -21,6 +21,7 @@ from agent_config import (
     parse_and_recalculate,
     save_agent_config,
 )
+from agent_core.run_state import RunJournal
 from main import app, state
 from sandbox import ExecutionSandbox
 from scanner import WorkspaceScanner
@@ -99,17 +100,17 @@ def test_staging_isolation_and_difflib() -> None:
         assert "-    return 'old'" in diff_obj["diff"]
         assert "+    return 'new_vibe'" in diff_obj["diff"]
 
-        # Check logs matrix
-        staging.log_planner("reasoning step 1", [{"id": 1, "action": "edit"}])
-        staging.log_coder("app.py", staged_code, "update greeting")
-        staging.log_sandbox(["test_cmd"], 0, "sandbox ok", "")
-
-        assert staging.planner_log_path.exists()
-        assert staging.coder_log_path.exists()
-        assert staging.sandbox_log_path.exists()
-        assert "reasoning step 1" in staging.planner_log_path.read_text(encoding="utf-8")
-        assert "new_vibe" in staging.coder_log_path.read_text(encoding="utf-8")
-        assert "sandbox ok" in staging.sandbox_log_path.read_text(encoding="utf-8")
+        # Run logging lives in the per-run journal (the ONE logging path):
+        # role logs are written through RunJournal, never to the workspace.
+        journal = RunJournal(tmp_path)
+        journal.log_llm_call("thinker", model="m", prompt="reasoning step 1",
+                             response="plan ready")
+        journal.log_llm_call("coder", model="m2", prompt="update greeting",
+                             response=staged_code)
+        journal.log_role("sandbox", "sandbox ok")
+        assert "reasoning step 1" in journal.role_log_path("thinker").read_text(encoding="utf-8")
+        assert "new_vibe" in journal.role_log_path("coder").read_text(encoding="utf-8")
+        assert "sandbox ok" in journal.role_log_path("sandbox").read_text(encoding="utf-8")
 
         # Deploy staged files
         deploy_res = staging.deploy_staged_files()
@@ -171,7 +172,9 @@ def test_fastapi_endpoints() -> None:
         assert init_data["status"] == "initialized"
         assert (tmp_path / ".agent").exists()
         assert (tmp_path / ".agent_staging").exists()
-        assert (tmp_path / ".agent_logs").exists()
+        # Per-run logging dirs are created when a run starts, not at init.
+        assert init_data["staging_dir"].endswith(".agent_staging")
+        assert init_data["runs_dir"].endswith(".agent_runs")
 
         # 2. POST /agent/run — the single pipeline. Mock the supervisor's
         #    generate to route on the prompt markers run_pipeline emits.

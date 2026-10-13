@@ -97,26 +97,52 @@ def _role_models(config: AgentConfig, args: argparse.Namespace) -> dict[str, lis
     return roles
 
 
-def _probe_once(
-    client: httpx.Client, base: str, model: str, prompt: str, num_predict: int
+# Role names as the gateway knows them ("planner" is the thinker role there).
+_GATEWAY_ROLE = {"planner": "thinker", "coder": "coder", "validator": "validator"}
+
+
+class _BenchConfig:
+    """Config view that pins ONE role to the model being probed, so a
+    --compare model goes through the gateway's role machinery (ceilings,
+    VRAM guard) without touching the persisted .agent profile."""
+
+    def __init__(self, base: AgentConfig, role: str, model: str) -> None:
+        object.__setattr__(self, "_base", base)
+        object.__setattr__(self, "_role", role)
+        object.__setattr__(self, "_model", model)
+
+    def __getattr__(self, name: str):
+        # Dunder/private lookups (deepcopy's __deepcopy__ probe, etc.) must
+        # raise immediately — otherwise ``self._base`` re-enters __getattr__
+        # and recurses without bound.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(object.__getattribute__(self, "_base"), name)
+
+    def __deepcopy__(self, memo: dict) -> "_BenchConfig":
+        return _BenchConfig(self._base, self._role, self._model)
+
+    def get_role_config(self, role: str) -> dict[str, Any]:
+        cfg = dict(self._base.get_role_config(role))
+        if role == self._role:
+            cfg["model"] = self._model
+        return cfg
+
+
+async def _probe_gateway(
+    gateway: Any, role: str, prompt: str, num_predict: int
 ) -> tuple[bool, float, int, str]:
-    """One /api/generate probe. Returns (ok, seconds, output_chars, error)."""
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"num_predict": num_predict},
-    }
+    """One probe through THE AgentGateway: single lock, VRAM guard, role
+    config. Returns (ok, seconds, output_chars, error)."""
     start = time.monotonic()
     try:
-        resp = client.post(f"{base}/api/generate", json=payload, timeout=300.0)
-        if resp.status_code != 200:
-            return False, 0.0, 0, f"HTTP {resp.status_code}"
-        data = resp.json()
+        text = await gateway.generate(
+            role, prompt, num_predict=num_predict, keep_warm=False
+        )
         seconds = round(time.monotonic() - start, 3)
-        return True, seconds, len(data.get("response", "")), ""
-    except httpx.HTTPError as exc:
-        return False, round(time.monotonic() - start, 3), 0, str(exc)
+        return True, seconds, len(text), ""
+    except Exception as exc:
+        return False, round(time.monotonic() - start, 3), 0, str(exc)[:300]
 
 
 def _installed_models(client: httpx.Client, base: str) -> list[str]:
@@ -127,19 +153,6 @@ def _installed_models(client: httpx.Client, base: str) -> list[str]:
     except httpx.HTTPError:
         pass
     return []
-
-
-def _unload_models(client: httpx.Client, base: str, models: list[str]) -> None:
-    """Best-effort unload (keep_alive=0) after benchmarking."""
-    for model in models:
-        try:
-            client.post(
-                f"{base}/api/generate",
-                json={"model": model, "prompt": "", "keep_alive": 0, "stream": False},
-                timeout=15.0,
-            )
-        except httpx.HTTPError:
-            pass
 
 
 def _write_reports(report: BenchReport, workspace: Path) -> tuple[Path, Path]:
@@ -204,7 +217,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
-    """Execute the benchmark. Prints progress; returns (report_dict, exit_code)."""
+    """Execute the benchmark. Prints progress; returns (report_dict, exit_code).
+
+    Every generation goes through THE AgentGateway (single process lock,
+    VRAM guard, role config) — bench never posts to /api/generate directly.
+    """
     args = build_parser().parse_args(argv)
     workspace = Path(args.workspace).resolve()
     config = load_agent_config(workspace)
@@ -223,37 +240,59 @@ def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
     role_models = _role_models(config, args)
     probed_models: list[str] = []
 
-    for role, models in role_models.items():
-        prompt = ROLE_PROBES.get(role, ROLE_PROBES["coder"])
-        for model in models:
-            if model not in installed:
-                hint = f"missing model {model} — run: ollama pull {model}"
-                print(f"SKIP {role}/{model}: {hint}")
-                report.results.append(
-                    RoleResult(role=role, model=model, ok=False, error=hint)
+    # THE gateway: one lock + VRAM guard for every probe below. Built once
+    # per run; the lock is created inside this event loop.
+    import asyncio
+
+    from ollama_client import AgentGateway, OllamaSupervisorClient
+
+    async def _bench_all() -> None:
+        supervisor = OllamaSupervisorClient(base_url=args.ollama_url)
+        gateway = AgentGateway(supervisor, config)
+        for role, models in role_models.items():
+            prompt = ROLE_PROBES.get(role, ROLE_PROBES["coder"])
+            gw_role = _GATEWAY_ROLE.get(role, "coder")
+            for model in models:
+                if model not in installed:
+                    hint = f"missing model {model} — run: ollama pull {model}"
+                    print(f"SKIP {role}/{model}: {hint}")
+                    report.results.append(
+                        RoleResult(role=role, model=model, ok=False, error=hint)
+                    )
+                    continue
+                probed_models.append(model)
+                # Pin this role to the probed model for the duration of its
+                # probes (the persisted .agent profile is never touched).
+                gateway.config = _BenchConfig(config, gw_role, model)
+                best_score = -1.0
+                total_seconds = 0.0
+                ok_any = False
+                error = ""
+                for _ in range(repeat):
+                    ok, seconds, chars, error = await _probe_gateway(
+                        gateway, gw_role, prompt, num_predict
+                    )
+                    ok_any = ok_any or ok
+                    total_seconds += seconds
+                    if ok and seconds > 0:
+                        best_score = max(best_score, chars / seconds)
+                avg = round(total_seconds / repeat, 3)
+                result = RoleResult(
+                    role=role, model=model, ok=ok_any,
+                    seconds=avg, output_chars=0, error="" if ok_any else error,
+                    score=round(best_score, 1) if best_score > 0 else 0.0,
                 )
-                continue
-            probed_models.append(model)
-            best_score = -1.0
-            total_seconds = 0.0
-            ok_any = False
-            error = ""
-            for _ in range(repeat):
-                ok, seconds, chars, error = _probe_once(
-                    client, args.ollama_url, model, prompt, num_predict
-                )
-                ok_any = ok_any or ok
-                total_seconds += seconds
-                if ok and seconds > 0:
-                    best_score = max(best_score, chars / seconds)
-            avg = round(total_seconds / repeat, 3)
-            result = RoleResult(
-                role=role, model=model, ok=ok_any,
-                seconds=avg, output_chars=0, error="" if ok_any else error,
-                score=round(best_score, 1) if best_score > 0 else 0.0,
-            )
-            report.results.append(result)
-            print(f"{role}/{model}: {'ok' if ok_any else 'FAIL'} ({avg}s avg)")
+                report.results.append(result)
+                print(f"{role}/{model}: {'ok' if ok_any else 'FAIL'} ({avg}s avg)")
+                # keep_warm=False on each probe already unloaded; belt+braces:
+                await gateway.unload(model)
+        gateway.config = config  # restore
+
+    try:
+        asyncio.run(_bench_all())
+    except Exception as exc:  # gateway/transport failure mid-bench
+        report.errors.append(str(exc)[:300])
+        print(f"ERROR: bench aborted: {exc}")
 
     # Best per role = highest throughput score among ok results
     for role in role_models:
@@ -273,7 +312,6 @@ def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
     print(f"\nReports: {json_path}\n         {md_path}")
     print("Note: benchmark models are unloaded when done (keep_alive=0).")
 
-    _unload_models(client, args.ollama_url, probed_models)
     return report.to_dict(), EXIT_OK
 
 

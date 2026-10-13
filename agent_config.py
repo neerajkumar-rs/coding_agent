@@ -28,6 +28,21 @@ RTX_3050_VRAM_CEILING_GB = 4.0
 # (and further by calibration in Phase 6).
 ROLE_CTX_CEILINGS = {"thinker": 16384, "coder": 12288, "validator": 16384}
 
+# Canonical role names; "planner" is accepted everywhere as the thinker alias.
+ROLE_NAMES = ("thinker", "coder", "validator")
+
+
+def canonical_role(role: str) -> str:
+    """Map a role alias to its canonical name ('planner' -> 'thinker')."""
+    return "thinker" if role == "planner" else role
+
+
+def ceiling_for(role: str) -> int:
+    """The static num_ctx ceiling for a role. Every num_ctx anywhere is
+    clamped through this — a later calibration phase swaps in measured values
+    here without touching any caller."""
+    return ROLE_CTX_CEILINGS.get(canonical_role(role), max(ROLE_CTX_CEILINGS.values()))
+
 # Canonical default roles: the single source of truth for model + sampling.
 # thinker = planner/Q&A, coder = code, validator = review (thinker model+ctx).
 def _default_roles() -> dict[str, dict[str, Any]]:
@@ -157,7 +172,8 @@ class AgentConfig:
     @property
     def max_context_tokens(self) -> int:
         # The thinker context window is the pipeline's default budget ceiling.
-        return int(self.roles["thinker"]["num_ctx"])  # type: ignore[index]
+        # Clamped through ceiling_for like every other num_ctx path.
+        return min(int(self.roles["thinker"]["num_ctx"]), ceiling_for("thinker"))  # type: ignore[index]
 
     @property
     def keep_alive(self) -> str:
@@ -166,7 +182,7 @@ class AgentConfig:
     def get_role_config(self, role: str) -> dict[str, Any]:
         """Effective settings for a role, num_ctx clamped to the role ceiling."""
         # Legacy alias: "planner" is the thinker role.
-        canonical = "thinker" if role == "planner" else role
+        canonical = canonical_role(role)
         cfg = dict(self.roles.get(canonical, self.roles["thinker"]))  # type: ignore[arg-type]
         ceiling = ROLE_CTX_CEILINGS.get(canonical)
         if ceiling is not None:
@@ -279,6 +295,56 @@ def benchmark_and_calculate_tokens(
     if is_3b or vram_gb <= RTX_3050_VRAM_CEILING_GB:
         return 4096
     return 8192
+
+
+class RoleRegistry:
+    """Validated get/set over the roles config, persisted to .agent.
+
+    The seam for live role switching: the gateway reads roles at call time
+    (per generate, under its lock), so a ``set`` here applies on the NEXT
+    call, never mid-generation. Model *existence* validation (exact match
+    against /api/tags) stays with the caller — the registry is pure config.
+    """
+
+    ALLOWED_FIELDS = {
+        "model", "num_ctx", "num_predict", "temperature",
+        "keep_alive", "inline_system", "think_budget",
+    }
+
+    def __init__(self, config: AgentConfig, workspace: str | Path | None = None) -> None:
+        self.config = config
+        self.workspace = Path(workspace).resolve() if workspace else None
+
+    def get(self, role: str) -> dict[str, Any]:
+        return self.config.get_role_config(role)
+
+    def set(self, role: str, **fields: Any) -> dict[str, Any]:
+        canonical = canonical_role(role)
+        if canonical not in ROLE_NAMES:
+            raise ValueError(f"unknown role: {role}")
+        unknown = set(fields) - self.ALLOWED_FIELDS
+        if unknown:
+            raise ValueError(f"unknown role fields: {sorted(unknown)}")
+        cfg = self.config.roles[canonical]
+        for key, value in fields.items():
+            if value is None:
+                continue
+            if key == "num_ctx":
+                value = max(512, min(int(value), ceiling_for(canonical)))
+            elif key in ("num_predict", "think_budget"):
+                value = max(0, int(value))
+            elif key == "temperature":
+                value = max(0.0, min(float(value), 2.0))
+            elif key == "inline_system":
+                value = bool(value)
+            else:  # model, keep_alive
+                value = str(value).strip()
+                if not value:
+                    raise ValueError(f"{key} must not be empty")
+            cfg[key] = value
+        if self.workspace is not None:
+            save_agent_config(self.config, self.workspace)
+        return self.config.get_role_config(canonical)
 
 
 def get_agent_config_path(workspace_root: str | Path | None = None) -> Path:

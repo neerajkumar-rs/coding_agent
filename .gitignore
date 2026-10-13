@@ -17,6 +17,5 @@ logs
 .agents
 .agent
 .agent_staging/
-.agent_logs/
 .agent_runs/
 .agent_tui_state.json

@@ -1,7 +1,9 @@
 """Architectural Isolation & Deferred File Staging Manager.
 
-Enforces zero-touch active directory execution: all code generation occurs in .agent_staging/.
-Provides discrete session logs in .agent_logs/ and fast atomic deployment.
+Enforces zero-touch active directory execution: all code generation occurs in
+.agent_staging/, with fast atomic deployment. Run logging lives in the
+per-run journal (.agent_runs/<run_id>/, see agent_core.run_state) — the old
+workspace-level log matrix is retired.
 """
 
 from __future__ import annotations
@@ -18,73 +20,25 @@ from typing import Any
 
 logger = logging.getLogger("staging_manager")
 
-LOGS_DIR_NAME = ".agent_logs"
 STAGING_DIR_NAME = ".agent_staging"
 
 
 class WorkspaceStagingManager:
-    """Manages isolated staging sandbox and discrete operational logging matrix."""
+    """Manages the isolated staging sandbox (.agent_staging/) and deployment.
+
+    Per-run logging lives in the run journal (.agent_runs/<run_id>/); this
+    class intentionally has no logging surface.
+    """
 
     def __init__(self, workspace_root: str | Path | None = None) -> None:
         self.workspace_root = Path(workspace_root).resolve() if workspace_root else Path.cwd().resolve()
-        self.logs_dir = self.workspace_root / LOGS_DIR_NAME
         self.staging_dir = self.workspace_root / STAGING_DIR_NAME
-
-        self.planner_log_path = self.logs_dir / "planner.log"
-        self.coder_log_path = self.logs_dir / "coder.log"
-        self.sandbox_log_path = self.logs_dir / "sandbox.log"
 
         self.ensure_directories()
 
     def ensure_directories(self) -> None:
-        """Create logging matrix and isolated staging sandbox folders."""
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        """Create the isolated staging sandbox folder."""
         self.staging_dir.mkdir(parents=True, exist_ok=True)
-
-    # -------------------------------------------------------------------------
-    # Discrete Logging Matrix
-    # -------------------------------------------------------------------------
-
-    def _append_log(self, path: Path, content: str) -> None:
-        try:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            header = f"\n{'='*70}\n[{timestamp}]\n"
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(header + content + "\n")
-        except Exception as exc:
-            logger.error(f"Failed writing to {path}: {exc}")
-
-    def log_planner(self, reasoning: str, task_queue: list[dict[str, Any]] | None = None) -> None:
-        """Write discrete operational log for planner: raw reasoning + generated task arrays."""
-        content = f"--- RAW REASONING ---\n{reasoning.strip()}\n\n"
-        if task_queue is not None:
-            content += f"--- GENERATED TASK QUEUE ---\n{json.dumps(task_queue, indent=2)}"
-        self._append_log(self.planner_log_path, content)
-
-    def log_coder(self, file_path: str, code_block: str, task_description: str = "") -> None:
-        """Write discrete operational log for coder: generated source code blocks."""
-        desc_line = f"Task: {task_description}\n" if task_description else ""
-        content = f"--- TARGET FILE: {file_path} ---\n{desc_line}--- CODE BLOCK ---\n{code_block}"
-        self._append_log(self.coder_log_path, content)
-
-    def log_sandbox(
-        self,
-        command: str | list[str],
-        exit_code: int,
-        stdout: str,
-        stderr: str,
-        duration_s: float | None = None,
-    ) -> None:
-        """Write discrete operational log for sandbox: terminal compilation/execution output."""
-        cmd_str = command if isinstance(command, str) else " ".join(command)
-        dur_str = f" Duration: {duration_s:.3f}s" if duration_s is not None else ""
-        content = (
-            f"--- SANDBOX EXECUTION --- Exit Code: {exit_code}{dur_str}\n"
-            f"Command: {cmd_str}\n"
-            f"--- STDOUT ---\n{stdout.strip()}\n"
-            f"--- STDERR ---\n{stderr.strip()}"
-        )
-        self._append_log(self.sandbox_log_path, content)
 
     # -------------------------------------------------------------------------
     # Deferred Staging Memory

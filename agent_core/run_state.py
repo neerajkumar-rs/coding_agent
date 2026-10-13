@@ -48,6 +48,92 @@ def diagnostic_hash(text: str) -> str:
     return hashlib.sha256(" ".join(text.split()).encode("utf-8")).hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# Log channel registry — the plug-and-play core of run logging.
+#
+# Every log a run can produce is ONE entry here: name -> filename under
+# .agent_runs/<run_id>/. Writers (RunJournal.log_*) and readers (both TUIs'
+# /logs) go through this registry, so adding a channel (a fourth role, a
+# bench log, a calibration log) is a one-line entry — no reader/writer
+# changes anywhere else.
+# ---------------------------------------------------------------------------
+LOG_CHANNELS: dict[str, str] = {
+    "thinker": "thinker.log",
+    "coder": "coder.log",
+    "validator": "validator.log",
+    "sandbox": "sandbox.log",
+    "events": "events.jsonl",
+}
+
+# Channels that hold role logs (everything except "events"); used when /logs
+# is called with no channel filter.
+ROLE_CHANNELS: tuple[str, ...] = tuple(c for c in LOG_CHANNELS if c != "events")
+
+
+def channel_path(run_dir: Path, channel: str) -> Path:
+    """The file a channel writes to, under the given run dir."""
+    filename = LOG_CHANNELS.get(channel, f"{channel}.log")
+    return Path(run_dir) / filename
+
+
+def latest_run_dir(workspace: Path | str) -> Path | None:
+    """The most recent .agent_runs/<run_id>/ for a workspace, or None."""
+    runs_dir = Path(workspace) / RUNS_DIR_NAME
+    if not runs_dir.is_dir():
+        return None
+    run_dirs = sorted((d for d in runs_dir.iterdir() if d.is_dir()), reverse=True)
+    return run_dirs[0] if run_dirs else None
+
+
+def tail_run_logs(
+    workspace: Path | str,
+    channel: str = "",
+    lines: int = 60,
+) -> dict[str, Any]:
+    """Read the LATEST run's logs for a workspace. Pure data — both TUIs
+    render this their own way.
+
+    ``channel`` picks one registered channel ("" = all role channels).
+    ``lines`` is a LINE count (tail semantics). Never raises: an unreadable
+    file becomes {"error": ...}. Returns {"run_id", "searched", "sections"},
+    where "searched" is the exact path checked when no run exists.
+    """
+    runs_dir = Path(workspace) / RUNS_DIR_NAME
+    chosen = latest_run_dir(workspace)
+    if chosen is None:
+        return {"run_id": None, "searched": str(runs_dir), "sections": []}
+
+    channels = [channel] if channel in LOG_CHANNELS else list(ROLE_CHANNELS)
+    sections: list[dict[str, Any]] = []
+    for name in channels:
+        path = channel_path(chosen, name)
+        if not path.exists():
+            continue
+        try:
+            tail = path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+            sections.append({"channel": name, "path": str(path), "lines": tail})
+        except OSError as exc:
+            sections.append({"channel": name, "path": str(path), "error": str(exc)})
+    return {"run_id": chosen.name, "searched": str(chosen), "sections": sections}
+
+
+def format_run_logs(result: dict[str, Any]) -> str:
+    """Render tail_run_logs output as plain text (shared by both TUIs)."""
+    if result.get("run_id") is None:
+        return f"No runs yet — searched {result.get('searched')}"
+    parts = [f"--- latest run: {result['run_id']} ---"]
+    sections = result.get("sections", [])
+    if not sections:
+        parts.append(f"(no logs in {result.get('searched')})")
+    for section in sections:
+        header = f"--- {LOG_CHANNELS.get(section['channel'], section['channel'])} ---"
+        if "error" in section:
+            parts.append(f"{header}\n(unreadable: {section['error']})")
+        else:
+            parts.append(header + "\n" + "\n".join(section["lines"]))
+    return "\n".join(parts)
+
+
 @dataclass
 class RunJournal:
     """Persists run metadata under .agent_runs/<run_id>/ (never workspace root)."""
@@ -110,8 +196,8 @@ class RunJournal:
     RAW_LOG_CHARS = 20_000  # raw prompt/response truncated to this per call
 
     def role_log_path(self, role: str) -> Path:
-        """thinker.log / coder.log / validator.log / sandbox.log under the run."""
-        return self.run_dir / f"{role}.log"
+        """The file a role/channel writes to (registry-driven)."""
+        return channel_path(self.run_dir, role)
 
     def log_role(self, role: str, content: str) -> None:
         """Append a timestamped block to the role's log file."""
@@ -135,18 +221,38 @@ class RunJournal:
         num_ctx: int | None = None,
         seconds: float | None = None,
         error: str | None = None,
+        think_chars: int | None = None,
+        done_reason: str | None = None,
+        eval_count: int | None = None,
+        eval_duration_ns: int | None = None,
+        size_vram: int | None = None,
+        size_total: int | None = None,
     ) -> None:
         """Record one raw LLM call (prompt + response, each truncated to
-        RAW_LOG_CHARS) in the role's log, and emit an llm_call event."""
+        RAW_LOG_CHARS) in the role's log, and emit an llm_call event.
+
+        All metadata fields are optional so old call sites keep working;
+        new fields are simply added to the header line when present. This is
+        the plug-and-play contract: extend the signature, and the block gets
+        richer without any reader change."""
         def _cut(text: str) -> str:
             text = text or ""
             return text if len(text) <= self.RAW_LOG_CHARS else (
                 text[: self.RAW_LOG_CHARS] + "\n...[truncated to 20KB]"
             )
 
+        tok_per_s: float | None = None
+        if eval_count is not None and eval_duration_ns:
+            tok_per_s = round(eval_count / (eval_duration_ns / 1e9), 1)
+        meta = (
+            f"num_ctx: {num_ctx}  temperature: {temperature}  seconds: {seconds}"
+            f"  think_chars: {think_chars}  done_reason: {done_reason}"
+            f"  eval_count: {eval_count}  tok/s: {tok_per_s}"
+            f"  size_vram: {size_vram}  size_total: {size_total}"
+        )
         lines = [
             f"MODEL: {model}",
-            f"num_ctx: {num_ctx}  temperature: {temperature}  seconds: {seconds}",
+            meta,
             "--- PROMPT ---",
             _cut(prompt),
             "--- RESPONSE ---",
@@ -159,5 +265,8 @@ class RunJournal:
             "event": "llm_call", "role": role, "model": model,
             "seconds": seconds, "num_ctx": num_ctx,
             "prompt_chars": len(prompt), "response_chars": len(response),
+            "think_chars": think_chars, "done_reason": done_reason,
+            "eval_count": eval_count, "tok_per_s": tok_per_s,
+            "size_vram": size_vram, "size_total": size_total,
             "error": error,
         })

@@ -1,10 +1,10 @@
 """Planner model schema-conformance benchmark.
 
-Runs N probe prompts against a candidate planner model through Ollama's
-structured-output path and reports the failure rate. If the configured
-planner (default erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest) fails schema validation on more than
-PLANNER_FAILURE_THRESHOLD of the probes, the recommended fallback is
-qwen2.5-coder:3b.
+Runs N probe prompts through the single AgentGateway (role config, VRAM
+guard, structured-output path) and reports the failure rate. If the
+configured thinker (default erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest)
+fails schema validation on more than PLANNER_FAILURE_THRESHOLD of the probes,
+the recommended fallback is qwen2.5-coder:3b-instruct.
 
 Usage:
     .\\env\\Scripts\\python.exe -m agent_core.planner_eval [--model NAME] [--probes 5]
@@ -13,14 +13,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 
-from agent_core.llm_gateway import LLMGateway, StructuredOutputError
 from agent_core.schemas import Plan
-from ollama_client import OllamaEngine, TEMPERATURE_PLAN
+from ollama_client import AgentGateway, OllamaSupervisorClient
 
 PLANNER_FAILURE_THRESHOLD = 0.20
-FALLBACK_PLANNER = "qwen2.5-coder:3b"
+FALLBACK_PLANNER = "qwen2.5-coder:3b-instruct"
 
 PROBES = [
     "Create a Python CLI that greets a user by name.",
@@ -31,21 +31,43 @@ PROBES = [
 ]
 
 
-def evaluate_planner(model: str, probes: int = len(PROBES)) -> dict:
-    """Return {'model', 'probes', 'failures', 'failure_rate', 'ok'}."""
-    gateway = LLMGateway(OllamaEngine())
+class _ProbeConfig:
+    """Minimal config shim: lets a probe model override the thinker role."""
+
+    def __init__(self, base, model: str) -> None:
+        object.__setattr__(self, "_base", base)
+        object.__setattr__(self, "_model", model)
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(object.__getattribute__(self, "_base"), name)
+
+    def __deepcopy__(self, memo):
+        return _ProbeConfig(self._base, self._model)
+
+    def get_role_config(self, role: str) -> dict:
+        cfg = dict(self._base.get_role_config(role))
+        if role in ("thinker", "planner"):
+            cfg["model"] = self._model
+        return cfg
+
+
+async def _evaluate(model: str, probes: int) -> dict:
+    gateway = AgentGateway(OllamaSupervisorClient())
+    if model:
+        gateway.config = _ProbeConfig(gateway.config, model)
     failures = 0
     for probe in PROBES[: max(1, probes)]:
         try:
-            gateway.structured(
-                model, f"Plan this request:\n{probe}", Plan,
-                max_tokens=900, temperature=TEMPERATURE_PLAN,
+            await gateway.structured(
+                "thinker", f"Plan this request:\n{probe}", Plan,
             )
-        except (StructuredOutputError, Exception):  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - any failure counts against the model
             failures += 1
     rate = failures / max(1, min(probes, len(PROBES)))
     return {
-        "model": model,
+        "model": model or gateway.config.get_role_config("thinker")["model"],
         "probes": min(probes, len(PROBES)),
         "failures": failures,
         "failure_rate": round(rate, 3),
@@ -53,9 +75,14 @@ def evaluate_planner(model: str, probes: int = len(PROBES)) -> dict:
     }
 
 
+def evaluate_planner(model: str, probes: int = len(PROBES)) -> dict:
+    """Return {'model', 'probes', 'failures', 'failure_rate', 'ok'}."""
+    return asyncio.run(_evaluate(model, probes))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Planner schema-conformance benchmark")
-    parser.add_argument("--model", default="erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest")
+    parser.add_argument("--model", default="")
     parser.add_argument("--probes", type=int, default=len(PROBES))
     args = parser.parse_args(argv)
 
@@ -67,8 +94,7 @@ def main(argv: list[str] | None = None) -> int:
     if not result["ok"]:
         print(
             f"FAIL: schema failure rate above {PLANNER_FAILURE_THRESHOLD:.0%}. "
-            f"Recommended planner: {FALLBACK_PLANNER} "
-            f"(set planner_model in .agent or pass --planner-model)."
+            f"Recommended planner: {FALLBACK_PLANNER}."
         )
         return 1
     print("PASS: model conforms to the Plan schema reliably enough.")
