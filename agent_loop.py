@@ -65,9 +65,10 @@ Tools (one line each):
 
 Rules: look at files before answering about them; only create or change files
 the user asked for; choose sensible defaults and say them in the reply; do the
-task yourself — never explain shell commands or tell the user to run tools;
-when the work is done, reply with a short summary; when nothing more is
-needed, finish.
+task yourself — never explain shell commands or tell the user to run tools.
+After a list_files/read_file/search observation you HAVE the answer: the next
+action is reply with it (never list or read the same thing twice). When the
+work is done, reply with a short summary; when nothing more is needed, finish.
 
 USER REQUEST: {request}
 
@@ -324,10 +325,13 @@ async def agent_turn(
                 str(f.get("name", ""))
                 for f in build_file_facts(workspace).get("files", [])
             ]
+            obs = obs + "\n(You have the listing. Reply with it now.)"
         elif action.action == "read_file":
             obs = _read_file(workspace, action.path)
+            obs = obs + "\n(You have the content. Reply with the answer now.)"
         elif action.action == "search":
             obs = _search(workspace, action.text or action.path)
+            obs = obs + "\n(You have the matches. Reply with the answer now.)"
         elif action.action == "run_test":
             obs = _run_test(workspace)
             result.test_result = obs
