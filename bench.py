@@ -354,20 +354,33 @@ async def _classify_ab_model(
     latencies: list[float] = []
     shell_leaks = 0
     reply_lines = 0
+    errors: list[str] = []
     for entry in eval_lines:
         if entry["expected"] == "fast":
             continue  # fast paths never touch a model — nothing to measure
         total += 1
         t0 = time.monotonic()
-        label = await classify_mode(
-            entry["text"], generate=_gen, file_names=[], last_turn="",
-        )
+        try:
+            label = await classify_mode(
+                entry["text"], generate=_gen, file_names=[], last_turn="",
+            )
+        except Exception as exc:
+            # A model that cannot classify at this budget (e.g. a reasoning
+            # model truncated at num_predict<=12) records the line as wrong
+            # and the error — the A/B report shows it, never crashes.
+            latencies.append(time.monotonic() - t0)
+            errors.append(f"{entry['text'][:40]}: {str(exc)[:120]}")
+            continue
         latencies.append(time.monotonic() - t0)
         if label == entry["expected"]:
             correct += 1
         if label == "reply":
             reply_lines += 1
-            answer = await reply_step(entry["text"], generate=_gen, facts_block=facts_block)
+            try:
+                answer = await reply_step(entry["text"], generate=_gen, facts_block=facts_block)
+            except Exception as exc:
+                errors.append(f"reply {entry['text'][:40]}: {str(exc)[:120]}")
+                continue
             if _SHELL_HINT_RE.search(answer):
                 shell_leaks += 1
     accuracy = round(100.0 * correct / total, 1) if total else 0.0
@@ -380,6 +393,7 @@ async def _classify_ab_model(
         "p95": _pctl(latencies, 95),
         "reply_lines": reply_lines,
         "shell_leaks": shell_leaks,
+        "errors": errors[:10],
     }
 
 

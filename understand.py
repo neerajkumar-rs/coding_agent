@@ -86,9 +86,21 @@ CLASSIFY_SCHEMA = {
 }
 
 CLASSIFY_PROMPT = """Classify the message. Answer with one word: reply, code, or both.
-reply = user wants information, a list, an explanation, or chat. No file is created or changed.
-code  = user wants a file created or changed.
-both  = user wants something explained AND a file created or changed.
+
+code = the message asks to CREATE, CHANGE, FIX or SAVE a concrete file or app,
+       and names what to build (a filename like notes.md or app.py, or a clear
+       artifact: "a form in login.html", "a flask app"). Polite forms count
+       ("can you make a form in login.html" -> code). Hinglish counts.
+both = the message asks a question AND ALSO asks for a file ("what is a closure,
+       then write an example file" -> both).
+reply = everything else: questions ("how do i ...", "what is ...", "yeh error
+       kyun"), listing or describing the workspace ("list the files", "make a
+       list of files", "what is in this dir"), pasted errors or stack traces,
+       follow-ups ("run it again", "change it", "and then?"), vague fragments
+       with typos and no clear artifact ("creat a pag", "write code",
+       "make somthing"), and chat. When in doubt: reply (reply never creates
+       a file; a wrong code creates one).
+
 Files in workspace: {files}
 Last turn: {last_turn}
 
