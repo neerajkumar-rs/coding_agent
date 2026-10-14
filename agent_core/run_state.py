@@ -261,6 +261,13 @@ class RunJournal:
         self.events_path = self.run_dir / "events.jsonl"
         self.tasks_path = self.run_dir / "tasks.md"
         self.backup_dir = self.run_dir / "backup"
+        # Per-model size_total seen at the previous call: a change means Ollama
+        # reloaded the model (e.g. a different num_ctx) — flagged on the event.
+        self._last_size_total: dict[str, int] = {}
+        self._call_seq = 0
+        # The ONLY llm_calls count that matters: real model calls, one per
+        # llm_call event. Deterministic stages never increment it.
+        self.llm_call_count = 0
 
     def write_task_plan(self, tasks: list[dict[str, Any]], spec_chars: int = 8_000) -> None:
         lines = ["# Agent run task plan", "", "Tasks are processed sequentially.", ""]
@@ -335,6 +342,7 @@ class RunJournal:
         eval_duration_ns: int | None = None,
         size_vram: int | None = None,
         size_total: int | None = None,
+        extra_call_fields: dict[str, Any] | None = None,
     ) -> None:
         """Record one raw LLM call (prompt + response, each truncated to
         RAW_LOG_CHARS) in the role's log, and emit an llm_call event.
@@ -352,11 +360,18 @@ class RunJournal:
         tok_per_s: float | None = None
         if eval_count is not None and eval_duration_ns:
             tok_per_s = round(eval_count / (eval_duration_ns / 1e9), 1)
+        reload_suspected = False
+        if size_total is not None:
+            prev = self._last_size_total.get(model)
+            if prev is not None and prev != size_total:
+                reload_suspected = True
+            self._last_size_total[model] = size_total
         meta = (
             f"num_ctx: {num_ctx}  temperature: {temperature}  seconds: {seconds}"
             f"  think_chars: {think_chars}  done_reason: {done_reason}"
             f"  eval_count: {eval_count}  tok/s: {tok_per_s}"
             f"  size_vram: {size_vram}  size_total: {size_total}"
+            + ("  reload_suspected: true" if reload_suspected else "")
         )
         lines = [
             f"MODEL: {model}",
@@ -369,7 +384,7 @@ class RunJournal:
         if error:
             lines.append(f"--- ERROR ---\n{error}")
         self.log_role(role, "\n".join(lines))
-        self.emit_event({
+        event: dict[str, Any] = {
             "event": "llm_call", "role": role, "model": model,
             "seconds": seconds, "num_ctx": num_ctx,
             "prompt_chars": len(prompt), "response_chars": len(response),
@@ -377,4 +392,66 @@ class RunJournal:
             "eval_count": eval_count, "tok_per_s": tok_per_s,
             "size_vram": size_vram, "size_total": size_total,
             "error": error,
-        })
+        }
+        if reload_suspected:
+            event["reload_suspected"] = True
+        self.llm_call_count += 1
+        self.emit_event(event)
+        # Full per-call record for the debug export (calls/<n>.json).
+        self._call_seq += 1
+        self._write_call_record(
+            self._call_seq, role, model=model, prompt=prompt, response=response,
+            temperature=temperature, num_ctx=num_ctx, seconds=seconds,
+            error=error, think_chars=think_chars, done_reason=done_reason,
+            eval_count=eval_count, eval_duration_ns=eval_duration_ns,
+            tok_per_s=tok_per_s, size_vram=size_vram, size_total=size_total,
+            reload_suspected=reload_suspected,
+            extra=extra_call_fields,
+        )
+
+    def _write_call_record(
+        self,
+        n: int,
+        role: str,
+        *,
+        model: str,
+        prompt: str,
+        response: str,
+        temperature: float | None,
+        num_ctx: int | None,
+        seconds: float | None,
+        error: str | None,
+        think_chars: int | None,
+        done_reason: str | None,
+        eval_count: int | None,
+        eval_duration_ns: int | None,
+        tok_per_s: float | None,
+        size_vram: int | None,
+        size_total: int | None,
+        reload_suspected: bool,
+        extra: dict[str, Any] | None,
+    ) -> None:
+        """Write the FULL per-call record (prompt, raw response, think text,
+        meta) to calls/<n>.json — the debug export caps and redacts from here.
+        Never raises into the run flow."""
+        record: dict[str, Any] = {
+            "n": n, "role": role, "model": model,
+            "prompt": prompt, "response": response,
+            "temperature": temperature, "num_ctx": num_ctx, "seconds": seconds,
+            "error": error, "think_chars": think_chars,
+            "done_reason": done_reason, "eval_count": eval_count,
+            "eval_duration_ns": eval_duration_ns, "tok_per_s": tok_per_s,
+            "size_vram": size_vram, "size_total": size_total,
+            "reload_suspected": reload_suspected,
+        }
+        if extra:
+            record.update(extra)
+        try:
+            calls_dir = self.run_dir / "calls"
+            calls_dir.mkdir(parents=True, exist_ok=True)
+            (calls_dir / f"{n:03d}.json").write_text(
+                json.dumps(record, ensure_ascii=False, indent=1),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass

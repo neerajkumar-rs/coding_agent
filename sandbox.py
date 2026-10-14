@@ -25,37 +25,13 @@ def tail_lines(text: str, count: int = 30) -> str:
 def check_plausible_content(rel_path: str, content: str) -> str | None:
     """Non-Python plausibility check. Returns an error string, or None if OK.
 
-    Fails: empty files, prose-only content, and leftover markdown fences.
-    Valid HTML needs a doctype/<html> AND a <body> and reasonable length.
+    Delegates to the ONE file-type registry (filetypes.check_file). Prose
+    types (.md/.txt) allow code fences; code types reject leftover fences;
+    binary-backed checks (node/rustc/bash) skip cleanly when not installed.
     """
-    if not content.strip():
-        return "file is empty"
-    if "```" in content:
-        return "leftover markdown fences (```) in file content"
-    suffix = Path(rel_path).suffix.lower()
-    if suffix == ".json":
-        import json
+    from filetypes import check_file
 
-        try:
-            json.loads(content)
-        except json.JSONDecodeError as exc:
-            return f"invalid JSON: {exc}"
-    elif suffix == ".html":
-        lower = content.lower()
-        if "<html" not in lower and "<!doctype" not in lower:
-            return "HTML file contains neither <html> nor <!doctype"
-        if "<body" not in lower:
-            return "HTML file has no <body>"
-        if len(content.strip()) < 40:
-            return "HTML file is too short to be a real page"
-    elif suffix == ".css":
-        if "{" not in content or "}" not in content:
-            return "CSS file contains no rule blocks"
-    elif suffix == ".js":
-        plausible = ("function", "=>", "const ", "let ", "var ", "document.", "module")
-        if not any(token in content for token in plausible):
-            return "JS file has no recognizable JavaScript constructs"
-    return None
+    return check_file(rel_path, content)
 
 
 class ExecutionSandbox:

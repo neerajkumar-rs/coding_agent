@@ -73,10 +73,20 @@ __all__ = [
 # THE request pipeline: ROUTE -> PLAN -> CODE -> CHECK -> VALIDATE -> SUMMARY
 # ===========================================================================
 
-LANGUAGE_BY_SUFFIX = {
-    ".py": "python", ".html": "html", ".css": "css",
-    ".js": "javascript", ".json": "json", ".md": "markdown",
-    ".txt": "text", ".rs": "rust",
+# The one file-type registry (filetypes.py) is the ONLY suffix table; these
+# are read-through views so existing attribute access keeps working.
+from filetypes import (
+    ALLOWED_SUFFIXES,
+    PROSE_SUFFIXES,
+    TEXT_SUFFIXES,
+    check_file,
+    extract_content,
+    language_of,
+)
+
+LANGUAGE_BY_SUFFIX = {  # read-through view over the registry (never edit here)
+    ext: e["language"] for ext, e in
+    __import__("filetypes").FILE_TYPES.items()
 }
 
 PLACEHOLDER_STEMS = {"your_code", "example", "foo", "file1", "untitled", "file", "code", "test"}
@@ -109,7 +119,7 @@ FILE_Q_SKIP_DIRS = {".git", ".agent_staging", ".agent_runs",
 FILE_Q_MAX_ENTRIES = 200
 FILE_Q_MAX_DETAIL = 20
 FILE_Q_HEAD_LINES = 30
-TEXT_SUFFIXES = set(LANGUAGE_BY_SUFFIX) | {".txt", ".toml", ".yml", ".yaml", ".cfg", ".ini"}
+# TEXT_SUFFIXES comes from the registry (imported above).
 
 
 def _file_language(path: Path) -> str:
@@ -117,10 +127,15 @@ def _file_language(path: Path) -> str:
 
 
 def build_file_facts(workspace: Path) -> dict[str, Any]:
-    """Deterministic scan: tree (depth 2) + per-text-file stats and heads."""
+    """Deterministic scan: tree (depth 2) + per-text-file stats and heads.
+
+    Returns {"tree", "files", "all_files"}: ``files`` carries text-file
+    details; ``all_files`` lists EVERY relative path (binaries included) so
+    the reply layer can tell "named but binary" apart from "absent"."""
     workspace = Path(workspace).resolve()
     tree_lines: list[str] = []
     details: list[dict[str, Any]] = []
+    all_files: list[str] = []
     count = 0
     for root, dirs, files in os.walk(workspace):
         dirs[:] = sorted(d for d in dirs if d not in FILE_Q_SKIP_DIRS and not d.startswith("."))
@@ -139,6 +154,7 @@ def build_file_facts(workspace: Path) -> dict[str, Any]:
             path = Path(root) / name
             rel = path.relative_to(workspace).as_posix()
             tree_lines.append(f"{indent}  {name}")
+            all_files.append(rel)
             if path.suffix.lower() not in TEXT_SUFFIXES:
                 continue  # skip binaries
             if len(details) >= FILE_Q_MAX_DETAIL:
@@ -154,7 +170,7 @@ def build_file_facts(workspace: Path) -> dict[str, Any]:
                 "size": path.stat().st_size,
                 "head": "\n".join(text.splitlines()[:FILE_Q_HEAD_LINES]),
             })
-    return {"tree": "\n".join(tree_lines), "files": details}
+    return {"tree": "\n".join(tree_lines), "files": details, "all_files": all_files}
 
 
 def format_file_table(facts: dict[str, Any]) -> str:
@@ -170,15 +186,20 @@ def format_file_table(facts: dict[str, Any]) -> str:
 
 
 def _language_of(path: str) -> str:
-    return LANGUAGE_BY_SUFFIX.get(Path(path).suffix.lower(), "text")
+    return language_of(path)
 
 
 def _valid_plan_task(task: dict[str, Any]) -> str | None:
-    """Return a rejection reason, or None when the plan task is acceptable."""
+    """Return a rejection reason, or None when the plan task is acceptable.
+
+    SAFETY rules only (empty path, junk artifact name, unsupported type). The
+    old word-count and language-mismatch rules rejected legitimate plans (a
+    7-word "Create a README file for the project") and are gone — the model's
+    description quality is not a safety concern; the coder + CHECK catch bad
+    content."""
     from scanner import is_junk_file
 
     path = str(task.get("path", "")).strip().replace("\\", "/")
-    desc = str(task.get("description", "")).strip()
     if not path:
         return "empty path"
     # Never plan around leftover run artifacts (tasks.md, summary.txt,
@@ -189,21 +210,27 @@ def _valid_plan_task(task: dict[str, Any]) -> str | None:
     if stem in PLACEHOLDER_STEMS:
         return f"placeholder filename: {path}"
     suffix = Path(path).suffix.lower()
-    if suffix not in ALLOWED_TARGET_SUFFIXES:
+    if suffix not in ALLOWED_SUFFIXES:
         return f"unsupported file type: {path}"
-    if len(desc.split()) < 8:
-        return f"description under 8 words: {desc!r}"
-    # Extension/language mismatch: description names a DIFFERENT language.
-    lang_words = {
-        ".html": ("html",), ".css": ("css",),
-        ".js": ("javascript", "js"), ".py": ("python",),
-        ".rs": ("rust", "rs"),
-    }
-    mentioned = {lang for words in lang_words.values() for lang in words if f" {lang} " in f" {desc.lower()} "}
-    own = set(lang_words.get(suffix, ()))
-    if mentioned and not (mentioned & own):
-        return f"extension/language mismatch: {path} vs {sorted(mentioned)}"
     return None
+
+
+def invented_file_rejection(tasks: list[dict[str, Any]], user_request: str) -> str | None:
+    """A plan whose ONLY task is an unrelated invented file is rejected:
+    the file name does not appear in the request and the request has no
+    web/page wording (which legitimises inferred index.html/style.css/...).
+    """
+    if len(tasks) != 1:
+        return None
+    name = Path(str(tasks[0].get("path", ""))).name.lower()
+    if not name:
+        return None
+    msg = user_request.lower()
+    if name in msg:
+        return None
+    if any(h in msg for h in WEB_HINTS):
+        return None
+    return f"plan invents {name} which the request never names"
 
 
 def _valid_plan(tasks: list[dict[str, str]], user_request: str) -> list[str]:
@@ -213,6 +240,9 @@ def _valid_plan(tasks: list[dict[str, str]], user_request: str) -> list[str]:
     for task in tasks:
         if Path(task["path"]).name.lower() == "app.py" and not requested_app_py:
             reasons.append("app.py planned but never requested — name files descriptively")
+    invented = invented_file_rejection(tasks, user_request)
+    if invented:
+        reasons.append(invented)
     lower = user_request.lower()
     # Completeness fires when the request EXPLICITLY spans html+css+js (or a
     # multi-file web plan was produced): all three must be present then.
@@ -254,31 +284,22 @@ def _parse_plan_json(text: str) -> list[dict[str, Any]]:
     return [t for t in data if isinstance(t, dict)]
 
 
-def _extract_code(raw: str) -> str:
-    """Longest fenced block, or the stripped raw text when no fences exist."""
-    matches = re.findall(r"```(?:\w+)?\n(.*?)```", raw, re.DOTALL)
-    if matches:
-        return max(matches, key=len).rstrip() + "\n"
-    return raw.strip() + "\n"
+# Extraction + the per-file CHECK come from the filetypes registry (one
+# suffix table, one check per type). Kept as thin wrappers so existing call
+# sites and tests keep working.
+
+
+def _extract_code(raw: str, rel_path: str = "") -> str:
+    """Per-type extraction: prose unwraps one outer fence (inner fences stay);
+    code takes the longest fenced block. Registry: filetypes.extract_content."""
+    return extract_content(raw, rel_path)
 
 
 def _check_generated(rel_path: str, content: str) -> str | None:
-    """Per-file deterministic CHECK, fully in-process. Returns error or None.
-
-    Content problems return a string; an exception escaping this function is
-    an INFRA error (checker crashed) and aborts WITHOUT a coder retry.
-    """
-    suffix = Path(rel_path).suffix.lower()
-    if suffix == ".py":
-        # compile() in-memory: no temp files, no __pycache__, no os.devnull
-        # (py_compile with os.devnull fails on Windows: "nul is a non-regular
-        # file"), no dependence on cwd or paths with spaces.
-        try:
-            compile(content, rel_path, "exec")
-        except SyntaxError as exc:
-            return f"syntax error: {exc.msg} (line {exc.lineno})"
-        return None
-    return check_plausible_content(rel_path, content)
+    """Per-file deterministic CHECK via the registry. Returns error or None.
+    An exception escaping this function is an INFRA error (checker crashed)
+    and aborts WITHOUT a coder retry."""
+    return check_file(rel_path, content)
 
 
 def _check_html_links(
@@ -320,7 +341,8 @@ async def _summary_prose(
         sections.append(f"FILE: {name}\n{head}")
     prompt = (
         "Describe only features visible in the code shown, in 2-3 sentences. "
-        "Do not invent features.\n\n"
+        "Do not invent features. Write in GitHub-flavored markdown: short, "
+        "file names in backticks, no headings.\n\n"
         + "\n\n".join(sections)
         + "\n\nREQUEST: " + user_request
     )
@@ -352,30 +374,56 @@ def _summary_skeleton(
     validate_problems: list[str],
     validate_failed: bool,
     total_seconds: float,
+    validate_error: str = "",
+    validate_ran: bool = False,
 ) -> str:
-    """Deterministic part of the summary — built in code, never by a model."""
+    """Deterministic part of the summary — built in code, never by a model.
+
+    GitHub-flavored markdown: bullet lists, file names in backticks, bold
+    labels; the UNVERIFIED line is a blockquote. Honest verification wording:
+    a syntax-only CHECK pass is never reported as "verified"; when VALIDATE
+    fails or is skipped the summary says WHY and how to fix it, and the
+    validation problem is listed as the known issue (never "none")."""
     file_list = sorted(generated)
     lines: list[str] = []
+    issues = list(validate_problems)
     if validate_failed:
-        lines.append("UNVERIFIED — validation could not run.")
-    lines.append(
-        "Built: " + (", ".join(file_list) if file_list else "(no files passed CHECK)")
-    )
+        reason = (validate_error or "unknown error").replace("\n", " ")[:200]
+        fix_match = re.search(r"ollama pull \S+", reason)
+        fix = fix_match.group(0) if fix_match else (
+            "check /models and the validator role config"
+        )
+        lines.append(
+            f"> **UNVERIFIED** — validation could not run: {reason}. Fix: {fix}"
+        )
+        issues.append(f"validation could not run: {reason}")
+    elif validate_ran and generated:
+        # Distinguish deterministic checks from the model review explicitly.
+        lines.append(
+            "**Checks passed** (syntax/links); **validated against your request**: "
+            + ("no problems found" if not validate_problems else "see issues below")
+        )
+    elif generated:
+        lines.append("**Checks passed** (syntax/links) — not validated against your request.")
+    if file_list:
+        lines.append("**Built:**")
+        lines.extend(f"- `{f}`" for f in file_list)
+    else:
+        lines.append("**Built:** — (no files passed CHECK)")
     if failed_tasks:
-        lines.append("Failed:")
+        lines.append("**Failed:**")
         for t in failed_tasks:
-            lines.append(f"  NOT saved (failed): {t['path']} - {t['error']}")
+            lines.append(f"- NOT saved (failed): `{t['path']}` — {t['error']}")
     how: list[str] = []
     if any(f.endswith((".html", ".htm")) for f in file_list):
         page = next(f for f in file_list if f.endswith((".html", ".htm")))
-        how.append(f"open {page} in a browser")
+        how.append(f"open `{page}` in a browser")
     if any(f.endswith(".py") for f in file_list):
         script = next(f for f in file_list if f.endswith(".py"))
-        how.append(f"run: python {script}")
-    lines.append("How to run: " + ("; ".join(how) if how else "see file contents"))
-    issues = list(validate_problems)
-    lines.append("Known issues: " + ("; ".join(issues) if issues else "none"))
-    lines.append(f"Total time: {total_seconds:.1f}s")
+        how.append(f"run: `python {script}`")
+    lines.append("**How to run:** " + ("; ".join(how) if how else "see file contents"))
+    lines.append("**Known issues:** " + ("; ".join(issues) if issues else "none"))
+    lines.append(f"**Total time:** {total_seconds:.1f}s")
     return "\n".join(lines)
 
 
@@ -389,10 +437,13 @@ async def _build_summary(
     total_seconds: float,
     generate: Callable[..., Awaitable[str]],
     summary_model: str,
+    validate_error: str = "",
+    validate_ran: bool = False,
 ) -> str:
     skeleton = _summary_skeleton(
         user_request, generated, failed_tasks,
         validate_problems, validate_failed, total_seconds,
+        validate_error=validate_error, validate_ran=validate_ran,
     )
     prose = await _summary_prose(user_request, generated, generate, summary_model)
     return (prose + "\n\n" + skeleton) if prose else skeleton
@@ -419,6 +470,7 @@ async def run_pipeline(
     think_budget: int = 512,
     log_llm_calls: bool = True,
     understand_model: str | None = None,
+    validator_missing: str | None = None,
 ) -> dict[str, Any]:
     """ROUTE -> PLAN -> CODE -> CHECK -> VALIDATE -> SUMMARY.
 
@@ -468,6 +520,13 @@ async def run_pipeline(
         trace.append(entry)
         journal.emit_event({"event": "stage", **entry})
 
+    def _reported_llm_calls() -> int:
+        """The honest count: real model calls = llm_call events. The local
+        ``llm_calls`` counter stays the BUDGET counter (it pre-increments
+        before a call and counts one per structured-generate invocation); the
+        journal counts exactly one event per actual call."""
+        return journal.llm_call_count if journal.llm_call_count else llm_calls
+
     def _finish(status: str, extra: dict[str, Any] | None = None) -> None:
         state: dict[str, Any] = {
             "run_id": journal.run_id,
@@ -476,7 +535,7 @@ async def run_pipeline(
             "intent": trace[0].get("note") if trace else "",
             "roles": {"thinker": planner_model, "coder": coder_model},
             "num_ctx": num_ctx,
-            "llm_calls": llm_calls,
+            "llm_calls": _reported_llm_calls(),
             "elapsed_seconds": round(time.monotonic() - pipeline_start, 3),
         }
         if extra:
@@ -500,10 +559,9 @@ async def run_pipeline(
         try:
             import history as _history
 
-            convo_snap: dict[str, Any] = {}
-            convo = convo_box.get("convo")
-            if convo is not None:
-                convo_snap = _history.state_snapshot(convo)
+            # Pre-turn snapshot (captured right after load): the state the
+            # model actually saw for THIS turn — fixtures depend on it.
+            convo_snap: dict[str, Any] = convo_box.get("pre_turn_snapshot") or {}
             _history.append_turn(workspace, {
                 "text": user_request,
                 "path": path,
@@ -514,7 +572,7 @@ async def run_pipeline(
                     {k: t.get(k) for k in ("stage", "status", "seconds", "model") if t.get(k) is not None}
                     for t in trace
                 ],
-                "llm_calls": llm_calls,
+                "llm_calls": _reported_llm_calls(),
                 "seconds": round(time.monotonic() - pipeline_start, 3),
                 "outcome": outcome,
                 "error": error,
@@ -580,12 +638,57 @@ async def run_pipeline(
         # tiny CLASSIFY call, then ONE act call per label (reply facts / plan).
         from understand import (
             PlanFailed,
-            build_facts_block,
+            build_listing_skeleton,
+            build_reply_facts,
             classify_mode,
             fast_path,
+            is_listing_request,
             plan_tasks,
             reply_step,
+            verify_side_effect,
         )
+
+        def _facts_block() -> str:
+            """FACTS for the reply step: file table + named-file content."""
+            return build_reply_facts(
+                workspace, message, facts,
+                turns=convo.turns,
+                last_result=convo.last_result,
+                last_trace=convo.last_trace,
+                pending_question=convo.pending_question,
+            )
+
+        async def _answer() -> str:
+            """The reply step: deterministic one-sentence answer for a listing
+            ask on an empty workspace; otherwise the model on the FACTS block,
+            with the Python listing skeleton for listing asks. A degenerate
+            reply (only a file name, or under 3 chars) gets ONE honest retry,
+            then a fixed 'could not answer' sentence — never a bare name."""
+            if not facts["files"] and is_listing_request(message):
+                return "The workspace is empty — there are no files to list."
+            skeleton = ""
+            if facts["files"] and is_listing_request(message):
+                skeleton = build_listing_skeleton(facts)
+            names = {str(f.get("name", "")).lower() for f in facts["files"]}
+
+            def _degenerate(text: str) -> bool:
+                stripped = text.strip().strip('"`').strip()
+                return len(stripped) < 3 or stripped.lower() in names
+
+            answer = await reply_step(
+                message, generate=_llm, facts_block=_facts_block(),
+                skeleton=skeleton,
+                table_names=[str(f.get("name", "")) for f in facts["files"]],
+            )
+            if _degenerate(answer):
+                answer = await reply_step(
+                    message, generate=_llm, facts_block=_facts_block(),
+                    skeleton=skeleton,
+                    table_names=[str(f.get("name", "")) for f in facts["files"]],
+                )
+            if _degenerate(answer):
+                return "I could not answer that from the workspace facts."
+            return answer
 
         t0 = time.monotonic()
         fp = fast_path(user_request)
@@ -610,6 +713,11 @@ async def run_pipeline(
         # Conversation state: the models resolve references from it.
         convo = ConversationState.load(workspace)
         convo_box["convo"] = convo
+        # The state fed to the model THIS turn, captured BEFORE the turn runs:
+        # history's state_snapshot must be this, not the post-turn state.
+        import history as _history_mod
+
+        convo_box["pre_turn_snapshot"] = _history_mod.state_snapshot(convo)
         # Merge a pending question into the message; after one question we
         # proceed with assumptions — never two questions in a row.
         message = user_request
@@ -620,41 +728,52 @@ async def run_pipeline(
             )
         facts = build_file_facts(workspace)
         file_names = [str(f.get("name", "")) for f in facts.get("files", [])][:40]
-        last_turn_line = ""
-        if convo.turns:
-            last = convo.turns[-1]
-            last_turn_line = f"{last.get('user', '')[:80]} -> {last.get('mode', '')}"
+        route_model = understand_model or coder_model
 
         # ---------------------------------------------------------- CLASSIFY
+        # The classify prompt carries NO previous-turn text (a "Last turn"
+        # line biased labels toward `code`); context still flows to the reply
+        # and plan steps below via the conversation state.
         mode = await classify_mode(
             message,
             generate=_llm,
             file_names=file_names,
-            last_turn=last_turn_line,
         )
-        record("CLASSIFY", "ok", time.monotonic() - t0, mode, model=coder_model)
+        record("CLASSIFY", "ok", time.monotonic() - t0, mode, model=route_model)
+
+        # ------------------------------------------------------------ VERIFY
+        # Before ANY side effect: one tiny yes/no call re-checks a code|both
+        # label. "no" downgrades to reply (listing/showing/reading files is
+        # NOT creating or changing).
+        if mode in ("code", "both"):
+            t0 = time.monotonic()
+            side_effect = await verify_side_effect(message, generate=_llm)
+            if side_effect:
+                record("VERIFY", "ok", time.monotonic() - t0,
+                       f"side effect confirmed ({mode})", model=route_model)
+            else:
+                record("VERIFY", "ok", time.monotonic() - t0,
+                       f"downgraded {mode}->reply (no side effect)", model=route_model)
+                journal.emit_event({"event": "verify_downgrade",
+                                    "from": mode, "to": "reply"})
+                mode = "reply"
 
         reply_text: str | None = None
 
         if mode in ("reply", "both"):
             # ---------------------------------------------------------- ANSWER
             t0 = time.monotonic()
-            facts_block = build_facts_block(
-                facts,
-                turns=convo.turns,
-                last_result=convo.last_result,
-                last_trace=convo.last_trace,
-                pending_question=convo.pending_question,
-            )
-            reply_text = await reply_step(
-                message, generate=_llm, facts_block=facts_block,
-            )
-            record("ANSWER", "ok", time.monotonic() - t0, model=coder_model)
+            reply_text = await _answer()
+            record("ANSWER", "ok", time.monotonic() - t0, model=route_model)
             if mode == "reply":
+                # last_result stores a one-line DESCRIPTION of what happened
+                # (never the bare reply text — a bare file name fed back as
+                # context poisons the next turn's reads).
                 convo.record_turn(
-                    user_request, "reply", reply_text[:120],
+                    user_request, "reply", f"answered: {reply_text[:80]}",
                     trace=trace,
-                    last_result={"type": "reply", "text": reply_text},
+                    last_result={"type": "reply",
+                                 "text": f"answered: {reply_text[:80]}"},
                 )
                 _finish("completed")
                 _record_history("reply", "ok", label=mode, answer=reply_text)
@@ -670,6 +789,9 @@ async def run_pipeline(
                 generate=_llm,
                 file_names=file_names,
                 task_validator=_valid_plan_task,
+                plan_validator=lambda tasks, msg: (
+                    invented_file_rejection(tasks, msg)
+                ),
             )
         except PlanFailed as exc:
             record("PLAN", "failed", time.monotonic() - t0, str(exc)[:200])
@@ -689,7 +811,31 @@ async def run_pipeline(
         record("PLAN", "ok", time.monotonic() - t0,
                f"{len(tasks)} tasks"
                + (f" (assumptions: {'; '.join(assumptions[:3])})" if assumptions else ""),
-               model=coder_model)
+               model=route_model)
+
+        if not tasks:
+            # A code/both turn NEVER ends as a chat reply: the planner named no
+            # file -> needs_human with the plan's reason (truthful outcome in
+            # history too).
+            reason = plan.reason or "no file could be named"
+            journal.emit_event({"event": "plan_empty", "reason": reason[:300]})
+            record("PLAN", "ok", 0.0, f"no plannable file: {reason[:120]}")
+            _finish("needs_human", {"staged_files": [], "failed_tasks": []})
+            _record_history("code", "needs_human", label=mode,
+                            error={"stage": "PLAN", "detail": reason[:500]})
+            convo.record_turn(
+                user_request, "code", f"needs_human: {reason[:80]}",
+                trace=trace,
+                last_result={"type": "code", "text": f"needs_human: {reason}"},
+            )
+            return {
+                "status": "needs_human",
+                "summary": f"Could not produce a valid plan: {reason}",
+                "staged_files": [],
+                "failed_tasks": [],
+                "trace": trace,
+                "run_id": journal.run_id,
+            }
 
         planned_paths = {t["path"] for t in tasks}
 
@@ -699,19 +845,46 @@ async def run_pipeline(
         # API calls, tests, --yes) skips the gate.
         if confirm is not None:
             _check_cancel()
+            # One warning line when the validator model is unavailable: the
+            # user should know BEFORE approving that VALIDATE cannot run.
+            if validator_missing:
+                journal.emit_event({
+                    "event": "validator_unavailable", "model": validator_missing})
+                console_note = (
+                    f"\nWARNING: validator model '{validator_missing}' is not "
+                    f"installed — validation will fail. Fix: ollama pull "
+                    f"{validator_missing}"
+                )
+            else:
+                console_note = ""
+            # Show the file names, the assumptions, and an overwrite marker
+            # for every path that already exists in the workspace.
+            gate_tasks = []
+            for t in tasks:
+                overwrites = (workspace / t["path"]).is_file()
+                gate_tasks.append({**t, "overwrites": overwrites})
             intent_line = (
                 f"{mode}: plan is "
-                + ", ".join(f"{t['action']} {t['path']}" for t in tasks)
+                + ", ".join(
+                    f"{t['action']} {t['path']}"
+                    + (" (overwrites existing file)" if t["overwrites"] else "")
+                    for t in gate_tasks
+                )
             )
+            if assumptions:
+                intent_line += " — assumptions: " + "; ".join(assumptions[:3])
+            intent_line += console_note
             journal.emit_event({"event": "confirm_requested",
-                                "plan": [t["path"] for t in tasks],
+                                "plan": [t["path"] for t in gate_tasks],
+                                "assumptions": assumptions[:3],
                                 "intent": intent_line})
-            approved = await confirm(tasks, intent_line)
+            approved = await confirm(gate_tasks, intent_line)
             if not approved:
                 record("PLAN", "ok", 0.0, "declined by user — nothing staged")
                 _finish("declined", {"staged_files": [], "failed_tasks": []})
+                # Honest outcome: the user cancelled the plan — never "ok".
                 _record_history(mode if mode in ("code", "both") else "code",
-                                "ok", label=mode,
+                                "cancelled", label=mode,
                                 answer="Plan declined by user — nothing was staged.",
                                 files_planned=[t["path"] for t in tasks])
                 return {
@@ -757,7 +930,7 @@ async def run_pipeline(
                 assumptions_block = "\nASSUMPTIONS: " + "; ".join(assumptions[:3])
             code_prompt = (
                 f"Implement exactly one file.\n"
-                f"ORIGINAL USER REQUEST: {user_request}\n"
+                f"ORIGINAL USER REQUEST: {user_request[:2000]}\n"
                 f"PLANNED FILES: {', '.join(sorted(planned_paths))}\n"
                 f"TARGET FILE: {path}\n"
                 f"TASK: {desc}\n"
@@ -783,7 +956,7 @@ async def run_pipeline(
                     temperature=TEMPERATURE_CODE,
                 )
                 _, clean = strip_think_blocks(raw)
-                content = _extract_code(clean)
+                content = _extract_code(clean, path)
 
                 c0 = time.monotonic()
                 try:
@@ -862,10 +1035,12 @@ async def run_pipeline(
 
         record("CODE", "ok" if generated else ("failed" if failed_tasks else "ok"),
                time.monotonic() - t_code,
-               f"{len(generated)} coded, {len(failed_tasks)} failed")
+               f"{len(generated)} coded, {len(failed_tasks)} failed",
+               model=coder_model)
         record("CHECK", "failed" if (failed_tasks or infra_error) else "ok",
                check_seconds,
-               infra_error or f"{len(generated)} passed, {len(failed_tasks)} failed")
+               infra_error or f"{len(generated)} passed, {len(failed_tasks)} failed",
+               model="-")  # deterministic stage: no model
 
         # sandbox channel: every deterministic CHECK outcome, one block per
         # run (per-file checks + the verifier step chain + infra errors).
@@ -890,8 +1065,10 @@ async def run_pipeline(
         validator_summary = ""
         t0 = time.monotonic()
         validate_failed = False
+        validate_error = ""
+        validate_ran = False
         if not generated:
-            record("VALIDATE", "skipped", 0.0, "nothing passed CHECK")
+            record("VALIDATE", "skipped", 0.0, "nothing passed CHECK", model="-")
         else:
             try:
                 if unload is not None:
@@ -913,6 +1090,8 @@ async def run_pipeline(
                 if structured_generate is not None:
                     try:
                         _check_cancel()
+                        # Budget tick only — the REPORTED llm_calls count comes
+                        # from journal llm_call events (one per actual call).
                         llm_calls += 1
                         vobj = await structured_generate(
                             planner_model, budget.trim(validate_prompt), ValidateResult
@@ -932,6 +1111,7 @@ async def run_pipeline(
                     data = json.loads(match.group(0)) if match else {}
                 validate_problems = [str(p) for p in data.get("problems", [])]
                 validator_summary = str(data.get("summary", ""))
+                validate_ran = True
 
                 if data.get("satisfies_request") is False:
                     # ONE fix pass through the coder, then re-run CHECK.
@@ -967,10 +1147,13 @@ async def run_pipeline(
                     validate_note = "fix pass applied" if not validate_problems else "problems remain"
                 else:
                     validate_note = "satisfies request"
-                record("VALIDATE", "ok", time.monotonic() - t0, validate_note)
+                record("VALIDATE", "ok", time.monotonic() - t0, validate_note,
+                       model=planner_model)
             except Exception as exc:
                 validate_failed = True
-                record("VALIDATE", "failed", time.monotonic() - t0, str(exc)[:300])
+                validate_error = str(exc)[:300]
+                record("VALIDATE", "failed", time.monotonic() - t0, validate_error,
+                       model=planner_model)
 
         # ---------------------------------------------------------------- SUMMARY
         # Runs on the THINKER (validator's model): after VALIDATE the thinker
@@ -986,21 +1169,27 @@ async def run_pipeline(
             total_seconds=time.monotonic() - pipeline_start,
             generate=generate,
             summary_model=planner_model,
+            validate_error=validate_error,
+            validate_ran=validate_ran,
         )
         file_list = sorted(generated)
         record("SUMMARY", "ok", time.monotonic() - t0,
-               "UNVERIFIED" if validate_failed else "")
+               "UNVERIFIED" if validate_failed else "", model=planner_model)
 
         _finish("completed", {"staged_files": file_list,
                               "failed_tasks": failed_tasks})
         # Conversation state: every turn recorded (reply-first for
         # code_and_reply was emitted as an event at PLAN time).
         convo.record_turn(
-            user_request, mode, summary[:120],
+            user_request, mode,
+            "wrote " + ", ".join(file_list) if file_list else "no files passed CHECK",
             trace=trace,
             last_result={
                 "type": "code",
-                "text": summary,
+                "text": (
+                    "wrote " + ", ".join(file_list) if file_list
+                    else "needs_human: no files passed CHECK"
+                ),
                 "files": file_list,
             },
         )
@@ -1013,8 +1202,15 @@ async def run_pipeline(
         }
         if mode == "both" and reply_text:
             out["reply"] = reply_text
+        # Honest outcome vocabulary: ok | unverified (code ran but validation
+        # failed/was skipped) | partial (some tasks failed) — see also
+        # needs_human / failed / cancelled / error on the other paths.
+        outcome = (
+            "unverified" if validate_failed
+            else ("partial" if failed_tasks else "ok")
+        )
         _record_history(
-            mode if mode in ("code", "both") else "code", "ok", label=mode,
+            mode if mode in ("code", "both") else "code", outcome, label=mode,
             answer=summary, files_planned=[t["path"] for t in tasks],
             files_staged=file_list,
         )

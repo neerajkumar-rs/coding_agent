@@ -40,10 +40,10 @@ def test_summary_skeleton_contents() -> None:
             tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
         ))
     summary = result["summary"]
-    assert "Built: greet.py" in summary
-    assert "How to run: run: python greet.py" in summary
-    assert "Known issues: none" in summary
-    assert "Total time:" in summary
+    assert "**Built:**" in summary and "`greet.py`" in summary
+    assert "**How to run:** run: `python greet.py`" in summary
+    assert "**Known issues:** none" in summary
+    assert "**Total time:**" in summary
 
 
 def test_summary_prose_included_when_clean() -> None:
@@ -57,7 +57,7 @@ def test_summary_prose_included_when_clean() -> None:
             tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
         ))
     assert "greet function" in result["summary"]
-    assert "Built: greet.py" in result["summary"]
+    assert "**Built:**" in result["summary"] and "`greet.py`" in result["summary"]
 
 
 def test_summary_prose_dropped_when_inventing_features() -> None:
@@ -73,7 +73,7 @@ def test_summary_prose_dropped_when_inventing_features() -> None:
     # Invented keywords absent from the code -> prose dropped entirely
     assert "dark mode" not in result["summary"]
     assert "login" not in result["summary"]
-    assert "Built: greet.py" in result["summary"]
+    assert "**Built:**" in result["summary"] and "`greet.py`" in result["summary"]
 
 
 def test_summary_falls_back_to_skeleton_when_model_fails() -> None:
@@ -93,8 +93,8 @@ def test_summary_falls_back_to_skeleton_when_model_fails() -> None:
             "create greet.py with a greet function",
             tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
         ))
-    assert "Built: greet.py" in result["summary"]
-    assert "Total time:" in result["summary"]
+    assert "**Built:**" in result["summary"] and "`greet.py`" in result["summary"]
+    assert "**Total time:**" in result["summary"]
 
 
 def test_summary_lists_failed_tasks_with_reasons() -> None:
@@ -118,7 +118,7 @@ def test_summary_lists_failed_tasks_with_reasons() -> None:
         ))
     assert result["staged_files"] == ["ok.py"]
     assert result["failed_tasks"][0]["path"] == "bad.py"
-    assert "NOT saved (failed): bad.py" in result["summary"]
+    assert "NOT saved (failed): `bad.py`" in result["summary"]
     assert "syntax error" in result["summary"]
 
 
@@ -141,8 +141,87 @@ def test_unverified_summary_when_validate_errors() -> None:
             "create greet.py with a greet function",
             tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
         ))
-    assert "UNVERIFIED" in result["summary"]
-    # Files were still staged (CHECK passed) — failure is reported, not hidden
-    assert result["staged_files"] == ["greet.py"]
-    validate = next(t for t in result["trace"] if t["stage"] == "VALIDATE")
-    assert validate["status"] == "failed"
+        summary = result["summary"]
+        assert "UNVERIFIED" in summary
+        # The UNVERIFIED line is a markdown blockquote with reason + fix...
+        assert "> **UNVERIFIED**" in summary
+        assert "validation could not run: ollama died mid-review" in summary
+        assert "Fix:" in summary
+        # ...and "Known issues: none" is NOT printed (the validation problem is
+        # listed as the known issue).
+        assert "Known issues:** none" not in summary
+        assert "**Known issues:** validation could not run" in summary
+        # Files were still staged (CHECK passed) — failure is reported, not hidden
+        assert result["staged_files"] == ["greet.py"]
+        validate = next(t for t in result["trace"] if t["stage"] == "VALIDATE")
+        assert validate["status"] == "failed"
+        # history outcome: unverified (not ok)
+        import history as _history
+        entries, _ = _history.read_history(tmp)
+        assert entries[-1]["outcome"] == "unverified"
+
+
+def test_unverified_summary_names_the_pull_fix_for_missing_model() -> None:
+    """ModelNotInstalled detail carries 'ollama pull <name>' — the summary
+    surfaces it as the fix."""
+    async def fake(model, prompt, system="", temperature=0.2, **kwargs):
+        if "CLASSIFY MODE:" in prompt:
+            return "code"
+        if "PLAN TASKS JSON:" in prompt:
+            return json.dumps({"tasks": json.loads(ONE_FILE_PLAN), "assumptions": []})
+        if "satisfies_request" in prompt:
+            raise RuntimeError(
+                "model not installed: 'qwen2.5-coder:7b'. Run: ollama pull qwen2.5-coder:7b")
+        if "TARGET FILE: greet.py" in prompt:
+            return GREET_CODE
+        return ""
+
+    with TemporaryDirectory() as tmp:
+        result = _run(run_pipeline(
+            "create greet.py with a greet function",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+        ))
+    assert "> **UNVERIFIED**" in result["summary"]
+    assert "validation could not run:" in result["summary"]
+    assert "Fix: ollama pull qwen2.5-coder:7b" in result["summary"]
+
+
+def test_validated_summary_distinguishes_checks_from_validation() -> None:
+    """A syntax-only CHECK pass is never 'verified': when VALIDATE ran clean,
+    the summary says checks passed AND validated; CHECK alone says so."""
+    routes = _base_routes(**{"Describe only features visible": ""})
+    fake = make_fake_generate(routes)
+    with TemporaryDirectory() as tmp:
+        result = _run(run_pipeline(
+            "create greet.py with a greet function",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+        ))
+    assert "**Checks passed** (syntax/links); **validated against your request**" in result["summary"]
+
+
+def test_partial_outcome_when_a_task_fails() -> None:
+    """One task fails CHECK, another passes: history outcome is 'partial'."""
+    import history as _history
+
+    routes = {
+        "JSON array of tasks": json.dumps([
+            {"path": "ok.py", "action": "create",
+             "description": "Python module that compiles and runs cleanly every time"},
+            {"path": "bad.py", "action": "create",
+             "description": "Python module that never compiles for this test"},
+        ]),
+        "TARGET FILE: ok.py": "```python\nX = 1\n```",
+        "TARGET FILE: bad.py": "```python\ndef broken(:\n```",
+        "satisfies_request": VALIDATE_OK,
+        "Describe only features visible": "",
+    }
+    fake = make_fake_generate(routes)
+    with TemporaryDirectory() as tmp:
+        result = _run(run_pipeline(
+            "create ok.py and bad.py modules",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+        ))
+        assert result["staged_files"] == ["ok.py"]
+        entries, _ = _history.read_history(tmp)
+        assert entries[-1]["outcome"] == "partial"
+        assert result["failed_tasks"][0]["path"] == "bad.py"

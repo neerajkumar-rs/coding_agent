@@ -31,11 +31,14 @@ try:
     from rich.console import Console
     from rich.json import JSON
     from rich.live import Live
+    from rich.markup import escape
     from rich.panel import Panel
     from rich.progress import Progress, SpinnerColumn, TextColumn
     from rich.prompt import Prompt
     from rich.table import Table
     from rich.text import Text
+
+    from render import file_preview, render_markdown, resolve_preview_target
 except ImportError as exc:
     raise SystemExit("Run:  pip install rich") from exc
 
@@ -624,69 +627,101 @@ def start_all_services(assume_yes: bool = False) -> None:
     console.print("  [bright_green]✓ FastAPI controller ready[/bright_green]")
 
 
+def audit_configured_models(workspace: str) -> dict | None:
+    """Detection half of the startup model audit (no printing, no prompting).
+
+    Returns None when Ollama is unreachable (the preflight table reports that
+    instead). Otherwise {"config", "installed", "rows", "migrations",
+    "missing"}: rows = (role, name, installed?) per role; migrations = the
+    retired-name -> new-default updates on offer (role, old, new); missing =
+    (role, name) not installed with the exact pull command.
+    """
+    from agent_config import ROLE_NAMES, load_agent_config
+    from main import EXPECTED_DIGESTS, RETIRED_MODEL_NAMES
+
+    config = load_agent_config(workspace)
+    try:
+        with urllib.request.urlopen(OLLAMA_TAGS_URL, timeout=5) as r:
+            installed = [m.get("name", "") for m in json.loads(r.read()).get("models", [])]
+    except Exception:
+        return None  # Ollama down — the preflight reports it instead
+
+    rows: list[tuple[str, str, bool]] = []
+    migrations: list[tuple[str, str, str]] = []
+    for role in ROLE_NAMES:
+        cfg = config.get_role_config(role)
+        name = str(cfg.get("model", ""))
+        is_installed = name in installed or (
+            ":" not in name and f"{name}:latest" in installed
+        )
+        rows.append((role, name, is_installed))
+        if (
+            not is_installed
+            and name in RETIRED_MODEL_NAMES
+            and role in ("thinker", "validator")
+        ):
+            new_name = next(
+                (n for n, d in EXPECTED_DIGESTS.items()
+                 if "DeepSeek-R1" in n and n in installed),
+                None,
+            )
+            if new_name:
+                migrations.append((role, name, new_name))
+    missing = [(r, n) for r, n, ok in rows if not ok]
+    return {
+        "config": config, "installed": installed, "rows": rows,
+        "migrations": migrations, "missing": missing,
+    }
+
+
+def apply_model_migration(workspace: str, config, role: str, new_name: str) -> None:
+    """Persist one approved retired-name migration to .agent."""
+    from agent_config import save_agent_config
+
+    config.roles[role]["model"] = new_name
+    save_agent_config(config, workspace)
+
+
+def _print_missing_models_table(missing: list[tuple[str, str]]) -> None:
+    table = Table(title="Configured models not installed",
+                  box=box.ROUNDED, border_style="yellow")
+    table.add_column("Role", style="bright_cyan")
+    table.add_column("Configured model")
+    table.add_column("Pull command", style="dim")
+    for role, name in missing:
+        table.add_row(role, name, f"ollama pull {name}")
+    console.print(table)
+
+
 def _check_configured_models(workspace: str, assume_yes: bool = False) -> None:
     """Startup model audit (exact names; never a silent substitution):
 
     1. A role configured to a RETIRED default name (not installed) while the
        new default IS installed -> ask once "Update <role> from <old> to
-       <new>? [y/N]" and persist on y (Rich TUI only; the Textual TUI's
-       /models view shows the same facts).
+       <new>? [y/N]" and persist on y.
     2. Any configured model not installed -> a table: role, configured name,
        installed yes/no, exact `ollama pull <name>`.
     """
     try:
-        from agent_config import ROLE_NAMES, load_agent_config, save_agent_config
-        from main import RETIRED_MODEL_NAMES, EXPECTED_DIGESTS
-
-        config = load_agent_config(workspace)
-        try:
-            with urllib.request.urlopen(OLLAMA_TAGS_URL, timeout=5) as r:
-                installed = [m.get("name", "") for m in json.loads(r.read()).get("models", [])]
-        except Exception:
-            return  # Ollama down — the preflight table reports it instead
-
-        roles_changed = False
-        rows: list[tuple[str, str, bool]] = []
-        for role in ROLE_NAMES:
-            cfg = config.get_role_config(role)
-            name = str(cfg.get("model", ""))
-            is_installed = name in installed or (
-                ":" not in name and f"{name}:latest" in installed
+        audit = audit_configured_models(workspace)
+        if audit is None:
+            return
+        changed = False
+        migrated: set[str] = set()
+        for role, old, new in audit["migrations"]:
+            answer = "y" if assume_yes else Prompt.ask(
+                f"[yellow]Update {role} from {old} to {new}?[/yellow]",
+                choices=["y", "n"], default="n",
             )
-            rows.append((role, name, is_installed))
-            if (
-                not is_installed
-                and name in RETIRED_MODEL_NAMES
-                and role in ("thinker", "validator")
-            ):
-                new_name = next(
-                    (n for n, d in EXPECTED_DIGESTS.items()
-                     if "DeepSeek-R1" in n and (n in installed or f"{n}" in installed)),
-                    None,
-                )
-                if new_name:
-                    answer = "y" if assume_yes else Prompt.ask(
-                        f"[yellow]Update {role} from {name} to {new_name}?[/yellow]",
-                        choices=["y", "n"], default="n",
-                    )
-                    if answer == "y":
-                        config.roles[role]["model"] = new_name
-                        roles_changed = True
-                        rows[-1] = (role, new_name, True)
-        if roles_changed:
-            save_agent_config(config, workspace)
+            if answer == "y":
+                apply_model_migration(workspace, audit["config"], role, new)
+                changed = True
+                migrated.add(role)
+        if changed:
             console.print("[bright_green]✓ .agent updated[/bright_green]")
-
-        missing = [(r, n) for r, n, ok in rows if not ok]
+        missing = [(r, n) for r, n in audit["missing"] if r not in migrated]
         if missing:
-            table = Table(title="Configured models not installed",
-                          box=box.ROUNDED, border_style="yellow")
-            table.add_column("Role", style="bright_cyan")
-            table.add_column("Configured model")
-            table.add_column("Pull command", style="dim")
-            for role, name in missing:
-                table.add_row(role, name, f"ollama pull {name}")
-            console.print(table)
+            _print_missing_models_table(missing)
     except Exception:
         return  # startup audit is best-effort; never blocks the TUI
 
@@ -905,6 +940,7 @@ def show_help() -> None:
             "/status      show service health + staged diff\n"
             "/workspace   change the active workspace path\n"
             "/save        save staged files into the workspace (/deploy alias)\n"
+            "/preview <file> [raw]  preview a staged/workspace file (md renders, code highlighted)\n"
             "/cancel      cancel the in-progress run for this workspace\n"
             "/router <t>  show how a message would be routed (tier, scores, intent)\n"
             "/logs [role|events] [N]  tail the latest run's logs (default 60 lines)\n"
@@ -955,9 +991,24 @@ async def _post_run_with_confirm(request_text: str, workspace_dir: str) -> dict:
             continue
         if not pending.get("pending"):
             continue
-        console.print(f"[yellow]Plan ({pending.get('intent', '')}):[/yellow]")
+        console.print(f"[yellow]Plan ({escape(str(pending.get('intent', '')))}):[/yellow]")
         for t in pending.get("plan", []):
-            console.print(f"  {t.get('action', 'create')}  {t.get('path', '')}")
+            ow = "  [yellow](overwrites existing file)[/yellow]" if t.get("overwrites") else ""
+            console.print(f"  {escape(str(t.get('action', 'create')))}  "
+                          f"{escape(str(t.get('path', '')))}{ow}")
+        # Preview: staged version when one exists, else the workspace file
+        # that would be overwritten (markdown rendered, code highlighted).
+        for t in pending.get("plan", []):
+            rel = str(t.get("path", ""))
+            if not rel:
+                continue
+            try:
+                target, source = resolve_preview_target(workspace_dir, rel)
+            except Exception:
+                continue
+            if target.is_file():
+                console.print(f"[dim]preview: {escape(rel)}  ({source})[/dim]")
+                console.print(file_preview(target))
         answer = await asyncio.to_thread(
             Prompt.ask, "[bold bright_green]Stage and build? [Y/n][/bold bright_green]",
             choices=["y", "n"], default="y",
@@ -1175,10 +1226,22 @@ async def _save_staged(workspace_dir: str) -> None:
     lines = []
     for diff_obj in diff_status.get("diffs", []):
         tag = "(new)" if diff_obj["action"] == "create" else "(overwrites existing file)"
-        lines.append(f"  {diff_obj['file']}  [dim]{tag}[/dim]")
+        lines.append(f"  {escape(str(diff_obj['file']))}  [dim]{tag}[/dim]")
     console.print(
-        f"[yellow]Saving to {dest_root}:[/yellow]\n" + "\n".join(lines)
+        f"[yellow]Saving to {escape(dest_root)}:[/yellow]\n" + "\n".join(lines)
     )
+    # Rendered preview per staged file (markdown rendered, code highlighted).
+    for diff_obj in diff_status.get("diffs", []):
+        rel = str(diff_obj.get("file", ""))
+        if not rel:
+            continue
+        try:
+            target, source = resolve_preview_target(workspace_dir, rel)
+        except Exception:
+            continue
+        if target.is_file():
+            console.print(f"[dim]preview: {escape(rel)}  ({source})[/dim]")
+            console.print(file_preview(target))
     # --yes auto-approves: only CHECK-passed files are ever staged, so
     # auto-approving the staged set is exactly "approve what passed CHECK".
     if _cli_yes:
@@ -1244,16 +1307,25 @@ async def _submit_locked(request_text: str, workspace_dir: str) -> None:
         _last_trace = result.get("trace", [])
         _print_trace(_last_trace)
 
-        # 2a. Question path: print the answer and stop.
+        # 2a. Question path: print the answer and stop. Markdown-rendered
+        # (never a markup string — a "[" in model text renders literally).
         if "answer" in result:
-            console.print(Panel(result["answer"], title="Answer", border_style="bright_green"))
+            if console.is_terminal:
+                console.print(Panel(render_markdown(str(result["answer"])),
+                                    title="Answer", border_style="bright_green"))
+            else:
+                print(result["answer"])
             return
 
-        # 2b. Summary
-        console.print(Panel(result.get("summary", "(no summary)"),
-                            title="Summary", border_style="bright_blue"))
+        # 2b. Summary (markdown)
+        if console.is_terminal:
+            console.print(Panel(render_markdown(str(result.get("summary", "(no summary)"))),
+                                title="Summary", border_style="bright_blue"))
+        else:
+            print(result.get("summary", "(no summary)"))
         for failed in result.get("failed_tasks", []):
-            console.print(f"[red]NOT saved (failed): {failed['path']} — {failed['error']}[/red]")
+            console.print(f"[red]NOT saved (failed): {escape(str(failed['path']))} — "
+                          f"{escape(str(failed['error']))}[/red]")
 
         # 3. Staged diffs (only files that passed CHECK are staged)
         diff_status = await post_json(STATUS_URL, {"workspace_dir": workspace_dir})
@@ -1636,6 +1708,12 @@ async def main() -> None:
                     else:
                         console.print(f"[dim]Re-sending turn {args} as a new turn (old state is not restored).[/dim]")
                         await submit(str(entry.get("text", "")), workspace)
+
+            elif command.startswith("/preview"):
+                # Local render only: no model call, no GPU, safe during a run.
+                import render as _render
+                console.print(_render.preview_command(
+                    workspace, text.strip()[len("/preview"):].strip()))
 
             elif command.startswith("/export"):
                 import export as _export

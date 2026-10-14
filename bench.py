@@ -35,10 +35,10 @@ DEFAULT_OLLAMA = "http://localhost:11434"
 EXIT_OK = 0
 EXIT_OLLAMA_UNREACHABLE = 2
 
-# The held-back classify eval set (tests/classify_eval.jsonl). Bench reads it
-# for the classifier A/B (accuracy first, latency second); the prompt examples
-# never contain these phrases.
-EVAL_PATH = Path(__file__).parent / "tests" / "classify_eval.jsonl"
+# The held-back classify HOLDOUT set (tests/classify_holdout.jsonl). Bench
+# reads it for the classifier A/B (accuracy first, latency second); the
+# prompt examples never contain these phrases.
+EVAL_PATH = Path(__file__).parent / "tests" / "classify_holdout.jsonl"
 
 
 # --- role probes: prompt + deterministic quality checks ----------------------
@@ -308,8 +308,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA)
     parser.add_argument(
         "--classify-ab", action="store_true",
-        help="A/B the coder vs thinker as the classifier over tests/classify_eval.jsonl "
-             "(label accuracy, p50/p95 latency, shell-command leakage on reply lines)",
+        help="A/B the coder vs thinker as the classifier over "
+             "tests/classify_holdout.jsonl, each with and without the retired "
+             "'Last turn' prompt line (label accuracy after the verify pass, "
+             "false-code rate, downgrade count, p50/p95 classify latency)",
     )
     return parser
 
@@ -332,26 +334,46 @@ def _pctl(values: list[float], pct: float) -> float:
     return round(ordered[idx], 3)
 
 
+# The retired "Last turn" line content for the A/B arm: the bias measured here
+# is exactly what a previous result ("Built: index.html") did to the label.
+_LEGACY_LAST_TURN = "make a page -> code (Built: index.html)"
+
+
 async def _classify_ab_model(
-    gateway: Any, model: str, eval_lines: list[dict[str, Any]], ollama_url: str
+    gateway: Any, model: str, eval_lines: list[dict[str, Any]], ollama_url: str,
+    *, last_turn: str = "",
 ) -> dict[str, Any]:
-    """Run the classifier + reply step over the eval set with `model` pinned
-    as the understand role. Returns accuracy/latency/leakage metrics."""
-    from understand import build_facts_block, classify_mode, reply_step
+    """Run classify (+ verify pass) over the eval set with `model` pinned as
+    the understand role. ``last_turn`` non-empty = the legacy prompt arm.
+
+    Metrics: label accuracy AFTER the verify pass, false-`code` rate on reply
+    lines, verify-pass downgrade count, classify p50/p95 latency, and
+    shell-command leakage on reply lines."""
+    from understand import (
+        PlanFailed,
+        build_facts_block,
+        classify_mode,
+        plan_tasks,
+        reply_step,
+        verify_side_effect,
+    )
 
     gateway.config = _BenchConfig(gateway.config, "understand", model)
 
     async def _gen(m, prompt, system="", temperature=0.0, **kwargs):
         return await gateway.generate(
             "understand", prompt, system=system, temperature=temperature,
-            num_predict=kwargs.get("num_predict", 12),
+            num_predict=kwargs.get("num_predict", 700),
             _format_schema=kwargs.get("_format_schema"),
         )
 
     facts_block = build_facts_block({"files": [], "flags": {}})
     correct = 0
     total = 0
-    latencies: list[float] = []
+    false_code = 0       # expected reply, final label code|both (after verify)
+    overcreate = 0       # expected files_created=0 but the PLAN step still named files
+    downgrades = 0       # verify pass flipped code|both -> reply
+    latencies: list[float] = []   # classify call latency only
     shell_leaks = 0
     reply_lines = 0
     errors: list[str] = []
@@ -362,7 +384,7 @@ async def _classify_ab_model(
         t0 = time.monotonic()
         try:
             label = await classify_mode(
-                entry["text"], generate=_gen, file_names=[], last_turn="",
+                entry["text"], generate=_gen, file_names=[], last_turn=last_turn,
             )
         except Exception as exc:
             # A model that cannot classify at this budget (e.g. a reasoning
@@ -372,8 +394,38 @@ async def _classify_ab_model(
             errors.append(f"{entry['text'][:40]}: {str(exc)[:120]}")
             continue
         latencies.append(time.monotonic() - t0)
+        if label in ("code", "both"):
+            try:
+                if not await verify_side_effect(entry["text"], generate=_gen):
+                    label = "reply"
+                    downgrades += 1
+            except Exception as exc:
+                errors.append(f"verify {entry['text'][:40]}: {str(exc)[:120]}")
+        if label in ("code", "both"):
+            # The real harm metric: does the PLAN step still produce files for
+            # a line that should create none? Runs with the SAME validators the
+            # pipeline uses (per-task rules + invented-file rejection), so the
+            # safety net behind a wrong label is measured too.
+            from orchestrator import _valid_plan_task, invented_file_rejection
+            try:
+                plan = await plan_tasks(
+                    entry["text"], generate=_gen, file_names=[],
+                    task_validator=_valid_plan_task,
+                    plan_validator=lambda tasks, msg: invented_file_rejection(tasks, msg),
+                )
+                planned = len(plan.tasks)
+            except PlanFailed:
+                planned = 0
+            except Exception as exc:
+                planned = 0
+                errors.append(f"plan {entry['text'][:40]}: {str(exc)[:120]}")
+            if planned and not entry.get("files_created"):
+                overcreate += 1
+                errors.append(f"OVERCREATE {entry['text'][:50]}: {planned} file(s)")
         if label == entry["expected"]:
             correct += 1
+        elif entry["expected"] == "reply" and label in ("code", "both"):
+            false_code += 1
         if label == "reply":
             reply_lines += 1
             try:
@@ -386,9 +438,13 @@ async def _classify_ab_model(
     accuracy = round(100.0 * correct / total, 1) if total else 0.0
     return {
         "model": model,
+        "arm": "legacy-last-turn" if last_turn else "clean",
         "accuracy": accuracy,
         "correct": correct,
         "total": total,
+        "false_code": false_code,
+        "overcreate": overcreate,
+        "verify_downgrades": downgrades,
         "p50": _pctl(latencies, 50),
         "p95": _pctl(latencies, 95),
         "reply_lines": reply_lines,
@@ -398,10 +454,12 @@ async def _classify_ab_model(
 
 
 async def _classify_ab(config: AgentConfig, ollama_url: str, installed: list[str]) -> dict[str, Any]:
-    """A/B coder vs thinker as the classifier. Picks roles.understand.model by
-    accuracy first, latency second. Gate: >=95% accuracy, 0 shell leaks, p95 < 2s."""
-    import asyncio as _asyncio  # local: the lock binds to this loop
-
+    """A/B: coder vs thinker as the classifier, each with and without the
+    retired "Last turn" prompt line (4 arms), over tests/classify_holdout.jsonl
+    with the verify pass active. Picks roles.understand.model by accuracy
+    first, latency second, CLEAN arms only.
+    Gate: >=95% accuracy after verify, 0 false-`code` on reply lines,
+    classify p95 < 1.5 s (model resident)."""
     from ollama_client import AgentGateway, OllamaSupervisorClient
 
     if not EVAL_PATH.exists():
@@ -419,37 +477,45 @@ async def _classify_ab(config: AgentConfig, ollama_url: str, installed: list[str
     rows: dict[str, Any] = {}
     for label, model in candidates.items():
         if model not in installed:
-            rows[label] = {"model": model, "error": f"missing — ollama pull {model}"}
-            print(f"SKIP classify/{label}: missing model {model} — ollama pull {model}")
+            rows[label] = {"model": model, "error": f"missing -- ollama pull {model}"}
+            print(f"SKIP classify/{label}: missing model {model} -- ollama pull {model}")
             continue
-        print(f"classify A/B: {label} = {model} ...")
-        rows[label] = await _classify_ab_model(gateway, model, eval_lines, ollama_url)
-        print(
-            f"  {label}: acc={rows[label]['accuracy']}% "
-            f"p50={rows[label]['p50']}s p95={rows[label]['p95']}s "
-            f"shell_leaks={rows[label]['shell_leaks']}/{rows[label]['reply_lines']}"
-        )
+        for arm_name, last_turn in (("clean", ""), ("legacy", _LEGACY_LAST_TURN)):
+            key = f"{label}/{arm_name}"
+            print(f"classify A/B: {key} = {model} ...")
+            rows[key] = await _classify_ab_model(
+                gateway, model, eval_lines, ollama_url, last_turn=last_turn,
+            )
+            r = rows[key]
+            print(
+                f"  {key}: acc={r['accuracy']}% false_code={r['false_code']} "
+                f"overcreate={r['overcreate']} downgrades={r['verify_downgrades']} "
+                f"p50={r['p50']}s p95={r['p95']}s "
+                f"shell_leaks={r['shell_leaks']}/{r['reply_lines']}"
+            )
         await gateway.unload(model)
     gateway.config = config  # restore
 
-    # Pick by accuracy first, latency second.
+    # Winner among CLEAN arms, by accuracy first, latency second.
+    clean = {k: v for k, v in rows.items()
+             if k.endswith("/clean") and "accuracy" in v}
     winner = None
-    scored = {k: v for k, v in rows.items() if "accuracy" in v}
-    if scored:
-        winner = max(
-            scored,
-            key=lambda k: (scored[k]["accuracy"], -scored[k]["p95"]),
-        )
+    if clean:
+        winner = max(clean, key=lambda k: (clean[k]["accuracy"], -clean[k]["p95"]))
     result: dict[str, Any] = {"rows": rows, "winner": winner}
     if winner:
-        w = scored[winner]
-        gate_ok = w["accuracy"] >= 95.0 and w["shell_leaks"] == 0 and w["p95"] < 2.0
+        w = clean[winner]
+        gate_ok = (
+            w["accuracy"] >= 95.0
+            and w["overcreate"] == 0
+            and w["p95"] < 1.5
+        )
         result["gate_ok"] = gate_ok
         result["recommendation"] = (
-            f"roles.understand.model = {scored[winner]['model']}"
+            f"roles.understand.model = {clean[winner]['model']}"
             if gate_ok else
-            f"no model passes the gate (winner {winner} misses: "
-            f"acc={w['accuracy']}% p95={w['p95']}s leaks={w['shell_leaks']})"
+            f"no model passes the gate (clean winner {winner} misses: "
+            f"acc={w['accuracy']}% overcreate={w['overcreate']} p95={w['p95']}s)"
         )
     return result
 

@@ -869,10 +869,15 @@ class AgentGateway:
             or (think is None and self.think_supported(resolved) is not True)
         ):
             effective_predict += int(rc.get("think_budget", 512))
-        rungs = [r for r in CTX_RUNGS if r <= int(rc["num_ctx"])]
+        # ONE num_ctx per model: roles sharing a model start at the same rung,
+        # so a ctx change never forces a hidden reload between phases.
+        from agent_config import effective_ctx_for_model
+
+        eff_ctx = effective_ctx_for_model(self.config, model)
+        rungs = [r for r in CTX_RUNGS if r <= eff_ctx]
         if not rungs:
             rungs = [CTX_RUNGS[0]]
-        ctx = rungs[-1]  # start at the role's configured rung
+        ctx = rungs[-1]  # start at the model's effective rung
 
         async with self._lock:  # THE lock: load + generate are atomic
             last_exc: Exception | None = None
@@ -1023,6 +1028,12 @@ class AgentGateway:
                 "eval_duration_ns": meta.get("eval_duration"),
                 "size_vram": size_vram, "size_total": size,
                 "swaps": swaps,
+                # full-fidelity fields for calls/<n>.json (raw = pre-strip)
+                "extra_call_fields": {
+                    "raw_response": meta.get("raw_response", ""),
+                    "think_text": meta.get("think_text", ""),
+                    "prompt_eval_count": meta.get("prompt_eval_count"),
+                },
             })
             if fraction < self.min_gpu_fraction:
                 await self._unload(client, resolved)

@@ -349,3 +349,45 @@ def test_migration_ollama_down_is_silent(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(tui.urllib.request, "urlopen", boom)
     # must not raise, must not prompt
     tui._check_configured_models(str(tmp_path), assume_yes=False)
+
+
+def test_no_prompt_when_already_correct(tmp_path, monkeypatch) -> None:
+    """Roles already on the current defaults: no migration prompt fires and
+    nothing is persisted."""
+    asked: list[str] = []
+    _legacy_agent(tmp_path)
+    # Fix the file first: current defaults already in place.
+    import json
+    (tmp_path / ".agent").write_text(json.dumps({
+        "roles": {
+            "thinker": {"model": NEW_NAME},
+            "validator": {"model": NEW_NAME},
+            "coder": {"model": "qwen2.5-coder:3b-instruct"},
+        }
+    }), encoding="utf-8")
+    installed = [NEW_NAME, "qwen2.5-coder:3b-instruct"]
+    monkeypatch.setattr(tui.urllib.request, "urlopen",
+                        lambda *a, **k: _fake_tags(installed))
+    monkeypatch.setattr(tui.Prompt, "ask",
+                        lambda *a, **k: asked.append("asked") or "n")
+    tui._check_configured_models(str(tmp_path), assume_yes=False)
+    assert asked == []  # never prompted
+
+
+def test_audit_detects_retired_validator_direct_role(tmp_path, monkeypatch) -> None:
+    """The evidence case: .agent with roles.validator.model = the retired name
+    directly (not via legacy planner_model) -> the migration offer fires."""
+    import json
+    (tmp_path / ".agent").write_text(json.dumps({
+        "roles": {
+            "thinker": {"model": NEW_NAME},
+            "validator": {"model": "deepseek-r1:1.5b"},
+            "coder": {"model": "qwen2.5-coder:3b-instruct"},
+        }
+    }), encoding="utf-8")
+    installed = [NEW_NAME, "qwen2.5-coder:3b-instruct"]
+    monkeypatch.setattr(tui.urllib.request, "urlopen",
+                        lambda *a, **k: _fake_tags(installed))
+    audit = tui.audit_configured_models(str(tmp_path))
+    assert audit is not None
+    assert ("validator", "deepseek-r1:1.5b", NEW_NAME) in audit["migrations"]

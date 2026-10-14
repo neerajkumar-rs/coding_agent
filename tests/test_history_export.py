@@ -133,7 +133,9 @@ def test_reply_turn_writes_history(tmp_path: Path) -> None:
             return "Grounded answer."
         return ""
 
-    _run(run_pipeline("list all the files", tmp_path, generate=fake,
+    # A question (not a listing ask): the model answers from the FACTS block.
+    # (A listing ask on an empty workspace now gets a deterministic sentence.)
+    _run(run_pipeline("what is a closure", tmp_path, generate=fake,
                       planner_model="P", coder_model="C"))
     entries, _ = history_mod.read_history(tmp_path)
     assert entries[-1]["path"] == "reply"
@@ -214,7 +216,7 @@ def _seed_turns(tmp_path: Path) -> None:
     history_mod.append_turn(tmp_path, {
         "text": "make a page", "path": "error", "outcome": "error",
         "seconds": 0.5, "error": {"stage": "CLASSIFY",
-                                  "detail": "model not installed: 'deepseek-r1:1.5b'. Run: ollama pull deepseek-r1:1.5b"},
+                                  "detail": "model not installed: 'qwen2.5-coder:7b-instruct'. Run: ollama pull qwen2.5-coder:7b-instruct"},
     })
 
 
@@ -225,7 +227,7 @@ def test_export_report_written_with_likely_cause(tmp_path: Path) -> None:
     text = Path(result["path"]).read_text(encoding="utf-8")
     assert "## Summary" in text
     assert "## Environment" in text
-    assert "Likely cause" in text and "ollama pull deepseek-r1:1.5b" in text
+    assert "Likely cause" in text and "ollama pull qwen2.5-coder:7b-instruct" in text
     assert "/retry 2" in text
     # exports live only under .agent_runs/exports/
     assert ".agent_runs" in result["path"] and "exports" in result["path"]
@@ -348,6 +350,87 @@ def test_export_makes_no_ollama_calls(tmp_path: Path, monkeypatch) -> None:
     # build_environment probes degrade to n/a; no exception escapes
     result = export_mod.do_export(tmp_path, "all", zip_out=True)
     assert Path(result["path"]).exists()
+
+
+def test_export_fixture_compatible_with_holdout_format(tmp_path: Path) -> None:
+    """--fixture lines load with the SAME shape checks as classify_holdout.jsonl."""
+    _seed_turns(tmp_path)
+    result = export_mod.do_export(tmp_path, "all", fixture=True)
+    lines = [
+        json.loads(raw)
+        for raw in Path(result["path"]).read_text(encoding="utf-8").splitlines()
+        if raw.strip()
+    ]
+    assert len(lines) == 2
+    for entry in lines:
+        # the holdout contract: label + files_created (+ pre-turn state)
+        assert entry["expected"] in ("fast", "reply", "code", "both",
+                                     "fast-path", "error", None), entry
+        assert "files_created" in entry
+        assert "state" in entry and "observed_ok" in entry
+
+
+def test_export_contains_prompts_and_raw_responses(tmp_path: Path) -> None:
+    """A turn with a run folder carrying calls/<n>.json: the report shows the
+    prompt and the RAW response (think separate) in fenced blocks."""
+    from orchestrator import run_pipeline
+    from tests.test_run_pipeline import make_fake_generate
+
+    fake = make_fake_generate({
+        "CLASSIFY MODE:": "reply",
+        "REPLY:": "<think>checking the table</think>The workspace has one file.",
+    })
+    _run(run_pipeline("what is a closure", tmp_path, generate=fake,
+                      planner_model="P", coder_model="C"))
+    result = export_mod.do_export(tmp_path, "last")
+    text = Path(result["path"]).read_text(encoding="utf-8")
+    assert "**LLM calls**" in text
+    assert "prompt:" in text and "response:" in text
+    assert "what is a closure" in text  # the real prompt text
+    assert "The workspace has one file." in text  # the (raw) response
+    assert "num_ctx=" in text
+
+
+def test_export_pre_turn_snapshot(tmp_path: Path) -> None:
+    """The state_snapshot in history is the state fed to the model for THAT
+    turn (taken before it) — turn 2's snapshot must NOT contain turn 2's own
+    result."""
+    from orchestrator import run_pipeline
+    from tests.test_run_pipeline import make_fake_generate
+
+    fake = make_fake_generate({
+        "CLASSIFY MODE:": "reply",
+        "REPLY:": "Grounded answer.",
+    })
+    _run(run_pipeline("what is a closure", tmp_path, generate=fake,
+                      planner_model="P", coder_model="C"))
+    _run(run_pipeline("what is a decorator", tmp_path, generate=fake,
+                      planner_model="P", coder_model="C"))
+    entries, _ = history_mod.read_history(tmp_path)
+    assert len(entries) == 2
+    snap2 = entries[-1].get("state_snapshot") or {}
+    # pre-turn: knows turn 1's text, but NOT turn 2's own text/result
+    turns_txt = json.dumps(snap2.get("turns", []))
+    assert "closure" in turns_txt
+    assert "decorator" not in turns_txt
+    last_result_txt = json.dumps(snap2.get("last_result", {}))
+    assert "decorator" not in last_result_txt
+
+
+def test_export_environment_labeled_and_roles(tmp_path: Path) -> None:
+    """Environment: build_id present, GPU labeled, per-role digest/installed/
+    effective ctx fields rendered."""
+    from agent_config import AgentConfig
+
+    _seed_turns(tmp_path)
+    cfg = AgentConfig()
+    result = export_mod.do_export(tmp_path, "last", config=cfg)
+    text = Path(result["path"]).read_text(encoding="utf-8")
+    assert "build_id:" in text
+    assert "gpu:" in text
+    assert "thinker:" in text and "installed=" in text
+    # local + UTC timestamps in the header
+    assert "(UTC)" in text and "(local)" in text
 
 
 def test_no_retired_log_dir_reference_and_exports_stay_put(tmp_path: Path) -> None:

@@ -53,6 +53,28 @@ def ceiling_for(role: str) -> int:
     return ROLE_CTX_CEILINGS.get(canonical, max(ROLE_CTX_CEILINGS.values()))
 
 
+def effective_ctx_for_model(config: "AgentConfig", model: str) -> int:
+    """ONE num_ctx per MODEL: every role resolving to the same model name
+    sends the same num_ctx on every call, so Ollama never reloads a model
+    just because the context window changed mid-run.
+
+    effective = min(smallest ceiling among the roles using the model,
+                    largest configured num_ctx among them).
+    A model no role references gets the largest ceiling."""
+    ctxs: list[int] = []
+    ceilings: list[int] = []
+    for role, rc in config.roles.items():
+        if str(rc.get("model", "")) == model:
+            ceilings.append(ceiling_for(role))
+            try:
+                ctxs.append(int(rc.get("num_ctx", 0) or 0))
+            except (TypeError, ValueError):
+                continue
+    if not ctxs:
+        return max(ROLE_CTX_CEILINGS.values())
+    return min(max(ctxs), min(ceilings))
+
+
 # ---------------------------------------------------------------------------
 # Machine calibration (calibrate.py writes calibration.json; we read it here)
 # ---------------------------------------------------------------------------

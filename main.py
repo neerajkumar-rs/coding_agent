@@ -49,15 +49,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("master_controller")
 
-LANGUAGE_BY_SUFFIX = {
-    ".py": "python",
-    ".html": "html",
-    ".css": "css",
-    ".js": "javascript",
-    ".json": "json",
-    ".md": "markdown",
-    ".txt": "text",
-}
+# The one file-type registry lives in filetypes.py; this is a read-through
+# view so existing attribute access keeps working (never a second table).
+from filetypes import FILE_TYPES as _FILE_TYPES
+
+LANGUAGE_BY_SUFFIX = {ext: e["language"] for ext, e in _FILE_TYPES.items()}
 
 app = FastAPI(
     title="Local LLM Master Controller",
@@ -506,6 +502,17 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
     router_cfg = state.config.router
     thinker_cfg = state.config.get_role_config("thinker")
 
+    # Validator availability (for the pre-confirm warning line): exact match
+    # against the installed list; unknown when Ollama is unreachable.
+    validator_model = str(state.config.get_role_config("validator")["model"])
+    validator_missing: str | None = None
+    try:
+        installed_now = await state.ollama.list_installed_models()
+        if installed_now and validator_model not in installed_now:
+            validator_missing = validator_model
+    except Exception:
+        validator_missing = None
+
     # Per-run journal, created HERE so the gateway's on_call hook streams the
     # full per-call record (prompt, answer, think_chars, done_reason,
     # eval_count, num_ctx used, size_vram/size, swaps) into it. The pipeline
@@ -549,6 +556,7 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
             think_budget=int(thinker_cfg.get("think_budget", 512)),
             log_llm_calls=False,
             understand_model=str(state.config.get_role_config("understand")["model"]),
+            validator_missing=validator_missing,
         )
         if result.get("status") == "cancelled":
             # Cancel is a normal outcome, not a 500: unload whatever is resident.

@@ -88,6 +88,12 @@ def make_fake_generate(routes: dict[str, str], default: str = ""):
                 return json.dumps({"tasks": json.loads(plan), "assumptions": []})
             return plan or default
 
+        # The side-effect verify pass (code|both labels): default confirms
+        # ("yes") so existing tests keep their intended path; a test sets
+        # routes["VERIFY SIDE EFFECT:"] = "no" to exercise the downgrade.
+        if "VERIFY SIDE EFFECT:" in prompt:
+            return routes.get("VERIFY SIDE EFFECT:", "yes")
+
         # The reply step: answer-only prompt (has FACTS but no plan marker).
         if "FACTS:" in prompt and "MESSAGE:" in prompt:
             if "REPLY:" in routes:
@@ -349,6 +355,39 @@ def test_run_pipeline_writes_run_journal() -> None:
         assert '"stage": "PLAN"' in events and '"stage": "SUMMARY"' in events
 
 
+def test_llm_calls_equals_llm_call_events() -> None:
+    """state.json llm_calls == the number of llm_call events in events.jsonl
+    (deterministic stages — CHECK, the SUMMARY skeleton — count 0)."""
+    fake = make_fake_generate({
+        "JSON array of tasks": WEB_PLAN,
+        "TARGET FILE: index.html": f"```html\n{INDEX_HTML}\n```",
+        "TARGET FILE: style.css": f"```css\n{STYLE_CSS}\n```",
+        "TARGET FILE: script.js": f"```javascript\n{SCRIPT_JS}\n```",
+        "satisfies_request": VALIDATE_OK,
+    })
+    with TemporaryDirectory() as tmp:
+        result = _run(run_pipeline(
+            "make a blog site in html5 css and js with dynamic content",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+        ))
+        run_dir = Path(tmp) / ".agent_runs" / result["run_id"]
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        events = [
+            json.loads(ln)
+            for ln in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        llm_events = [e for e in events if e.get("event") == "llm_call"]
+        assert state["llm_calls"] == len(llm_events), (
+            f"llm_calls={state['llm_calls']} but {len(llm_events)} llm_call events"
+        )
+        # calls/<n>.json full records exist, one per event
+        calls = sorted((run_dir / "calls").glob("*.json"))
+        assert len(calls) == len(llm_events)
+        first = json.loads(calls[0].read_text(encoding="utf-8"))
+        assert "prompt" in first and "response" in first and "num_ctx" in first
+
+
 # --- Phase 1: cancellation -----------------------------------------------------
 
 def test_cancel_during_code_stops_fast_and_stages_nothing_further() -> None:
@@ -444,6 +483,8 @@ def test_confirm_gate_decline_stages_nothing_and_never_calls_coder() -> None:
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
         if "CLASSIFY MODE:" in prompt:
             return "code"
+        if "VERIFY SIDE EFFECT:" in prompt:
+            return "yes"
         if "PLAN TASKS JSON:" in prompt:
             return json.dumps({"tasks": json.loads(WEB_PLAN), "assumptions": []})
         if model == CODER:
@@ -494,6 +535,46 @@ def test_confirm_gate_approve_runs_full_pipeline() -> None:
         ))
         assert set(result["staged_files"]) == {"index.html", "style.css", "script.js"}
         assert seen["plan"] == sorted(result["staged_files"]) or sorted(seen["plan"]) == sorted(result["staged_files"])
+
+
+def test_confirm_gate_shows_overwrites_and_assumptions() -> None:
+    """The gate payload: file names, per-file overwrites flag, the
+    '(overwrites existing file)' marker and the assumptions in the intent."""
+    plan = json.dumps([
+        {"path": "index.html", "action": "create",
+         "description": "Standalone HTML page containing all markup and structure"}
+    ])
+    fake = make_fake_generate({
+        "JSON array of tasks": plan,
+        "PLAN TASKS JSON:": json.dumps({
+            "tasks": json.loads(plan),
+            "assumptions": ["Chose a single self-contained page"],
+        }),
+        "TARGET FILE: index.html": (
+            "```html\n<!doctype html><html><head><style>body{margin:0}</style>"
+            "</head><body>hi</body></html>\n```"
+        ),
+        "satisfies_request": VALIDATE_OK,
+    })
+    seen: dict = {}
+
+    async def approve(tasks, intent_line):
+        seen["tasks"] = tasks
+        seen["intent"] = intent_line
+        return True
+
+    with TemporaryDirectory() as tmp:
+        Path(tmp, "index.html").write_text("<html>old</html>", encoding="utf-8")
+        result = _run(run_pipeline(
+            "create index.html holding my recipe collection",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+            confirm=approve,
+        ))
+        assert result["staged_files"] == ["index.html"]
+    assert seen["tasks"][0]["overwrites"] is True
+    assert "(overwrites existing file)" in seen["intent"]
+    assert "index.html" in seen["intent"]
+    assert "Chose a single self-contained page" in seen["intent"]
 
 
 def test_confirm_none_skips_gate() -> None:

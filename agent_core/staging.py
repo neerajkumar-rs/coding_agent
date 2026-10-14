@@ -42,6 +42,19 @@ def safe_target(workspace: Path, relative_name: str) -> Path:
     return candidate
 
 
+def safe_read_target(workspace: Path, relative_name: str) -> Path:
+    """Read-only variant of safe_target: containment + protection, but NO
+    suffix gate — the reply layer may read any in-workspace file (binary ones
+    are skipped by the caller with a note)."""
+    if is_protected(relative_name):
+        raise PathEscapeError(f"target path is protected: {relative_name}")
+    candidate = (workspace / relative_name).resolve()
+    root = workspace.resolve()
+    if candidate != root and root not in candidate.parents:
+        raise PathEscapeError("target_file must remain inside the workspace")
+    return candidate
+
+
 class StagingArea:
     def __init__(self, workspace: Path) -> None:
         self.workspace = Path(workspace).resolve()

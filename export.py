@@ -29,6 +29,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+
+def _capability_entry(caps: Any, model: str) -> dict[str, Any]:
+    """Find a capability-probe cache entry by digest12 key or resolved name."""
+    if not isinstance(caps, dict):
+        return {}
+    direct = caps.get(model)
+    if isinstance(direct, dict):
+        return direct
+    for entry in caps.values():
+        if isinstance(entry, dict) and entry.get("model") == model:
+            return entry
+    return {}
+
 from agent_core.run_state import RUNS_DIR_NAME
 from history import get_turn, read_history
 
@@ -141,6 +154,23 @@ def _probe(cmd: list[str], timeout: float = 3.0) -> str:
     return "n/a"
 
 
+def _gpu_labeled() -> str:
+    """GPU as 'name, total MiB, used MiB, free MiB' with labels (n/a-safe)."""
+    raw = _probe(
+        ["nvidia-smi", "--query-gpu=name,memory.total,memory.used",
+         "--format=csv,noheader,nounits"]
+    )
+    if raw == "n/a" or not raw.strip():
+        return "n/a"
+    try:
+        first = raw.splitlines()[0]
+        name, total_s, used_s = [p.strip() for p in first.split(",")][:3]
+        total, used = int(float(total_s)), int(float(used_s))
+        return f"{name}, total {total} MiB, used {used} MiB, free {total - used} MiB"
+    except (ValueError, IndexError):
+        return raw
+
+
 def build_environment(workspace: str | Path, config: Any | None = None) -> dict[str, Any]:
     """Environment section data. No gateway calls; probes never raise."""
     import ollama_client  # for the default host only
@@ -152,8 +182,21 @@ def build_environment(workspace: str | Path, config: Any | None = None) -> dict[
     }
     base = getattr(ollama_client, "DEFAULT_OLLAMA_HOST", "http://localhost:11434")
     env["ollama_url"] = base
-    # ollama --version + reachability + /api/ps (all optional)
+    # ollama --version + reachability + /api/ps + /api/tags (all optional)
     env["ollama_version"] = _probe(["ollama", "--version"])
+    installed_names: list[str] = []
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(f"{base}/api/tags", timeout=3) as r:
+            tags = json.loads(r.read())
+        installed_names = [m.get("name", "") for m in tags.get("models", [])]
+        env["tags"] = [
+            {"name": m.get("name"), "digest12": str(m.get("digest", "")).removeprefix("sha256:")[:12]}
+            for m in tags.get("models", [])
+        ]
+    except Exception:
+        env["tags"] = []
     try:
         import urllib.request
 
@@ -167,17 +210,30 @@ def build_environment(workspace: str | Path, config: Any | None = None) -> dict[
     except Exception:
         env["ollama_reachable"] = False
         env["ps"] = []
-    env["gpu"] = _probe(
-        ["nvidia-smi", "--query-gpu=name,memory.total,memory.used",
-         "--format=csv,noheader"]
-    )
+    env["gpu"] = _gpu_labeled()
     if config is not None:
         try:
-            from agent_config import ROLE_NAMES
+            from agent_config import ROLE_NAMES, effective_ctx_for_model
 
-            env["roles"] = {
-                role: config.get_role_config(role) for role in ROLE_NAMES
+            caps = (getattr(config, "extra", None) or {}).get("capabilities", {})
+            tags_digest = {
+                t["name"]: t.get("digest12")
+                for t in (env.get("tags") or []) if t.get("name")
             }
+            roles_env: dict[str, Any] = {}
+            for role in ROLE_NAMES:
+                cfg = config.get_role_config(role)
+                model = str(cfg.get("model", ""))
+                entry = _capability_entry(caps, model)
+                roles_env[role] = {
+                    **cfg,
+                    "digest12": entry.get("digest12")
+                    or str(entry.get("digest", ""))[:12]
+                    or tags_digest.get(model) or None,
+                    "installed": model in installed_names,
+                    "num_ctx_effective": effective_ctx_for_model(config, model),
+                }
+            env["roles"] = roles_env
         except Exception:
             pass
     return env
@@ -187,12 +243,48 @@ def build_environment(workspace: str | Path, config: Any | None = None) -> dict[
 # Likely-cause derivation (facts only)
 # ---------------------------------------------------------------------------
 
+def _run_events(run_dir: Path | None) -> list[dict[str, Any]]:
+    if run_dir is None:
+        return []
+    path = run_dir / "events.jsonl"
+    if not path.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    try:
+        for ln in path.read_text(encoding="utf-8").splitlines():
+            if ln.strip():
+                try:
+                    events.append(json.loads(ln))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+    return events
+
+
 def likely_cause(turn: dict[str, Any], run_dir: Path | None) -> str | None:
-    """A 'Likely cause' line only when derivable from facts."""
+    """A 'Likely cause' line only when derivable from facts: the turn's error,
+    or run-folder facts (reload_suspected, verify downgrade, done_reason)."""
     error = turn.get("error") or {}
     detail = str(error.get("detail", ""))
     stage = str(error.get("stage", ""))
+    events = _run_events(run_dir)
+
+    # --- facts that apply with or without a turn-level error ---
+    for ev in events:
+        if ev.get("event") == "llm_call" and ev.get("reload_suspected"):
+            return (
+                f"model reloaded mid-run (size_total changed for "
+                f"{ev.get('model', '?')}) — a num_ctx change between calls; "
+                "the same-ctx rule should prevent this"
+            )
     if not error:
+        for ev in events:
+            if ev.get("event") == "verify_downgrade":
+                return (
+                    f"classifier said {ev.get('from', '?')}; the verify pass "
+                    "found no side effect and downgraded to reply"
+                )
         return None
     if "model not installed" in detail or "ModelNotInstalled" in detail:
         match = re.search(r"ollama pull (\S+)", detail)
@@ -201,8 +293,18 @@ def likely_cause(turn: dict[str, Any], run_dir: Path | None) -> str | None:
         return f"VRAM guard: model did not fit at any context rung (stage {stage})"
     if "done_reason" in detail and "length" in detail:
         return "response truncated (done_reason=length) — prompt too large"
+    for ev in events:
+        if ev.get("event") == "llm_call" and ev.get("done_reason") == "length":
+            return (
+                f"response truncated (done_reason=length) at role "
+                f"{ev.get('role', '?')} — prompt too large for the window"
+            )
     if "failed validation" in detail or "valid plan" in detail:
         return f"validation failure at {stage}: {detail[:160]}"
+    # stage exception with a traceback event
+    for ev in events:
+        if ev.get("event") == "exception" and ev.get("traceback"):
+            return f"exception at {ev.get('stage', stage)}: {str(ev.get('error', detail))[:160]}"
     return f"{stage}: {detail[:160]}" if stage else detail[:160]
 
 
@@ -226,6 +328,17 @@ def _cap(text: str, limit: int, full_path: Path | None = None) -> str:
     return text[:limit] + note + ")"
 
 
+def _fence(text: str) -> str:
+    """A valid Markdown fence for ``text``: four backticks when the text
+    itself contains a triple-backtick fence, else the usual three."""
+    return "````" if "```" in text else "```"
+
+
+def _fenced(text: str) -> str:
+    f = _fence(text)
+    return f"{f}\n{text}\n{f}"
+
+
 def _turn_section(workspace: str | Path, turn: dict[str, Any], *, redact_on: bool,
                   full: bool) -> str:
     ws = Path(workspace).resolve()
@@ -243,7 +356,7 @@ def _turn_section(workspace: str | Path, turn: dict[str, Any], *, redact_on: boo
         lines.append(f"- models: {models}")
     lines.append("\n**User text**\n")
     text = str(turn.get("text", ""))
-    lines.append("```\n" + _cap(text, PROMPT_CAP) + "\n```")
+    lines.append(_fenced(_cap(text, PROMPT_CAP)))
 
     snap = turn.get("state_snapshot") or {}
     if snap:
@@ -261,7 +374,8 @@ def _turn_section(workspace: str | Path, turn: dict[str, Any], *, redact_on: boo
                 f"{t.get('seconds', '?')} | {t.get('model', '')} |"
             )
 
-    # Per-call detail from the journal (role logs: prompt + response + meta)
+    # Per-call detail from the journal (calls/<n>.json: full prompt + raw
+    # response + think text + meta; capped here, full text in the file).
     if run_dir is not None:
         calls_dir = run_dir / "calls"
         call_files = sorted(calls_dir.glob("*.json")) if calls_dir.is_dir() else []
@@ -272,18 +386,27 @@ def _turn_section(workspace: str | Path, turn: dict[str, Any], *, redact_on: boo
                     call = json.loads(call_file.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     continue
+                reload_flag = "  RELOAD SUSPECTED" if call.get("reload_suspected") else ""
                 lines.append(
                     f"- `{call.get('role', '?')}` model={call.get('model', '?')} "
                     f"num_ctx={call.get('num_ctx', '?')} "
                     f"prompt_tokens={call.get('prompt_eval_count', '?')} "
                     f"output_tokens={call.get('eval_count', '?')} "
+                    f"tok/s={call.get('tok_per_s', '?')} "
                     f"done_reason={call.get('done_reason', '?')} "
-                    f"seconds={call.get('seconds', '?')}"
+                    f"seconds={call.get('seconds', '?')} "
+                    f"size_vram={call.get('size_vram', '?')}/"
+                    f"{call.get('size_total', '?')}{reload_flag}"
                 )
                 prompt_text = str(call.get("prompt", ""))
-                response_text = str(call.get("response", ""))
-                lines.append("  prompt:\n  ```\n" + _cap(prompt_text, PROMPT_CAP, call_file) + "\n  ```")
-                lines.append("  response:\n  ```\n" + _cap(response_text, PROMPT_CAP, call_file) + "\n  ```")
+                # The RAW response (pre think-strip) when recorded; else the
+                # post-strip answer.
+                response_text = str(call.get("raw_response") or call.get("response", ""))
+                think_text = str(call.get("think_text", ""))
+                lines.append("  prompt:\n  " + _fenced(_cap(prompt_text, PROMPT_CAP, call_file)).replace("\n", "\n  "))
+                if think_text.strip():
+                    lines.append("  think:\n  " + _fenced(_cap(think_text, PROMPT_CAP, call_file)).replace("\n", "\n  "))
+                lines.append("  response:\n  " + _fenced(_cap(response_text, PROMPT_CAP, call_file)).replace("\n", "\n  "))
 
     if turn.get("files_planned"):
         lines.append("\n**Plan**: " + ", ".join(turn["files_planned"]))
@@ -291,7 +414,9 @@ def _turn_section(workspace: str | Path, turn: dict[str, Any], *, redact_on: boo
         lines.append("**Staged**: " + ", ".join(turn["files_staged"]))
     if turn.get("answer_preview"):
         lines.append("\n**Answer**\n")
-        lines.append("```\n" + _cap(str(turn["answer_preview"]), PROMPT_CAP) + "\n```")
+        # RAW markdown, never the rendered output; the fence widens when the
+        # answer itself contains fences.
+        lines.append(_fenced(_cap(str(turn["answer_preview"]), PROMPT_CAP)))
     if turn.get("error"):
         err = turn["error"]
         lines.append(f"\n**Error** — stage `{err.get('stage', '?')}`: {err.get('detail', '')}")
@@ -336,7 +461,12 @@ def build_report(
     ws = Path(workspace).resolve()
     parts: list[str] = []
     parts.append("# Debug report\n")
-    parts.append(f"generated: {datetime.now(timezone.utc).isoformat()}\n")
+    now_utc = datetime.now(timezone.utc)
+    local = datetime.now().astimezone()
+    parts.append(
+        f"generated: {now_utc.isoformat()} (UTC) / "
+        f"{local.isoformat(timespec='seconds')} (local)\n"
+    )
 
     # 1. Summary
     parts.append("## Summary\n")
@@ -370,9 +500,15 @@ def build_report(
     if roles:
         parts.append("- roles:")
         for role, cfg in roles.items():
+            eff = cfg.get("num_ctx_effective")
+            eff_str = f" (effective {eff})" if eff and eff != cfg.get("num_ctx") else ""
             parts.append(
-                f"  - {role}: {cfg.get('model')} num_ctx={cfg.get('num_ctx')} "
-                f"num_predict={cfg.get('num_predict')} temp={cfg.get('temperature')}"
+                f"  - {role}: {cfg.get('model')} "
+                f"digest={cfg.get('digest12') or 'n/a'} "
+                f"installed={'yes' if cfg.get('installed') else 'no'} "
+                f"num_ctx={cfg.get('num_ctx')}{eff_str} "
+                f"num_predict={cfg.get('num_predict')} temp={cfg.get('temperature')} "
+                f"keep_alive={cfg.get('keep_alive', 'n/a')}"
             )
     parts.append(f"- workspace: {env.get('workspace', str(ws))}")
 
@@ -428,15 +564,19 @@ def write_report(workspace: str | Path, report: str) -> Path:
 
 def build_fixture_lines(turns: list[dict[str, Any]], *, redact_on: bool = True,
                         workspace: str | Path = ".") -> list[str]:
-    """One JSON line per turn in the eval format (text, state, expected,
-    observed_ok: null) for paste-into-classify_eval.jsonl."""
+    """One JSON line per turn in the holdout format (text, state, expected,
+    files_created, observed_ok: null) for paste-into-classify_holdout.jsonl.
+    ``state`` is the PRE-turn snapshot (the state the model actually saw)."""
     lines: list[str] = []
     for t in turns:
+        staged = t.get("files_staged") or []
         entry = {
             "text": t.get("text", ""),
             "state": t.get("state_snapshot") or {},
             "expected": t.get("label") or t.get("path"),
+            "files_created": len(staged),
             "observed_ok": None,
+            "note": f"exported turn {t.get('id', '?')} (outcome {t.get('outcome', '?')})",
         }
         line = json.dumps(entry, ensure_ascii=False)
         lines.append(redact(line, workspace) if redact_on else line)
@@ -473,8 +613,14 @@ def do_export(
     redact_on = not no_redact
     warning = FULL_WARNING if (full or no_redact) else ""
     env = build_environment(ws, config)
-    if build_id:
-        env["build_id"] = build_id
+    if not build_id:
+        try:
+            from main import _build_id as _bid
+
+            build_id = _bid()
+        except Exception:
+            build_id = "n/a"
+    env["build_id"] = build_id
 
     if fixture:
         path = write_fixtures(ws, turns, redact_on=redact_on)

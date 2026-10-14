@@ -26,6 +26,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Input, RichLog, Static
 
+import render
 import tui
 from tui import (
     EXPECTED_STAGES,
@@ -193,6 +194,8 @@ class OllamaAgentApp(App):
         self._workspace_pending = False
         self._confirm_pending = False
         self._setup_pending = False
+        # Retired-name model migration gate: (role, old, new) awaiting y/N.
+        self._migration_pending: tuple[str, str, str] | None = None
         self._vitals_lines: list[str] = ["n/a", "n/a", "n/a"]
         self._vitals_at = 0.0
         self._polling = False
@@ -237,6 +240,7 @@ class OllamaAgentApp(App):
         # Vitals polling every second, in a thread worker; UI never blocks.
         self.set_interval(1.0, self._tick)
         self._refresh_status_bar()
+        self._model_audit_work()
 
     def on_key(self, event) -> None:
         """Up/Down in the input bar recalls previous inputs; Esc clears."""
@@ -339,6 +343,25 @@ class OllamaAgentApp(App):
             else:
                 self._write(f"[{DIM}]Calibration skipped — nothing changed.[/]")
             return
+        if self._migration_pending is not None:
+            # Retired-name migration gate: y migrates + persists; anything else
+            # keeps the old name and the missing-model table stays visible.
+            role, old, new = self._migration_pending
+            self._migration_pending = None
+            if text.lower() == "y":
+                try:
+                    from agent_config import load_agent_config
+
+                    tui.apply_model_migration(
+                        self.workspace, load_agent_config(self.workspace), role, new)
+                    self._write(f"[{GREEN}]✓ {role} updated to {new} (.agent saved)[/]")
+                    self._refresh_status_bar()
+                except Exception as exc:
+                    self._write(f"[{RED}]Migration failed: {exc}[/]")
+            else:
+                self._write(f"[{DIM}]Kept {old} — pull it or switch: "
+                            f"/model {role} {new}[/]")
+            return
         if not text:
             return
         if self._save_pending:
@@ -352,13 +375,13 @@ class OllamaAgentApp(App):
 
         # Turn separation: dim rule, then the message ONCE with accent prefix.
         self._write(Rule(style=DIM))
-        self._write(f"[bold {ACCENT}]you[/] {text}")
+        self._write(f"[bold {ACCENT}]you[/] {render.escape(text)}")
 
         command = text.lower()
         if command in {"/quit", "/exit", "q"}:
             self.exit()
         elif command == "/help":
-            self._write(f"[{DIM}]/run · /benchmark · /save · /status · /workspace · "
+            self._write(f"[{DIM}]/run · /benchmark · /save · /preview <file> [raw] · /status · /workspace · "
                         f"/cancel · /router <text> · /models · /logs [role|events] [N] · /clear · /quit[/]\n")
         elif command == "/clear":
             self.query_one("#chat", RichLog).clear()
@@ -414,6 +437,10 @@ class OllamaAgentApp(App):
         elif command.startswith("/export"):
             args = text.strip()[len("/export"):].strip()
             self._export_work(args)
+        elif command.startswith("/preview"):
+            # Local render only: no model call, no GPU, safe during a run.
+            self._write(render.preview_command(
+                self.workspace, text.strip()[len("/preview"):].strip()))
         elif command.startswith("/router"):
             self._router_work(text.strip()[len("/router"):].strip())
         elif command == "/roles":
@@ -492,6 +519,38 @@ class OllamaAgentApp(App):
             self._refresh_status_bar()
 
     @work(thread=True)
+    def _model_audit_work(self) -> None:
+        """Startup model audit (Textual side): retired-name migration offer
+        (inline y/N gate — the app's modal) + the missing-model table."""
+        try:
+            audit = tui.audit_configured_models(self.workspace)
+        except Exception:
+            return
+        if audit is None:
+            return
+        migrations = audit["migrations"]
+        missing = audit["missing"]
+        lines: list[str] = []
+        if migrations:
+            role, old, new = migrations[0]
+            lines.append(f"[yellow]Configured model '{old}' ({role}) is a retired "
+                         f"default and not installed.[/]")
+            for r, o, n in migrations[1:]:
+                lines.append(f"[yellow]also retired: {r} = {o} -> {n}[/]")
+            lines.append(f"[bold {ACCENT}]Update {role} from {old} to {new}? \\[y/N][/]")
+        if missing:
+            lines.append("[yellow]Configured models not installed:[/]")
+            for role, name in missing:
+                lines.append(f"  {role}: {name}  [{DIM}]ollama pull {name}[/]")
+        if not lines:
+            return
+        def _show() -> None:
+            self._write("\n".join(lines))
+            if migrations:
+                self._migration_pending = migrations[0]
+        self.call_from_thread(_show)
+
+    @work(thread=True)
     def _poll_confirm(self) -> None:
         """Poll the server's pending plan-confirm gate (one per second via
         _tick). Never blocks the UI; no Rich prompts inside the app."""
@@ -510,11 +569,28 @@ class OllamaAgentApp(App):
             self._confirm_polling = False
 
     def _show_confirm(self, pending: dict) -> None:
-        lines = [f"[yellow]Plan ({pending.get('intent', '')}):[/]"]
+        lines = [f"[yellow]Plan ({render.escape(str(pending.get('intent', '')))}):[/]"]
         for t in pending.get("plan", []):
-            lines.append(f"  {t.get('action', 'create')}  {t.get('path', '')}")
-        lines.append(f"[bold {ACCENT}]Stage and build? \\[Y/n] (Enter = yes)[/]")
+            ow = "  [yellow](overwrites existing file)[/]" if t.get("overwrites") else ""
+            lines.append(f"  {render.escape(str(t.get('action', 'create')))}  "
+                         f"{render.escape(str(t.get('path', '')))}{ow}")
         self._write("\n".join(lines))
+        # Preview: staged version when one exists, else the workspace file that
+        # would be overwritten (markdown rendered, code highlighted).
+        for t in pending.get("plan", []):
+            rel = str(t.get("path", ""))
+            if not rel:
+                continue
+            try:
+                target, source = render.resolve_preview_target(self.workspace, rel)
+            except Exception:
+                continue
+            if target.is_file():
+                self._write(render.Group(
+                    render.Text(f"preview: {rel}  ({source})", style=DIM),
+                    render.file_preview(target),
+                ))
+        self._write(f"[bold {ACCENT}]Stage and build? \\[Y/n] (Enter = yes)[/]")
         self._confirm_pending = True
 
     def _answer_confirm(self, approved: bool) -> None:
@@ -790,23 +866,29 @@ class OllamaAgentApp(App):
         # Structured error envelope (never a bare 500): stage + detail + run_id.
         if result.get("error"):
             self._write(
-                f"[{RED}]Run failed at {result.get('stage', '?')}: "
-                f"{result.get('error')}: {result.get('detail', '')}[/]\n"
-                f"[{DIM}]run_id: {result.get('run_id', '?')}[/]"
-                + (f"\n[yellow]{result['hint']}[/]" if result.get("hint") else "")
+                f"[{RED}]Run failed at {render.escape(str(result.get('stage', '?')))}: "
+                f"{render.escape(str(result.get('error')))}: "
+                f"{render.escape(str(result.get('detail', '')))}[/]\n"
+                f"[{DIM}]run_id: {render.escape(str(result.get('run_id', '?')))}[/]"
+                + (f"\n[yellow]{render.escape(str(result['hint']))}[/]" if result.get("hint") else "")
             )
             return
 
         self._write(f"[{DIM}]" + trace_line(trace) + "[/]")
 
+        # Answers and summaries are markdown renderables — never markup strings
+        # (a "[" in model text must render literally, never be parsed).
         if "answer" in result:
-            self._write(result["answer"])
+            self._write(render.render_markdown(str(result["answer"])))
             self._write("")
             return
 
-        self._write(result.get("summary", "(no summary)"))
+        self._write(render.render_markdown(str(result.get("summary", "(no summary)"))))
         for failed in result.get("failed_tasks", []):
-            self._write(f"[{RED}]NOT saved (failed): {failed['path']} — {failed['error']}[/]")
+            self._write(
+                f"[{RED}]NOT saved (failed): {render.escape(str(failed['path']))} — "
+                f"{render.escape(str(failed['error']))}[/]"
+            )
         self._write("")
         if result.get("staged_files"):
             self._prepare_save()
@@ -820,20 +902,34 @@ class OllamaAgentApp(App):
             self._write(f"[{DIM}]No staged changes.[/]")
             return
         dest_root = str(Path(self.workspace).resolve())
-        lines = [f"[yellow]Saving to {dest_root}:[/]"]
+        lines = [f"[yellow]Saving to {render.escape(dest_root)}:[/]"]
         for diff_obj in diff_status.get("diffs", []):
             tag = "(new)" if diff_obj["action"] == "create" else "(overwrites existing file)"
-            lines.append(f"  {diff_obj['file']}  [{DIM}]{tag}[/]")
+            lines.append(f"  {render.escape(str(diff_obj['file']))}  [{DIM}]{tag}[/]")
+        self._write("\n".join(lines))
+        # Rendered preview per staged file (markdown rendered, code
+        # highlighted) — the diff stays available via /logs and /workspace diff.
+        for diff_obj in diff_status.get("diffs", []):
+            rel = str(diff_obj.get("file", ""))
+            if not rel:
+                continue
+            try:
+                target, source = render.resolve_preview_target(self.workspace, rel)
+            except Exception:
+                continue
+            if target.is_file():
+                self._write(render.Group(
+                    render.Text(f"preview: {rel}  ({source})", style=DIM),
+                    render.file_preview(target),
+                ))
         # --yes auto-approves: only CHECK-passed files are staged, so saving
         # the staged set is exactly "approve what passed CHECK".
         if tui._cli_yes:
-            self._write("\n".join(lines))
             self._write(f"[{DIM}]--yes: auto-saving staged (CHECK-passed) files.[/]")
             self._deploy_work()
             return
         # The literal "[y/N]" must be escaped so Rich does not eat it as markup.
-        lines.append(f"[bold {ACCENT}]Save? \\[y/N][/]")
-        self._write("\n".join(lines))
+        self._write(f"[bold {ACCENT}]Save? \\[y/N][/]")
         self._save_pending = True
 
     async def _answer_save(self, answer: str) -> None:

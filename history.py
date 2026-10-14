@@ -196,6 +196,23 @@ def state_snapshot(convo: Any) -> dict[str, Any]:
 # Shared rendering for /history (both TUIs call these)
 # ---------------------------------------------------------------------------
 
+# Outcome styling for /history and the sidebar: unverified is yellow (code ran
+# but validation failed/skipped — NOT the green of a clean ok).
+OUTCOME_STYLES = {
+    "unverified": "yellow",
+    "failed": "red",
+    "error": "red",
+    "needs_human": "red",
+    "cancelled": "dim",
+}
+
+
+def style_outcome(outcome: str) -> str:
+    """Rich markup for an outcome value; plain text for unknown/ok."""
+    style = OUTCOME_STYLES.get(outcome)
+    return f"[{style}]{outcome}[/{style}]" if style else outcome
+
+
 def format_history_table(workspace: str | Path, n: int = 15) -> str:
     """`/history [N]`: id, time, path/label, outcome, seconds, text preview."""
     entries, skipped = read_history(workspace, limit=n)
@@ -206,9 +223,12 @@ def format_history_table(workspace: str | Path, n: int = 15) -> str:
         ts = str(e.get("ts", ""))[:19].replace("T", " ")
         label = e.get("label") or e.get("path", "?")
         text = str(e.get("text", "")).replace("\n", " ")[:60]
+        outcome = str(e.get("outcome", "?"))
+        styled = style_outcome(outcome)
+        pad = max(0, 12 - len(outcome))
         lines.append(
             f"{int(e.get('id', 0)):>4}  {ts:<19}  {str(label):<18}  "
-            f"{str(e.get('outcome', '?')):<12}  {float(e.get('seconds', 0.0)):>6.1f}  {text}"
+            f"{styled}{' ' * pad}  {float(e.get('seconds', 0.0)):>6.1f}  {text}"
         )
     if skipped:
         lines.append(f"(skipped {skipped} corrupt line(s))")

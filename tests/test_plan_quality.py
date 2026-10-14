@@ -24,16 +24,21 @@ def test_placeholders_rejected() -> None:
     assert _valid_plan_task(_task("blog_page.py", desc)) is None
 
 
-def test_extension_language_mismatch_rejected() -> None:
-    assert _valid_plan_task(_task("main.rs", "Python script that greets the user by name")) is not None
-    assert _valid_plan_task(_task("page.py", "HTML page structure for the blog home page")) is not None
-    assert _valid_plan_task(_task("main.rs", "Rust binary that greets the user by name")) is None
-    assert _valid_plan_task(_task("page.html", "HTML page structure for the blog home page")) is None
-
-
-def test_short_description_rejected() -> None:
-    assert _valid_plan_task(_task("ok.py", "does things")) is not None
-    assert _valid_plan_task(_task("ok.py", "does several concrete things for the user request")) is None
+def test_safety_rules_only_no_quality_gates() -> None:
+    """The word-count and language-mismatch gates are gone (they rejected
+    legitimate plans like 'Create a README file for the project'). Only SAFETY
+    rules remain: empty path, junk artifact name, unsupported type. The coder
+    + CHECK catch bad content; the plan gate never judges prose quality."""
+    # previously rejected by the word-count rule: now accepted
+    assert _valid_plan_task(_task("readme.md", "Create a README file for the project")) is None
+    # previously rejected by the language-mismatch rule: now accepted (the
+    # description mentioning another language is not a safety problem)
+    assert _valid_plan_task(_task("main.rs", "Python script that greets the user by name")) is None
+    assert _valid_plan_task(_task("page.py", "HTML page structure for the blog home page")) is None
+    # safety rules still fire
+    assert _valid_plan_task(_task("foo.py", "anything at all here")) is not None  # placeholder stem
+    assert _valid_plan_task(_task("", "no path at all here")) is not None  # empty path
+    assert _valid_plan_task(_task("x.exe", "binary target not supported here")) is not None  # type
 
 
 # --- plan-level rules ----------------------------------------------------------
@@ -85,6 +90,8 @@ def test_coder_prompt_contains_request_paths_language() -> None:
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
         if "CLASSIFY MODE:" in prompt:
             return "code"
+        if "VERIFY SIDE EFFECT:" in prompt:
+            return "yes"
         if "PLAN TASKS JSON:" in prompt:
             return json.dumps({
                 "tasks": [_task(
@@ -117,6 +124,8 @@ def test_index_html_prompt_requires_exact_link_names() -> None:
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
         if "CLASSIFY MODE:" in prompt:
             return "code"
+        if "VERIFY SIDE EFFECT:" in prompt:
+            return "yes"
         if "PLAN TASKS JSON:" in prompt:
             return json.dumps({
                 "tasks": [

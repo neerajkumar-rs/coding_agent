@@ -141,13 +141,22 @@ All endpoints accept and return JSON.
 { "prompt": "Create a greeting CLI in generated.py", "auto_deploy": true }
 ```
 
-Runs the single pipeline `orchestrator.run_pipeline`: ROUTE → PLAN → CODE →
-CHECK → VALIDATE → SUMMARY. ROUTE is the router v2 (T0/T1 word-boundary rules
-first, T2 grey-zone classifier only when the rules are unsure; CHAT gets a
-canned reply with zero model calls). Stages CHECK-passed files (never
-auto-deploys). Response carries `summary`, `staged_files`, `failed_tasks`,
-`trace`, `run_id` for code tasks, or `answer`, `trace`, `run_id` for
-questions, plus `status` on cancel/budget stop.
+Runs the single pipeline `orchestrator.run_pipeline`: fast paths (zero model)
+→ CLASSIFY → VERIFY → PLAN → CODE → CHECK → VALIDATE → SUMMARY. CLASSIFY is
+one tiny schema-constrained call (no previous-turn text — a "Last turn" line
+biased labels toward `code`). A `code|both` label is re-checked by VERIFY
+(one `yes|no` call: "create or change a file?"); `no` downgrades to `reply`
+before anything is planned. A plan may legitimately return `tasks: []` +
+`reason` (→ reply fallback), and a plan whose only task is an unrelated
+invented file (no web/page wording in the request) is rejected in code —
+retried once, then `reply`. Replies are grounded in a Python-built FACTS
+block: the file table plus the CONTENT of any file the message names (cap 3
+files, 6000 chars, read-only), with a Python listing skeleton for list/show
+asks (a contradicting model reply is replaced by the table). Stages
+CHECK-passed files (never auto-deploys). Response carries `summary`,
+`staged_files`, `failed_tasks`, `trace`, `run_id` for code tasks, or
+`answer`, `trace`, `run_id` for questions, plus `status` on cancel/budget
+stop.
 
 Every LLM call is recorded in the run journal
 (`.agent_runs/<run_id>/{thinker,coder,validator}.log` + `sandbox.log` for
@@ -244,7 +253,9 @@ e:\coding_agent\
 ├── tui.py                 ← Rich TUI (reuses running Ollama)
 ├── tui_textual.py         ← Textual TUI (two-column, sidebar, save prompt)
 │
-├── tests/                 ← pytest suite (24 files, offline)
+├── tests/                 ← pytest suite (offline) + classify_eval.jsonl and
+│                              classify_holdout.jsonl (held-back label sets —
+│                              never used as CLASSIFY prompt examples)
 ├── test_master_controller.py  ← legacy lifecycle suite (offline, via /agent/run)
 ├── e2e_smoke_test.py          ← end-to-end with mock Ollama server
 └── scripts/live_smoke.py      ← live Ollama connection check (not pytest)
@@ -304,7 +315,12 @@ while loading — that is normal and not a VRAM leak.
    already-running Ollama prints a warning that these cannot be verified.
    `keep_alive: "5m"` is the payload's top-level field.
 4. **Context discipline** — per-role `num_ctx` (thinker 8192, coder 6144 by
-   default); prompt inputs capped at 85% of the window minus the output reserve.
+   default); prompt inputs capped at 85% of the window minus the output
+   reserve. **One num_ctx per model**: roles resolving to the same model name
+   send the same `num_ctx` on every call
+   (`effective_ctx_for_model = min(ceiling, max(role num_ctx))`), so a context
+   change never forces a hidden reload between phases; the journal flags
+   `reload_suspected` on a call event when `size_total` changed.
 5. **nvidia-smi watchdog** — logs `memory.used` around each load; warns when
    free VRAM < 300 MB; silent when nvidia-smi is absent. On Windows it prints
    once: set "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback".
