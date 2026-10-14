@@ -78,11 +78,17 @@ def channel_path(run_dir: Path, channel: str) -> Path:
 
 
 def latest_run_dir(workspace: Path | str) -> Path | None:
-    """The most recent .agent_runs/<run_id>/ for a workspace, or None."""
+    """The most recent .agent_runs/<run_id>/ for a workspace, or None.
+    Only REAL run dirs count: ``bench/`` (benchmark reports) and anything
+    without a state.json is excluded."""
     runs_dir = Path(workspace) / RUNS_DIR_NAME
     if not runs_dir.is_dir():
         return None
-    run_dirs = sorted((d for d in runs_dir.iterdir() if d.is_dir()), reverse=True)
+    run_dirs = sorted(
+        (d for d in runs_dir.iterdir()
+         if d.is_dir() and d.name != "bench" and (d / "state.json").exists()),
+        reverse=True,
+    )
     return run_dirs[0] if run_dirs else None
 
 
@@ -107,11 +113,12 @@ def tail_run_logs(
     if run_id:
         if runs_dir.is_dir():
             exact = runs_dir / run_id
-            if exact.is_dir():
+            if exact.is_dir() and exact.name != "bench":
                 chosen = exact
             else:
                 matches = [d for d in runs_dir.iterdir()
-                           if d.is_dir() and d.name.startswith(run_id)]
+                           if d.is_dir() and d.name != "bench"
+                           and d.name.startswith(run_id)]
                 chosen = matches[0] if len(matches) == 1 else None
         if chosen is None:
             return {"run_id": None,

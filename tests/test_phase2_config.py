@@ -55,11 +55,13 @@ def test_legacy_keys_fold_into_roles_on_load() -> None:
         c = load_agent_config(tmp)
         assert c.planner_model == "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
         assert c.coder_model == "qwen2.5-coder:3b"
-        assert c.max_context_tokens == 4096
-        # and they became roles (the single source of truth)
+        # Legacy max_context_tokens is IGNORED: role defaults stand (v4).
+        # The compat property reports the thinker's window, not the legacy key.
+        assert c.max_context_tokens == 8192
         assert c.roles["thinker"]["model"] == "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
         assert c.roles["coder"]["model"] == "qwen2.5-coder:3b"
-        assert c.roles["thinker"]["num_ctx"] == 4096
+        assert c.roles["thinker"]["num_ctx"] == 8192
+        assert c.roles["coder"]["num_ctx"] == 6144
 
 
 def test_recalculate_preserves_everything() -> None:
@@ -131,8 +133,8 @@ class _ModelsHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path.endswith("/api/tags"):
             body = json.dumps({"models": [
-                {"name": "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "digest": "sha256:abc123def4567890", "size": 1_100_000_000},
-                {"name": "qwen2.5-coder:3b-instruct", "digest": "sha256:9999888877776666", "size": 1_900_000_000},
+                {"name": "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "digest": "sha256:0a7c62f3bef49d9f1bef759b692335b2", "size": 1_100_000_000},
+                {"name": "qwen2.5-coder:3b-instruct", "digest": "sha256:f72c60cabf6237b07f6e632b2c48d533", "size": 1_900_000_000},
             ]}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -173,7 +175,7 @@ def test_models_endpoint_per_role() -> None:
             data = r.json()
             coder = data["roles"]["coder"]
             assert coder["model"] == "qwen2.5-coder:3b-instruct"
-            assert coder["digest"] == "999988887777"  # 12 chars
+            assert coder["digest"] == "f72c60cabf62"  # 12 chars (the real digest)
             assert coder["quant"] == "Q4_K_M"
             assert coder["installed"] is True
             assert coder["resident"] is False

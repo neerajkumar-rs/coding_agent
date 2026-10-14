@@ -495,13 +495,14 @@ async def run_pipeline(
                 f"max wall time exceeded ({budgets.max_wall_seconds:.0f}s)"
             )
 
-    def record(stage: str, status: str, seconds: float, note: str = "") -> None:
-        trace.append({"stage": stage, "status": status,
-                      "seconds": round(seconds, 1), "note": note})
-        journal.emit_event(
-            {"event": "stage", "stage": stage, "status": status,
-             "seconds": round(seconds, 1), "note": note}
-        )
+    def record(stage: str, status: str, seconds: float, note: str = "",
+               model: str = "") -> None:
+        entry = {"stage": stage, "status": status,
+                 "seconds": round(seconds, 1), "note": note}
+        if model:
+            entry["model"] = model
+        trace.append(entry)
+        journal.emit_event({"event": "stage", **entry})
 
     def _finish(status: str, extra: dict[str, Any] | None = None) -> None:
         state: dict[str, Any] = {
@@ -579,7 +580,8 @@ async def run_pipeline(
         )
         route = routed.intent
         record("ROUTE", "ok", time.monotonic() - t0,
-               f"{route} (tier {routed.tier})")
+               f"{route} (tier {routed.tier})",
+               model=planner_model if routed.tier == 2 else "")
 
         if route == "COMMAND":
             # Slash commands are dispatched by the client UI; one that reaches
@@ -616,7 +618,8 @@ async def run_pipeline(
                 except Exception:
                     pass  # keep the canned reply
             record("ANSWER", "ok", time.monotonic() - t0,
-                   "canned" if not chat_use_llm else "thinker")
+                   "FAST-PATH (canned)" if not chat_use_llm else "thinker",
+                   model="" if not chat_use_llm else planner_model)
             _finish("completed")
             return {"answer": reply, "trace": trace, "run_id": journal.run_id}
 
@@ -636,7 +639,7 @@ async def run_pipeline(
                 temperature=TEMPERATURE_PLAN,
             )
             _, answer = strip_think_blocks(raw)
-            record("ANSWER", "ok", time.monotonic() - t0)
+            record("ANSWER", "ok", time.monotonic() - t0, model=coder_model)
             _finish("completed")
             return {"answer": answer.strip(), "trace": trace, "run_id": journal.run_id}
 
@@ -666,7 +669,8 @@ async def run_pipeline(
             else:
                 answer = table
             record("ANSWER", "ok", time.monotonic() - t0,
-                   f"{len(facts['files'])} files scanned")
+                   f"{len(facts['files'])} files scanned",
+                   model=coder_model if (wants_prose and facts["files"]) else "")
             _finish("completed")
             return {"answer": answer, "trace": trace, "run_id": journal.run_id}
 

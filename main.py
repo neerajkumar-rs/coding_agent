@@ -180,6 +180,17 @@ async def health_check() -> dict[str, Any]:
     }
 
 
+# Expected digests for the reference models (soft check: warn, never fail).
+EXPECTED_DIGESTS = {
+    "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest": "0a7c62f3bef4",
+    "qwen2.5-coder:3b-instruct": "f72c60cabf62",
+}
+
+# Retired default model names (not installed on the user's machine): the
+# migration prompt offers to move a role off these onto the new default.
+RETIRED_MODEL_NAMES = {"deepseek-r1:1.5b", "deepseek-r1"}
+
+
 def _capability_entry(caps: Any, model: str) -> dict[str, Any]:
     """Find the capability-probe cache entry for a model name.
 
@@ -195,6 +206,20 @@ def _capability_entry(caps: Any, model: str) -> dict[str, Any]:
         if isinstance(entry, dict) and entry.get("model") == model:
             return entry
     return {}
+
+
+def _digest_warning(name: str, digest12: str) -> str | None:
+    """Soft digest check for the reference models: mismatch prints expected vs
+    actual (a re-pulled tag may legitimately differ) — never a hard failure."""
+    expected = EXPECTED_DIGESTS.get(name)
+    if expected and digest12 and digest12 != expected:
+        return f"digest mismatch: expected {expected}, got {digest12} (a re-pulled tag?)"
+    return None
+
+
+def _merge_warnings(*parts: str | None) -> str | None:
+    merged = " | ".join(p for p in parts if p)
+    return merged or None
 
 
 def _base_model_warning(name: str, quant: str, template: str | None = None) -> str | None:
@@ -277,7 +302,10 @@ async def list_models() -> dict[str, Any]:
             "num_ctx": cfg.get("num_ctx"),
             "installed": name in tags,
             "resident": name in resident,
-            "warning": _base_model_warning(name, quant, templates.get(name)),
+            "warning": _merge_warnings(
+                _base_model_warning(name, quant, templates.get(name)),
+                _digest_warning(name, digest),
+            ),
         }
     return {"workspace": str(state.workspace_root), "roles": roles, "resident": resident}
 

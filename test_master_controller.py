@@ -33,11 +33,13 @@ def test_agent_config_and_recalculate() -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
 
-        # 1. Save and load default config
+        # 1. Save and load config (legacy max_context_tokens is IGNORED in
+        #    v4: the role defaults stand — the status bar must never show 4096
+        #    for the defaults again).
         cfg = AgentConfig(
             planner_model="erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest",
             coder_5b_or_3b="qwen2.5-coder:3b",
-            max_context_tokens=4096,
+            roles={"thinker": {"num_ctx": 8192}},
         )
         saved = save_agent_config(cfg, tmp_path)
         assert saved.exists()
@@ -45,7 +47,7 @@ def test_agent_config_and_recalculate() -> None:
         loaded = load_agent_config(tmp_path)
         assert loaded.planner_model == "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
         assert loaded.coder_model == "qwen2.5-coder:3b"
-        assert loaded.max_context_tokens == 4096
+        assert loaded.max_context_tokens == 8192  # thinker default, not a legacy fold
 
         # 2. Benchmark calculation logic
         # 3B coder on RTX 3050 4GB ceiling should cap at 4096

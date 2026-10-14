@@ -99,7 +99,7 @@ def test_strip_think_only_a_block_and_empty_open() -> None:
 
 def test_reasoning_model_detection() -> None:
     assert is_reasoning_model("erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest")
-    assert is_reasoning_model("deepseek-r1:1.5b")
+    assert is_reasoning_model("erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest")
     assert not is_reasoning_model("qwen2.5-coder:3b")
 
 
@@ -108,7 +108,9 @@ def test_reasoning_model_detection() -> None:
 # ---------------------------------------------------------------------------
 
 def _engine(tmp: Path) -> OllamaEngine:
-    cfg = AgentConfig(max_context_tokens=4096, keep_alive="5m")
+    # Legacy max_context_tokens is ignored (v4): set the thinker role's ctx
+    # explicitly — that is what the engine payload reads.
+    cfg = AgentConfig(roles={"thinker": {"num_ctx": 4096}}, keep_alive="5m")
     return OllamaEngine(base_url="http://127.0.0.1:1", config=cfg, workspace_root=tmp)
 
 
@@ -232,7 +234,7 @@ def test_truncation_retries_with_bigger_budget() -> None:
         with TemporaryDirectory() as tmp:
             engine = OllamaEngine(
                 base_url=base_url,
-                config=AgentConfig(max_context_tokens=4096),
+                config=AgentConfig(roles={"thinker": {"num_ctx": 4096}}),
                 workspace_root=tmp,
             )
             answer = engine.chat("qwen2.5-coder:3b", "ping", max_tokens=256)
@@ -252,7 +254,7 @@ def test_context_bound_truncation_raises_retryable() -> None:
         with TemporaryDirectory() as tmp:
             engine = OllamaEngine(
                 base_url=base_url,
-                config=AgentConfig(max_context_tokens=4096),
+                config=AgentConfig(roles={"thinker": {"num_ctx": 4096}}),
                 workspace_root=tmp,
             )
             with pytest.raises(OllamaTruncatedError) as excinfo:
@@ -271,7 +273,7 @@ def test_chat_strips_think_before_return() -> None:
         with TemporaryDirectory() as tmp:
             engine = OllamaEngine(
                 base_url=base_url,
-                config=AgentConfig(max_context_tokens=4096),
+                config=AgentConfig(roles={"thinker": {"num_ctx": 4096}}),
                 workspace_root=tmp,
             )
             answer = engine.chat("erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "ping", max_tokens=256)
@@ -324,7 +326,7 @@ def test_supervisor_aborts_inflight_request_on_cancel() -> None:
                 await client.generate(
                     prompt="ping",
                     model_name="qwen2.5-coder:3b",
-                    config=AgentConfig(max_context_tokens=4096),
+                    config=AgentConfig(roles={"thinker": {"num_ctx": 4096}}),
                     cancel_event=cancel,
                 )
                 return -1.0

@@ -108,9 +108,16 @@ def trace_stage_rows(trace: list[dict]) -> list[tuple[str, str, str]]:
 
 
 def trace_line(trace: list[dict]) -> str:
-    """Single dim chat line, e.g. 'ROUTE ok 0.0s | PLAN ok 12.3s | ...'."""
-    return " | ".join(f"[{color}]{stage} {value}[/{color}]"
-                      for stage, value, color in trace_stage_rows(trace))
+    """Single dim chat line, e.g. 'UNDERSTAND ok 2.1s (qwen2.5-coder:3b-instruct)'.
+    Stages that ran a model show it in parentheses; FAST-PATH stages show no
+    model (0 model calls)."""
+    models = {t.get("stage"): t.get("model", "") for t in trace}
+    parts: list[str] = []
+    for stage, value, color in trace_stage_rows(trace):
+        model = models.get(stage, "")
+        parts.append(f"[{color}]{stage} {value}[/{color}]"
+                     + (f" [{DIM}]({model})[/]" if model else ""))
+    return " | ".join(parts)
 
 
 def _post_json_sync(url: str, payload: dict) -> dict:
@@ -256,12 +263,15 @@ class OllamaAgentApp(App):
         resident = next(
             (c.get("model") for c in roles.values() if c.get("resident")), "—"
         )
+        # Full configured names, per the exact-name rule: a wrong name must be
+        # visible at a glance. U/T/C/V only; the writer (W) is parked and
+        # appears only when configured AND used (never today).
         parts = [
-            f"T:{_short_model(roles.get('thinker', {}).get('model'))}@{roles.get('thinker', {}).get('num_ctx')}",
-            f"C:{_short_model(roles.get('coder', {}).get('model'))}@{roles.get('coder', {}).get('num_ctx')}",
-            f"V:{_short_model(roles.get('validator', {}).get('model'))}@{roles.get('validator', {}).get('num_ctx')}",
-            f"W:{_short_model(roles.get('writer', {}).get('model'))}@{roles.get('writer', {}).get('num_ctx')}",
-            f"res:{_short_model(resident)}",
+            f"U:{roles.get('understand', {}).get('model') or '—'}@{roles.get('understand', {}).get('num_ctx') or '—'}",
+            f"T:{roles.get('thinker', {}).get('model') or '—'}@{roles.get('thinker', {}).get('num_ctx') or '—'}",
+            f"C:{roles.get('coder', {}).get('model') or '—'}@{roles.get('coder', {}).get('num_ctx') or '—'}",
+            f"V:{roles.get('validator', {}).get('model') or '—'}@{roles.get('validator', {}).get('num_ctx') or '—'}",
+            f"res:{resident}",
         ]
         gpu_pct = ""
         if "%" in gpu:

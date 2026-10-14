@@ -475,6 +475,8 @@ def _check_ollama_running() -> CheckResult:
 
 
 def _check_required_models() -> CheckResult:
+    """EXACT match only (Ollama's untagged -> :latest normalization allowed);
+    never a fuzzy/substring match — a wrong name must be visible, not hidden."""
     try:
         with urllib.request.urlopen(OLLAMA_TAGS_URL, timeout=5) as r:
             data = json.loads(r.read())
@@ -484,10 +486,11 @@ def _check_required_models() -> CheckResult:
     installed = [m.get("name", "") for m in data.get("models", [])]
     missing: list[str] = []
     for req in REQUIRED_MODELS:
-        # fuzzy: req prefix must appear in any installed name
-        req_base = req.split(":")[0].lower()
-        if not any(req_base in m.lower() for m in installed):
-            missing.append(req)
+        if req in installed:
+            continue
+        if ":" not in req and f"{req}:latest" in installed:
+            continue
+        missing.append(req)
 
     if missing:
         pull_cmds = "  ".join(f"ollama pull {m}" for m in missing)
@@ -619,6 +622,114 @@ def start_all_services(assume_yes: bool = False) -> None:
         _shutdown("FastAPI failed to start")
         raise RuntimeError("FastAPI did not respond within 30 s")
     console.print("  [bright_green]✓ FastAPI controller ready[/bright_green]")
+
+
+def _check_configured_models(workspace: str, assume_yes: bool = False) -> None:
+    """Startup model audit (exact names; never a silent substitution):
+
+    1. A role configured to a RETIRED default name (not installed) while the
+       new default IS installed -> ask once "Update <role> from <old> to
+       <new>? [y/N]" and persist on y (Rich TUI only; the Textual TUI's
+       /models view shows the same facts).
+    2. Any configured model not installed -> a table: role, configured name,
+       installed yes/no, exact `ollama pull <name>`.
+    """
+    try:
+        from agent_config import ROLE_NAMES, load_agent_config, save_agent_config
+        from main import RETIRED_MODEL_NAMES, EXPECTED_DIGESTS
+
+        config = load_agent_config(workspace)
+        try:
+            with urllib.request.urlopen(OLLAMA_TAGS_URL, timeout=5) as r:
+                installed = [m.get("name", "") for m in json.loads(r.read()).get("models", [])]
+        except Exception:
+            return  # Ollama down — the preflight table reports it instead
+
+        roles_changed = False
+        rows: list[tuple[str, str, bool]] = []
+        for role in ROLE_NAMES:
+            cfg = config.get_role_config(role)
+            name = str(cfg.get("model", ""))
+            is_installed = name in installed or (
+                ":" not in name and f"{name}:latest" in installed
+            )
+            rows.append((role, name, is_installed))
+            if (
+                not is_installed
+                and name in RETIRED_MODEL_NAMES
+                and role in ("thinker", "validator")
+            ):
+                new_name = next(
+                    (n for n, d in EXPECTED_DIGESTS.items()
+                     if "DeepSeek-R1" in n and (n in installed or f"{n}" in installed)),
+                    None,
+                )
+                if new_name:
+                    answer = "y" if assume_yes else Prompt.ask(
+                        f"[yellow]Update {role} from {name} to {new_name}?[/yellow]",
+                        choices=["y", "n"], default="n",
+                    )
+                    if answer == "y":
+                        config.roles[role]["model"] = new_name
+                        roles_changed = True
+                        rows[-1] = (role, new_name, True)
+        if roles_changed:
+            save_agent_config(config, workspace)
+            console.print("[bright_green]✓ .agent updated[/bright_green]")
+
+        missing = [(r, n) for r, n, ok in rows if not ok]
+        if missing:
+            table = Table(title="Configured models not installed",
+                          box=box.ROUNDED, border_style="yellow")
+            table.add_column("Role", style="bright_cyan")
+            table.add_column("Configured model")
+            table.add_column("Pull command", style="dim")
+            for role, name in missing:
+                table.add_row(role, name, f"ollama pull {name}")
+            console.print(table)
+    except Exception:
+        return  # startup audit is best-effort; never blocks the TUI
+
+
+def _check_placeholder_files(workspace: str, assume_yes: bool = False) -> None:
+    """Startup warning: placeholder-named leftovers (your_code.py, example.py,
+    foo.py, untitled.*) in the workspace. Listed explicitly (never silently
+    hidden from a user's listing) with a y/N cleanup offer (default N).
+    The planner context already excludes them via the junk filter."""
+    try:
+        from orchestrator import PLACEHOLDER_STEMS
+
+        root = Path(workspace)
+        found: list[Path] = []
+        skip = {".git", ".agent", ".agent_runs", ".agent_staging", "env",
+                ".venv", "venv", "node_modules", "__pycache__"}
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if any(part in skip or part.startswith(".") for part in path.relative_to(root).parts[:-1]):
+                continue
+            if path.stem.lower() in PLACEHOLDER_STEMS:
+                found.append(path)
+        if not found:
+            return
+        console.print(
+            f"[yellow]!! {len(found)} placeholder-named file(s) in the workspace "
+            f"(leftover scaffolds; excluded from planner context):[/yellow]"
+        )
+        for path in found:
+            console.print(f"  [dim]{path.relative_to(root)}[/dim]")
+        cleanup = assume_yes or Prompt.ask(
+            "Delete these placeholder files?", choices=["y", "n"], default="n",
+        ) == "y"
+        if cleanup:
+            for path in found:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            console.print("[bright_green]✓ placeholder files removed[/bright_green]")
+    except Exception:
+        return  # best-effort; never blocks startup
 
 
 def _next_free_port(start: int) -> int | None:
@@ -1594,6 +1705,17 @@ def cli() -> None:
     _run_preflight_table()
     try:
         start_all_services(assume_yes=args.yes)
+        # Exact-name model audit: retired-name migration prompt (y/N) +
+        # missing-model table with exact pull commands. Best-effort, never blocks.
+        try:
+            _check_configured_models(args.workspace or str(PROJECT_ROOT), assume_yes=args.yes)
+        except Exception:
+            pass
+        # Placeholder-named leftovers (your_code.py etc.): listed + y/N cleanup.
+        try:
+            _check_placeholder_files(args.workspace or str(PROJECT_ROOT), assume_yes=args.yes)
+        except Exception:
+            pass
     except RuntimeError as exc:
         console.print(f"[bold red]Service startup failed:[/bold red] {exc}")
         return

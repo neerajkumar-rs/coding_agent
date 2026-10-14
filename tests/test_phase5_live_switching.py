@@ -52,7 +52,7 @@ def test_get_config_returns_roles_and_router(ws) -> None:
     r = client.get("/config")
     assert r.status_code == 200
     data = r.json()
-    assert set(data["roles"]) == {"thinker", "coder", "validator", "writer"}
+    assert set(data["roles"]) == {"thinker", "coder", "validator", "writer", "understand"}
     assert data["roles"]["coder"]["model"] == "qwen2.5-coder:3b-instruct"
     assert "min_confidence" in data["router"]
 

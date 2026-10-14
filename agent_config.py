@@ -26,12 +26,15 @@ RTX_3050_VRAM_CEILING_GB = 4.0
 
 # Role ceilings (num_ctx). The effective num_ctx is always clamped to these
 # (and further by calibration in Phase 6).
-ROLE_CTX_CEILINGS = {"thinker": 16384, "coder": 12288, "validator": 16384, "writer": 16384}
+ROLE_CTX_CEILINGS = {"thinker": 16384, "coder": 12288, "validator": 16384,
+                     "writer": 16384, "understand": 12288}
 
 # Canonical role names; "planner" is accepted everywhere as the thinker alias.
-# writer = prose (summaries/docs); defaults to the thinker MODEL so a fourth
-# role costs zero extra VRAM/swaps until configured otherwise.
-ROLE_NAMES = ("thinker", "coder", "validator", "writer")
+# understand = the LLM-first router (defaults to the coder model: no thinking
+# tax, follows JSON, and shares residency with the coding phase).
+# writer = PARKED (inert): kept as a registry seam; nothing routes to it and
+# it is hidden from the status bar unless configured and used.
+ROLE_NAMES = ("understand", "thinker", "coder", "validator", "writer")
 
 
 def canonical_role(role: str) -> str:
@@ -174,8 +177,8 @@ def _default_roles() -> dict[str, dict[str, Any]]:
             "inline_system": True,
             "think_budget": 512,
         },
-        # Prose role: summaries / docs. Same model as the thinker by default
-        # (zero extra VRAM), warmer temperature for readable prose.
+        # Prose role: summaries / docs. PARKED (inert): same model as the
+        # thinker by default; nothing routes to it.
         "writer": {
             "model": DEFAULT_PLANNER_MODEL,
             "num_ctx": 8192,
@@ -184,6 +187,18 @@ def _default_roles() -> dict[str, dict[str, Any]]:
             "keep_alive": DEFAULT_KEEP_ALIVE,
             "inline_system": True,
             "think_budget": 512,
+        },
+        # LLM-first routing: one schema-constrained call decides reply/code.
+        # Coder model by default — no thinking tax, strict JSON, and it can
+        # stay resident into the CODE phase (one swap pair per run at most).
+        "understand": {
+            "model": DEFAULT_CODER_MODEL,
+            "num_ctx": 6144,
+            "num_predict": 700,
+            "temperature": 0.0,
+            "keep_alive": DEFAULT_KEEP_ALIVE,
+            "inline_system": False,
+            "think_budget": 0,
         },
     }
 
@@ -246,9 +261,13 @@ class AgentConfig:
         if (c := _clean(coder_5b_or_3b)) and "model" not in saved.get("coder", {}):
             merged["coder"]["model"] = c
         if max_context_tokens is not None:
-            for role in merged:
-                if "num_ctx" not in saved.get(role, {}):
-                    merged[role]["num_ctx"] = int(max_context_tokens)
+            # Legacy key: v4+ ignores it (role defaults 8192/6144 stand unless
+            # roles.<role>.num_ctx was explicitly set) and notes the override
+            # once instead of silently shrinking every role's window.
+            logger.info(
+                "ignoring legacy max_context_tokens=%s (role num_ctx defaults apply)",
+                max_context_tokens,
+            )
         if keep_alive:
             for role in merged:
                 if "keep_alive" not in saved.get(role, {}):

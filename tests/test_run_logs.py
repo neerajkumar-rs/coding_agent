@@ -25,6 +25,7 @@ import tui_textual
 
 def _seed_run_with_logs(workspace: str | Path, run_id: str = "") -> RunJournal:
     journal = RunJournal(workspace, run_id=run_id)
+    journal.save_state({"run_id": journal.run_id, "status": "completed"})
     journal.log_llm_call(
         "thinker", model="m", prompt="plan this", response="the plan",
         num_ctx=8192, temperature=0.2, seconds=1.5, think_chars=42,
@@ -129,9 +130,24 @@ def test_latest_run_dir_picks_newest(tmp_path: Path) -> None:
     assert latest_run_dir(tmp_path / "nonexistent") is None
 
 
+def test_latest_run_dir_excludes_bench_and_stateless_dirs(tmp_path: Path) -> None:
+    """A benchmark run writes .agent_runs/bench/ with reports but no state.json;
+    /logs must never pick it as 'latest run'."""
+    real = _seed_run_with_logs(tmp_path, run_id="20261012T000000Z-aaa111")
+    # bench dir + a stateless junk dir, both NEWER by name
+    bench_dir = tmp_path / ".agent_runs" / "bench"
+    bench_dir.mkdir(parents=True)
+    (bench_dir / "bench-20261013T000000Z.md").write_text("# report", encoding="utf-8")
+    (tmp_path / ".agent_runs" / "20261013T999999Z-nostate").mkdir()
+    assert latest_run_dir(tmp_path) == real.run_dir
+    # run_id selection also refuses bench
+    assert tail_run_logs(tmp_path, run_id="bench")["run_id"] is None
+
+
 def test_line_count_tail_not_char_count() -> None:
     with TemporaryDirectory() as tmp:
         journal = RunJournal(tmp)
+        journal.save_state({"run_id": journal.run_id, "status": "completed"})
         journal.log_role("sandbox", "\n".join(f"line {i}" for i in range(100)))
         result = tail_run_logs(tmp, "sandbox", lines=5)
         lines = result["sections"][0]["lines"]

@@ -147,11 +147,11 @@ def test_trace_line_question_has_no_skipped() -> None:
 _ROLES_PAYLOAD = {
     "workspace": "E:/coding_agent",
     "roles": {
-        "thinker": {"model": "deepseek-r1:1.5b", "num_ctx": 8192,
+        "thinker": {"model": "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "num_ctx": 8192,
                     "num_predict": 2048, "temperature": 0.2, "keep_alive": "5m"},
         "coder": {"model": "qwen2.5-coder:3b-instruct", "num_ctx": 6144,
                   "num_predict": 2048, "temperature": 0.1, "keep_alive": "5m"},
-        "validator": {"model": "deepseek-r1:1.5b", "num_ctx": 8192,
+        "validator": {"model": "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "num_ctx": 8192,
                       "num_predict": 512, "temperature": 0.0, "keep_alive": "5m"},
     },
     "router": {"min_confidence": 0.7, "chat_use_llm": False},
@@ -167,7 +167,7 @@ async def test_roles_command_renders_table() -> None:
             await pilot.pause()
             await pilot.pause()
         plain = "\n".join(_plain_lines(app))
-        assert "thinker" in plain and "deepseek-r1:1.5b" in plain
+        assert "thinker" in plain and "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest" in plain
         assert "coder" in plain and "qwen2.5-coder:3b-instruct" in plain
         assert "validator" in plain
         assert "min_confidence" in plain
@@ -245,9 +245,10 @@ async def test_status_bar_shows_roles_and_gpu() -> None:
     app = OllamaAgentApp(workspace="E:/coding_agent")
     models_payload = {
         "roles": {
-            "thinker": {"model": "deepseek-r1:1.5b", "num_ctx": 8192, "resident": True},
+            "understand": {"model": "qwen2.5-coder:3b-instruct", "num_ctx": 6144, "resident": False},
+            "thinker": {"model": "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "num_ctx": 8192, "resident": True},
             "coder": {"model": "qwen2.5-coder:3b-instruct", "num_ctx": 6144, "resident": False},
-            "validator": {"model": "deepseek-r1:1.5b", "num_ctx": 8192, "resident": False},
+            "validator": {"model": "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest", "num_ctx": 8192, "resident": False},
         }
     }
     async with app.run_test() as pilot:
@@ -257,6 +258,7 @@ async def test_status_bar_shows_roles_and_gpu() -> None:
             await pilot.pause()
             await pilot.pause()
         bar = str(app.query_one("#status-right").render())
-        assert "deepseek-r1" in bar
-        assert "qwen2.5-coder" in bar
+        # full real names, per the exact-name rule (a wrong name is visible)
+        assert "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest@8192" in bar
+        assert "qwen2.5-coder:3b-instruct@6144" in bar
         assert "42%" in bar
