@@ -93,13 +93,17 @@ code = the message asks to CREATE, CHANGE, FIX or SAVE a concrete file or app,
        ("can you make a form in login.html" -> code). Hinglish counts.
 both = the message asks a question AND ALSO asks for a file ("what is a closure,
        then write an example file" -> both).
-reply = everything else: questions ("how do i ...", "what is ...", "yeh error
-       kyun"), listing or describing the workspace ("list the files", "make a
-       list of files", "what is in this dir"), pasted errors or stack traces,
-       follow-ups ("run it again", "change it", "and then?"), vague fragments
-       with typos and no clear artifact ("creat a pag", "write code",
-       "make somthing"), and chat. When in doubt: reply (reply never creates
-       a file; a wrong code creates one).
+reply = everything else. The message is reply when the answer would READ or
+       DESCRIBE files that already exist — listing, showing, explaining,
+       answering questions — even when the phrasing has "make", typos, or extra
+       words ("bro", "use cli tools"): "list the files", "make a list of the
+       files and their types", "what is in this dir", "how do i make a todo
+       page" (asks HOW = reading/instructions). reply is also: questions,
+       pasted errors or stack traces, follow-ups ("run it again", "change it",
+       "and then?"), vague fragments with typos and no clear artifact
+       ("creat a pag", "write code", "make somthing"), and chat.
+       When in doubt: reply (reply never creates a file; a wrong code creates
+       one).
 
 Files in workspace: {files}
 Last turn: {last_turn}
@@ -107,6 +111,8 @@ Last turn: {last_turn}
 "hi bro" -> reply
 "how many lines in index.html" -> reply
 "show me the file sizes" -> reply
+"list the files with their sizes in kb" -> reply
+"make a list of the files and their types" -> reply
 "create a script that renames files" -> code
 
 Message: "{text}"

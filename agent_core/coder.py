@@ -16,7 +16,11 @@ from typing import Any, Protocol
 
 from ollama_client import TEMPERATURE_CODE
 
-ALLOWED_TARGET_SUFFIXES = {".py", ".html", ".css", ".js"}
+# Suffixes a generated file may have. The plan validator (_valid_plan_task)
+# allows exactly this set plus nothing else; safe_target enforces the same set
+# at staging/deploy time. Text data files (.md, .json, .txt) are allowed: a
+# request like "store this table in dir_table.md" is a legitimate target.
+ALLOWED_TARGET_SUFFIXES = {".py", ".html", ".css", ".js", ".json", ".md", ".txt", ".rs"}
 MAX_CODE_TOKENS = 1800
 
 CODER_PROMPT_TEMPLATE = (

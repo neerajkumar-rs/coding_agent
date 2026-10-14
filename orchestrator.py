@@ -76,7 +76,7 @@ __all__ = [
 LANGUAGE_BY_SUFFIX = {
     ".py": "python", ".html": "html", ".css": "css",
     ".js": "javascript", ".json": "json", ".md": "markdown",
-    ".rs": "rust",
+    ".txt": "text", ".rs": "rust",
 }
 
 PLACEHOLDER_STEMS = {"your_code", "example", "foo", "file1", "untitled", "file", "code", "test"}
@@ -189,7 +189,7 @@ def _valid_plan_task(task: dict[str, Any]) -> str | None:
     if stem in PLACEHOLDER_STEMS:
         return f"placeholder filename: {path}"
     suffix = Path(path).suffix.lower()
-    if suffix not in ALLOWED_TARGET_SUFFIXES | {".json", ".md", ".rs"}:
+    if suffix not in ALLOWED_TARGET_SUFFIXES:
         return f"unsupported file type: {path}"
     if len(desc.split()) < 8:
         return f"description under 8 words: {desc!r}"

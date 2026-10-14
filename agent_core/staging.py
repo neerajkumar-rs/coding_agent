@@ -36,7 +36,9 @@ def safe_target(workspace: Path, relative_name: str) -> Path:
     if candidate != root and root not in candidate.parents:
         raise PathEscapeError("target_file must remain inside the workspace")
     if candidate.suffix.lower() not in ALLOWED_TARGET_SUFFIXES:
-        raise PathEscapeError("target_file must end in .py, .html, .css, or .js")
+        raise PathEscapeError(
+            f"target_file must end in one of {sorted(ALLOWED_TARGET_SUFFIXES)}"
+        )
     return candidate
 
 
