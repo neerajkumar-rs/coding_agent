@@ -50,6 +50,15 @@ def _fake_generate(routes: dict[str, str]):
     import re
 
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
+        if "UNDERSTAND JSON:" in prompt:
+            plan = routes.get("JSON array of tasks", "")
+            if plan.lstrip().startswith("["):
+                return json.dumps({
+                    "mode": "code", "reply": None,
+                    "tasks": json.loads(plan),
+                    "assumptions": [], "question": None,
+                })
+            return plan
         target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
         if target and f"TARGET FILE: {target.group(1)}" in routes:
             return routes[f"TARGET FILE: {target.group(1)}"]

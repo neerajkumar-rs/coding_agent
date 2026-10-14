@@ -29,6 +29,16 @@ def _fake(routes: dict[str, str]):
     import re
 
     async def fake(model, prompt, system="", temperature=0.2, **kw):
+        # The Understand call: the test's plan, wrapped as an Understand payload.
+        if "UNDERSTAND JSON:" in prompt:
+            plan = routes.get("JSON array of tasks", "")
+            if plan.lstrip().startswith("["):
+                return json.dumps({
+                    "mode": "code", "reply": None,
+                    "tasks": json.loads(plan),
+                    "assumptions": [], "question": None,
+                })
+            return plan
         target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
         if target and f"TARGET FILE: {target.group(1)}" in routes:
             return routes[f"TARGET FILE: {target.group(1)}"]
@@ -130,8 +140,12 @@ def test_garbage_coder_fails_without_stub_files() -> None:
 
     async def fake(model, prompt, system="", temperature=0.2, **kw):
         import re
-        if "JSON array of tasks" in prompt:
-            return PLAN
+        if "UNDERSTAND JSON:" in prompt:
+            return json.dumps({
+                "mode": "code", "reply": None,
+                "tasks": json.loads(PLAN),
+                "assumptions": [], "question": None,
+            })
         target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
         if target:
             calls["n"] += 1

@@ -190,8 +190,12 @@ def test_fastapi_endpoints() -> None:
         })
 
         async def mock_generate(role_or_model, prompt, **kwargs):
-            if "JSON array of tasks" in prompt:
-                return plan_json
+            if "UNDERSTAND JSON:" in prompt:
+                return json.dumps({
+                    "mode": "code", "reply": None,
+                    "tasks": json.loads(plan_json),
+                    "assumptions": [], "question": None,
+                })
             if "TARGET FILE: greet.py" in prompt:
                 return good_code
             if "satisfies_request" in prompt:

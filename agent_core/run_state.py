@@ -163,6 +163,85 @@ def format_run_logs(result: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Conversation state — one per workspace, persisted across turns.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ConversationState:
+    """Per-workspace conversation memory at .agent_runs/session.json.
+
+    Updated after EVERY turn (reply, question, failure included). The
+    Understand model resolves "this/that/again/what did you do" from it;
+    there is no regex reference resolution anywhere.
+    """
+
+    workspace: Path
+    turns: list[dict[str, Any]] = field(default_factory=list)  # last 3
+    last_result: dict[str, Any] = field(default_factory=dict)  # type/text/files
+    last_trace: list[dict[str, Any]] = field(default_factory=list)
+    pending_question: str = ""
+
+    MAX_TURNS = 3
+    LAST_RESULT_CHARS = 1_500
+
+    @property
+    def path(self) -> Path:
+        return Path(self.workspace) / RUNS_DIR_NAME / "session.json"
+
+    @classmethod
+    def load(cls, workspace: Path | str) -> "ConversationState":
+        ws = Path(workspace).resolve()
+        path = ws / RUNS_DIR_NAME / "session.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError
+        except (OSError, ValueError, json.JSONDecodeError):
+            return cls(workspace=ws)
+        return cls(
+            workspace=ws,
+            turns=list(data.get("turns", []))[-cls.MAX_TURNS:],
+            last_result=dict(data.get("last_result", {})),
+            last_trace=list(data.get("last_trace", [])),
+            pending_question=str(data.get("pending_question", "")),
+        )
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({
+            "turns": self.turns[-self.MAX_TURNS:],
+            "last_result": self.last_result,
+            "last_trace": self.last_trace,
+            "pending_question": self.pending_question,
+            "updated_at": utc_now_iso(),
+        }, indent=2), encoding="utf-8")
+        tmp.replace(self.path)
+
+    def record_turn(self, user_text: str, mode: str, result_one_liner: str,
+                    *, trace: list[dict[str, Any]] | None = None,
+                    last_result: dict[str, Any] | None = None,
+                    pending_question: str = "") -> None:
+        """Append a turn (capped at MAX_TURNS), refresh trace/result/question."""
+        self.turns.append({
+            "user": user_text[:300],
+            "mode": mode,
+            "result": result_one_liner[:200],
+        })
+        self.turns = self.turns[-self.MAX_TURNS:]
+        if trace is not None:
+            self.last_trace = trace
+        if last_result is not None:
+            last_result = dict(last_result)
+            if len(str(last_result.get("text", ""))) > self.LAST_RESULT_CHARS:
+                last_result["text"] = str(last_result.get("text", ""))[: self.LAST_RESULT_CHARS]
+            self.last_result = last_result
+        self.pending_question = pending_question
+        self.save()
+
+
 @dataclass
 class RunJournal:
     """Persists run metadata under .agent_runs/<run_id>/ (never workspace root)."""

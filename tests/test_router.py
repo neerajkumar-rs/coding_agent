@@ -303,8 +303,9 @@ def test_chat_zero_model_calls_zero_files() -> None:
             ))
             assert "answer" in result
             assert "staged_files" not in result
+            # FAST-PATH: no UNDERSTAND stage, zero model calls
             stages = [t["stage"] for t in result["trace"]]
-            assert stages == ["ROUTE", "ANSWER"]
+            assert stages == ["ANSWER"]
     assert calls == []  # canned reply: zero model calls by default
 
 
@@ -318,7 +319,13 @@ def test_command_intent_never_touches_files() -> None:
 
 
 def test_unclear_asks_clarifying_question() -> None:
-    fake = make_fake_generate({})
+    fake = make_fake_generate({
+        "UNDERSTAND JSON:": json.dumps({
+            "mode": "reply", "reply": None,
+            "tasks": [], "assumptions": [],
+            "question": "What should I build — a page, a script, or something else?",
+        }),
+    })
     with TemporaryDirectory() as tmp:
         result = _run(run_pipeline("make something", tmp, generate=fake,
                                    planner_model=PLANNER, coder_model=CODER))
@@ -328,11 +335,18 @@ def test_unclear_asks_clarifying_question() -> None:
 
 # --- FILE_QUESTION end to end ------------------------------------------------------
 
-def test_file_question_returns_real_table_no_planner_call() -> None:
-    calls: list[str] = []
-
+def test_file_question_grounded_in_facts_via_understand() -> None:
+    """'what is in my dir' — the Understand model answers from the FACTS
+    table only (grounded in the workspace, no invented files)."""
     async def fake(model, prompt, system="", temperature=0.2, **kw):
-        calls.append(model)
+        if "UNDERSTAND JSON:" in prompt:
+            assert "main.py" in prompt  # FACTS table went in
+            assert "notes.txt" in prompt
+            return json.dumps({
+                "mode": "reply",
+                "reply": "The workspace contains main.py (python) and notes.txt.",
+                "tasks": [], "assumptions": [], "question": None,
+            })
         return "some answer"
 
     with TemporaryDirectory() as tmp:
@@ -344,20 +358,19 @@ def test_file_question_returns_real_table_no_planner_call() -> None:
         ))
     assert "answer" in result
     assert "main.py" in result["answer"]
-    assert "notes.txt" in result["answer"]
-    assert "python" in result["answer"]  # language column
-    # No planner call (FILE_QUESTION without explain/summarize = no model call)
-    assert calls == []
     stages = [t["stage"] for t in result["trace"]]
-    assert stages == ["ROUTE", "ANSWER"]
+    assert stages == ["UNDERSTAND", "ANSWER"]
 
 
-def test_file_question_explain_makes_one_coder_call() -> None:
-    calls: list[tuple[str, str]] = []
-
+def test_file_question_explain_via_understand() -> None:
     async def fake(model, prompt, system="", temperature=0.2, **kw):
-        calls.append((model, prompt))
-        return "<think>x</think>main.py is the entry point."
+        if "UNDERSTAND JSON:" in prompt:
+            return json.dumps({
+                "mode": "reply",
+                "reply": "main.py is the entry point.",
+                "tasks": [], "assumptions": [], "question": None,
+            })
+        return "unused"
 
     with TemporaryDirectory() as tmp:
         Path(tmp, "main.py").write_text("def main():\n    pass\n", encoding="utf-8")
@@ -365,18 +378,19 @@ def test_file_question_explain_makes_one_coder_call() -> None:
             "summarize my files",
             tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
         ))
-    assert len(calls) == 1
-    model, prompt = calls[0]
-    assert model == CODER
-    assert "Do not invent files" in prompt
     assert "main.py is the entry point" in result["answer"]
-    assert "main.py" in result["answer"]  # deterministic table included
 
 
 # --- QUESTION creates zero tasks ----------------------------------------------------
 
 def test_question_creates_zero_tasks() -> None:
-    fake = make_fake_generate({"QUESTION:": "Rust is compiled; Python is interpreted."})
+    fake = make_fake_generate({
+        "UNDERSTAND JSON:": json.dumps({
+            "mode": "reply",
+            "reply": "Rust is compiled; Python is interpreted.",
+            "tasks": [], "assumptions": [], "question": None,
+        }),
+    })
     with TemporaryDirectory() as tmp:
         result = _run(run_pipeline(
             "tell me the difference between rust and python",

@@ -32,6 +32,7 @@ from agent_config import (
 from ollama_client import (
     TEMPERATURE_CODE,
     TEMPERATURE_PLAN,
+    ModelNotInstalled,
     OllamaError,
     OllamaSupervisorClient,
     OllamaTruncatedError,
@@ -579,8 +580,29 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
     except HTTPException:
         raise
     except Exception as exc:
+        # Never a bare 500: structured error with stage + detail + run_id.
         logger.error(f"agent run failed: {exc}")
-        raise HTTPException(status_code=500, detail=str(exc))
+        stage = "unknown"
+        try:
+            events = journal.read_events()
+            stage_entries = [e for e in events if e.get("event") == "stage"]
+            if stage_entries:
+                stage = str(stage_entries[-1].get("stage", "unknown"))
+        except Exception:
+            pass
+        hint = ""
+        if isinstance(exc, ModelNotInstalled):
+            hint = f"Run: ollama pull {getattr(exc, 'requested', '')}"
+        elif exc.__class__.__name__ == "VramGuardError":
+            hint = "Model does not fit the GPU at any context rung — try /setup calibration or a lower num_ctx."
+        return {
+            "error": exc.__class__.__name__,
+            "stage": stage,
+            "detail": str(exc)[:500],
+            "run_id": journal.run_id,
+            "hint": hint,
+            "trace": [],
+        }
     finally:
         gateway.on_call = None
 

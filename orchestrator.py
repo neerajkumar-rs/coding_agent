@@ -21,7 +21,12 @@ from typing import Any, Awaitable, Callable
 
 from agent_core.coder import ALLOWED_TARGET_SUFFIXES, parse_coder_output, apply_file_edit
 from agent_core.context import ContextBudget
-from agent_core.run_state import RUNS_DIR_NAME, RunJournal, diagnostic_hash
+from agent_core.run_state import (
+    RUNS_DIR_NAME,
+    ConversationState,
+    RunJournal,
+    diagnostic_hash,
+)
 from agent_core.schemas import PipelinePlan, ValidateResult
 from agent_core.staging import safe_target
 from agent_core.verifier import verify_files
@@ -229,53 +234,10 @@ def _valid_plan(tasks: list[dict[str, str]], user_request: str) -> list[str]:
     return reasons
 
 
-def _fallback_plan(user_request: str, deliverable: str | None = None) -> list[dict[str, str]] | None:
-    """Deterministic plan when the planner fails validation twice.
+# _fallback_plan was retired with the rules router (v4): the Understand step
+# produces plans; a total Understand failure is a graceful reply, never a
+# deterministic scaffold.
 
-    Allowed ONLY after intent == CODE_TASK was confirmed (the caller guarantees
-    this). Emits a path derived from the extracted deliverable (or a filename
-    in the request) and fixed minimal template descriptions per extension —
-    NEVER raw request text as file content. Returns None when there is no
-    extractable filename/deliverable (the caller then reports needs_human).
-    """
-    lower = user_request.lower()
-    if any(h in lower for h in WEB_HINTS) or (deliverable or "") in ("page", "site", "website", "blog", "landing", "form"):
-        return [
-            {"path": "index.html", "action": "create",
-             "description": "Main HTML5 page structure that links the stylesheet and script files and presents the content sections."},
-            {"path": "style.css", "action": "create",
-             "description": "Stylesheet with layout, typography, colors and responsive rules for the page structure."},
-            {"path": "script.js", "action": "create",
-             "description": "JavaScript providing the dynamic content and interactions requested for the page."},
-        ]
-    # A filename typed by the user wins over a derived one — unless it is a
-    # rejected placeholder/junk name.
-    name_match = re.search(r"\b[\w.-]+\.(?:py|js|ts|html?|css|json|md|txt|rs)\b", lower)
-    if name_match:
-        candidate = name_match.group(0)
-        lang = _language_of(candidate)
-        probe = {"path": candidate, "action": "create",
-                 "description": (
-                     f"{lang.capitalize()} file implementing the requested behavior; "
-                     "fill in the TODO sections with the concrete logic."
-                 )}
-        if _valid_plan_task(probe) is None:
-            return [probe]
-    if deliverable and not re.search(r"\.[a-z]+$", deliverable.lower()):
-        # A plain noun deliverable (not a filename — those were handled above).
-        safe = re.sub(r"[^a-z0-9]+", "_", deliverable.lower()).strip("_") or "task"
-        if safe in ("test", "tests"):
-            safe = "test_feature"
-        if safe not in PLACEHOLDER_STEMS:
-            return [{
-                "path": f"{safe}.py",
-                "action": "create",
-                "description": (
-                    f"Python {safe.replace('_', ' ')} stub implementing the requested "
-                    "behavior with a TODO for the concrete details."
-                ),
-            }]
-    return None
 
 
 def _parse_plan_json(text: str) -> list[dict[str, Any]]:
@@ -367,7 +329,7 @@ async def _summary_prose(
             summary_model, prompt,
             system="You describe only what the code visibly does.",
             temperature=TEMPERATURE_PLAN,
-            role="writer",  # server path: the writer role owns summary prose
+            role="thinker",  # summary prose runs on the thinker (writer parked)
         )
     except Exception:
         return ""
@@ -540,6 +502,11 @@ async def run_pipeline(
             )
         llm_calls += 1
         role = kwargs.get("role") or ("coder" if model == coder_model else "thinker")
+        # Role-scoped calls (understand) may pass model=None: resolve the model
+        # name for logging + the generate seam from the role.
+        if model is None:
+            model = {"understand": coder_model, "coder": coder_model,
+                     "writer": planner_model}.get(role, planner_model)
         trimmed = budget.trim(prompt)
         call_t0 = time.monotonic()
         response = ""
@@ -565,28 +532,15 @@ async def run_pipeline(
 
     try:
         # ------------------------------------------------------------------ ROUTE
-        # Router v2: T0/T1 rules first (no model); the T2 grey-zone classifier
-        # makes ONE thinker call through the same budget-guarded seam. There is
-        # no fall-through to CODE_TASK: unclassifiable -> UNCLEAR, never files.
-        t0 = time.monotonic()
-        routed: RouteResult = await router_route(
-            user_request,
-            generate=_llm,
-            thinker_model=planner_model,
-            history=history,
-            min_confidence=router_min_confidence,
-            think_supported=think_supported,
-            think_budget=think_budget,
-        )
-        route = routed.intent
-        record("ROUTE", "ok", time.monotonic() - t0,
-               f"{route} (tier {routed.tier})",
-               model=planner_model if routed.tier == 2 else "")
+        # Understand step: fast paths (no model, no files) first, then ONE
+        # schema-constrained call (role understand) that reads the message +
+        # workspace FACTS + CONVERSATION STATE and returns mode/tasks.
+        from understand import build_state_block, fast_path, understand
 
-        if route == "COMMAND":
-            # Slash commands are dispatched by the client UI; one that reaches
-            # the server gets a polite no-op, never files.
-            record("ANSWER", "ok", 0.0, "command handled by the client")
+        t0 = time.monotonic()
+        fp = fast_path(user_request)
+        if fp == "COMMAND":
+            record("ANSWER", "ok", 0.0, "FAST-PATH (command handled by the client)")
             _finish("completed")
             return {
                 "answer": "Slash commands are handled by the client UI — "
@@ -594,211 +548,74 @@ async def run_pipeline(
                 "trace": trace,
                 "run_id": journal.run_id,
             }
-
-        if route == "CHAT":
-            # Canned reply by default: zero model calls, no files, no coder
-            # call, no staging, no model swap. router.chat_use_llm=true opts
-            # into a short thinker reply (strip_think-ed, max 2 sentences).
-            t0 = time.monotonic()
+        if fp == "CHAT":
             reply = canned_chat_reply(user_request)
-            if chat_use_llm:
-                try:
-                    raw = await _llm(
-                        planner_model,
-                        "Reply briefly and warmly (max 2 sentences). "
-                        "You are a local coding assistant; offer to help with code.\n\n"
-                        "MESSAGE: " + user_request,
-                        system="You are a concise, friendly coding assistant.",
-                        temperature=TEMPERATURE_PLAN,
-                    )
-                    _, prose = strip_think_blocks(raw)
-                    prose = prose.strip()
-                    if prose:
-                        reply = prose
-                except Exception:
-                    pass  # keep the canned reply
-            record("ANSWER", "ok", time.monotonic() - t0,
-                   "FAST-PATH (canned)" if not chat_use_llm else "thinker",
-                   model="" if not chat_use_llm else planner_model)
+            record("ANSWER", "ok", 0.0, "FAST-PATH (canned)", model="")
             _finish("completed")
             return {"answer": reply, "trace": trace, "run_id": journal.run_id}
 
-        if route == "QUESTION":
-            t0 = time.monotonic()
-            # Depth-1 file tree as context; the workspace name itself never
-            # enters the prompt.
-            facts = build_file_facts(workspace)
-            depth1 = "\n".join(
-                line for line in facts["tree"].splitlines() if not line.startswith("  ")
+        # Conversation state: the Understand model resolves references from it.
+        convo = ConversationState.load(workspace)
+        # Merge a pending question into the message; yes/ok/default/do it
+        # accepts the proposed default. After one question we proceed with
+        # assumptions even if the answer is vague — never two in a row.
+        message = user_request
+        if convo.pending_question:
+            message = (
+                f"PENDING QUESTION FROM THE AGENT: {convo.pending_question}\n"
+                f"USER ANSWER: {user_request}"
             )
-            raw = await _llm(
-                coder_model,
-                "Answer concisely and accurately. The user's directory contains:\n"
-                + depth1 + "\n\nQUESTION: " + user_request,
-                system="You are a precise technical assistant.",
-                temperature=TEMPERATURE_PLAN,
-            )
-            _, answer = strip_think_blocks(raw)
-            record("ANSWER", "ok", time.monotonic() - t0, model=coder_model)
-            _finish("completed")
-            return {"answer": answer.strip(), "trace": trace, "run_id": journal.run_id}
+        facts = build_file_facts(workspace)
+        facts_table = format_file_table(facts)
+        state_block = build_state_block(
+            convo.turns, convo.last_result, convo.last_trace, convo.pending_question,
+        )
+        uresult = await understand(
+            message,
+            generate=_llm,
+            facts_table=facts_table,
+            state_block=state_block,
+            task_validator=_valid_plan_task,
+        )
+        record("UNDERSTAND", "ok", time.monotonic() - t0,
+               f"{uresult.mode} ({len(uresult.tasks)} tasks)",
+               model=coder_model)
 
-        if route == "FILE_QUESTION":
-            t0 = time.monotonic()
-            facts = build_file_facts(workspace)
-            table = format_file_table(facts)
-            wants_prose = any(
-                w in user_request.lower() for w in ("explain", "summarize", "summarise", "describe")
+        # -------------------------------------------------- dispatch per mode
+        if uresult.question and not uresult.tasks and uresult.mode == "reply":
+            # One question, stored; the next turn merges with it.
+            convo.record_turn(
+                user_request, "question", "asked one question",
+                trace=trace, pending_question=uresult.question,
             )
-            if wants_prose and facts["files"]:
-                # ONE model call, facts only — never invent files, never name the
-                # workspace. The deterministic table is included in the answer.
-                facts_block = "\n".join(
-                    f"- {f['name']} ({f['language']}, {f['lines']} lines):\n{f['head']}"
-                    for f in facts["files"]
-                )
-                raw = await _llm(
-                    coder_model,
-                    "Describe only the files listed. Do not invent files.\n\n"
-                    + facts_block + "\n\nREQUEST: " + user_request,
-                    system="You describe only the files you are shown.",
-                    temperature=TEMPERATURE_PLAN,
-                )
-                _, prose = strip_think_blocks(raw)
-                answer = table + "\n\n" + prose.strip()
-            else:
-                answer = table
-            record("ANSWER", "ok", time.monotonic() - t0,
-                   f"{len(facts['files'])} files scanned",
-                   model=coder_model if (wants_prose and facts["files"]) else "")
-            _finish("completed")
-            return {"answer": answer, "trace": trace, "run_id": journal.run_id}
-
-        if route == "UNCLEAR":
             record("ANSWER", "ok", 0.0, "needs clarification")
             _finish("completed")
             return {
-                "answer": routed.clarifying_question
-                or "Could you tell me a bit more — should I create or change "
-                   "code (which file/feature), or answer a question?",
+                "answer": uresult.question,
                 "trace": trace,
                 "run_id": journal.run_id,
             }
 
-        # ------------------------------------------------------------------ PLAN
-        t0 = time.monotonic()
-        plan_prompt = (
-            "You are a software planner. Return ONLY a JSON array of tasks, each "
-            '{"path": "<relative file path>", "action": "create"|"edit", '
-            '"description": "<what to build, at least 8 words>"}. '
-            "Invent concrete, descriptive filenames from the request itself. "
-            "Every description must be at least 8 words and match the file's "
-            "language. A web page request must produce an HTML file, a CSS file "
-            "and a JavaScript file. No code, JSON only.\n\nREQUEST: " + user_request
-        )
-        tasks: list[dict[str, Any]] = []
-        last_rejects: list[str] = []
-
-        def _normalize(candidate: dict[str, Any]) -> dict[str, Any] | None:
-            """Accept any plan-task shape at the edge; normalize to the single
-            unified format {path, action, description}."""
-            path = candidate.get("path") or candidate.get("file") or ""
-            files = candidate.get("target_files")
-            if not path and isinstance(files, list) and files:
-                path = str(files[0])
-            desc = candidate.get("description") or candidate.get("spec") or candidate.get("name") or ""
-            action = str(candidate.get("action", "create")).lower()
-            if action not in ("create", "edit"):
-                action = "create"
-            path = str(path).strip().replace("\\", "/")
-            if not path:
-                return None
-            return {"path": path, "action": action, "description": str(desc).strip()}
-
-        # Schema-constrained attempt first (when the seam supports it): Ollama
-        # `format` + pydantic validation, THEN the rules. Falls back to the
-        # JSON-regex prompt path below on any structured failure.
-        if structured_generate is not None:
-            try:
-                _check_cancel()
-                llm_calls += 1
-                plan_obj = await structured_generate(
-                    planner_model,
-                    budget.trim(plan_prompt),
-                    PipelinePlan,
-                )
-                for task in plan_obj.tasks:
-                    normalized = _normalize(task.model_dump())
-                    if normalized is None:
-                        continue
-                    reason = _valid_plan_task(normalized)
-                    if reason:
-                        last_rejects.append(reason)
-                    else:
-                        tasks.append(normalized)
-            except Exception as exc:
-                last_rejects.append(f"structured plan failed: {exc}")
-                tasks = []
-
-        for plan_attempt in range(2 if not tasks else 0):
-            prompt = plan_prompt
-            if last_rejects:
-                prompt += "\n\nPrevious plan was rejected: " + "; ".join(last_rejects)
-            raw = await _llm(
-                planner_model, prompt,
-                system="You output only strict JSON task arrays.",
-                temperature=TEMPERATURE_PLAN,
+        if uresult.mode == "reply" or (not uresult.tasks and uresult.reply):
+            reply = (uresult.reply or "").strip() or "I don't know."
+            convo.record_turn(
+                user_request, "reply", reply[:120],
+                trace=trace,
+                last_result={"type": "reply", "text": reply},
             )
-            _, clean = strip_think_blocks(raw)
-            candidates = _parse_plan_json(clean)
-            tasks, last_rejects = [], []
-            for candidate in candidates:
-                normalized = _normalize(candidate)
-                if normalized is None:
-                    last_rejects.append("task has no file path")
-                    continue
-                reason = _valid_plan_task(normalized)
-                if reason:
-                    last_rejects.append(reason)
-                else:
-                    tasks.append(normalized)
-            if tasks:
-                # Plan-level rules (whole-set): app.py only when requested, web
-                # requests must cover html+css+js.
-                plan_reasons = _valid_plan(tasks, user_request)
-                if plan_reasons:
-                    last_rejects.extend(plan_reasons)
-                    tasks = []
-            if tasks:
-                break
-            if plan_attempt == 0 and not last_rejects:
-                last_rejects = ["planner returned no parseable JSON task array"]
-        if not tasks:
-            # _fallback_plan runs ONLY here: intent == CODE_TASK was confirmed
-            # (T1, or T2 above the confidence floor + guard) and the planner
-            # failed twice. It derives a path from the extracted deliverable
-            # and emits fixed minimal templates — never raw request text as
-            # file content. No extractable filename/deliverable -> needs_human.
-            fallback = _fallback_plan(user_request, routed.deliverable)
-            if not fallback:
-                record("PLAN", "failed", time.monotonic() - t0,
-                       "planner failed twice; no deliverable to fall back on")
-                _finish("needs_human", {"staged_files": [], "failed_tasks": []})
-                return {
-                    "status": "needs_human",
-                    "summary": "The planner could not produce a valid plan and "
-                               "the request has no filename or deliverable to "
-                               "fall back on. Please name a target file.",
-                    "staged_files": [],
-                    "failed_tasks": [],
-                    "trace": trace,
-                    "run_id": journal.run_id,
-                }
-            tasks = fallback
-            record("PLAN", "ok", time.monotonic() - t0,
-                   f"deterministic fallback ({len(tasks)} tasks)")
-        else:
-            record("PLAN", "ok", time.monotonic() - t0, f"{len(tasks)} tasks")
+            record("ANSWER", "ok", 0.0, "reply (no files)")
+            _finish("completed")
+            return {"answer": reply, "trace": trace, "run_id": journal.run_id}
+
+        # code / code_and_reply: tasks become the plan (PLAN stage is gone;
+        # Understand produced it). code_and_reply prints the reply first.
+        if uresult.mode == "code_and_reply" and uresult.reply:
+            journal.emit_event({"event": "reply", "text": uresult.reply[:500]})
+        tasks = uresult.tasks
+        assumptions = uresult.assumptions
+        record("PLAN", "ok", 0.0,
+               f"{len(tasks)} tasks from Understand"
+               + (f" (assumptions: {'; '.join(assumptions[:3])})" if assumptions else ""))
 
         planned_paths = {t["path"] for t in tasks}
 
@@ -809,7 +626,7 @@ async def run_pipeline(
         if confirm is not None:
             _check_cancel()
             intent_line = (
-                f"{route} (tier {routed.tier}): plan is "
+                f"{uresult.mode}: plan is "
                 + ", ".join(f"{t['action']} {t['path']}" for t in tasks)
             )
             journal.emit_event({"event": "confirm_requested",
@@ -850,6 +667,16 @@ async def run_pipeline(
                         + " and ".join(links)
                         + " with <link>/<script> tags using those exact filenames."
                     )
+            # Understand flags: this task consumes the previous turn's result.
+            last_result_block = ""
+            if task.get("uses_last_result") and convo.last_result.get("text"):
+                last_result_block = (
+                    "\nPREVIOUS RESULT (use this as input data):\n"
+                    + str(convo.last_result.get("text", ""))[:1_500]
+                )
+            assumptions_block = ""
+            if assumptions:
+                assumptions_block = "\nASSUMPTIONS: " + "; ".join(assumptions[:3])
             code_prompt = (
                 f"Implement exactly one file.\n"
                 f"ORIGINAL USER REQUEST: {user_request}\n"
@@ -859,6 +686,7 @@ async def run_pipeline(
                 f"LANGUAGE: {language}\n"
                 f"Return ONLY the complete file contents inside one "
                 f"```{language} fenced block. No commentary.{extra}"
+                f"{assumptions_block}{last_result_block}"
             )
             content: str | None = None
             error: str | None = None
@@ -1087,13 +915,27 @@ async def run_pipeline(
 
         _finish("completed", {"staged_files": file_list,
                               "failed_tasks": failed_tasks})
-        return {
+        # Conversation state: every turn recorded (reply-first for
+        # code_and_reply was emitted as an event at PLAN time).
+        convo.record_turn(
+            user_request, uresult.mode, summary[:120],
+            trace=trace,
+            last_result={
+                "type": "code",
+                "text": summary,
+                "files": file_list,
+            },
+        )
+        out: dict[str, Any] = {
             "summary": summary,
             "staged_files": file_list,
             "failed_tasks": failed_tasks,
             "trace": trace,
             "run_id": journal.run_id,
         }
+        if uresult.mode == "code_and_reply" and uresult.reply:
+            out["reply"] = uresult.reply
+        return out
     except (RunCancelled, OllamaCancelledError):
         _finish("cancelled")
         return {

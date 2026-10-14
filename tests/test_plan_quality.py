@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from orchestrator import _fallback_plan, _valid_plan, _valid_plan_task, run_pipeline
+from orchestrator import _valid_plan, _valid_plan_task, run_pipeline
 from tests.test_run_pipeline import CODER, PLANNER, VALIDATE_OK, make_fake_generate
 
 
@@ -57,52 +57,25 @@ def test_web_plan_must_include_html_css_js() -> None:
     assert _valid_plan(full, "make a blog site in html css js") == []
 
 
-def test_fallback_plan_gives_three_web_files() -> None:
-    plan = _fallback_plan("make a blog site in html css js")
-    assert [t["path"] for t in plan] == ["index.html", "style.css", "script.js"]
-    for t in plan:
-        assert _valid_plan_task(t) is None
+# --- Understand task rules (the fallback plan is retired in v4) ---------------
 
+def test_understand_tasks_pass_through_valid_plan_rules() -> None:
+    """UnderstandResult tasks go through the same per-task rules; rejected
+    tasks are dropped in code, never trusted from the model."""
+    from understand import UnderstandResult
 
-def test_fallback_plan_non_web_is_single_python_file() -> None:
-    plan = _fallback_plan("fix the parser to handle empty lines", deliverable="parser")
-    assert plan is not None
-    assert len(plan) == 1
-    assert plan[0]["path"].endswith(".py")
-
-
-def test_fallback_plan_never_uses_request_text_as_content() -> None:
-    """The fallback emits a fixed minimal template: the description is exactly
-    the template (only the deliverable noun slots in), never raw request text."""
-    request = "fix the flux capacitor calibration routine immediately please"
-    plan = _fallback_plan(request, deliverable="calibration")
-    assert plan is not None
-    assert plan[0]["description"] == (
-        "Python calibration stub implementing the requested "
-        "behavior with a TODO for the concrete details."
-    )
-    # and the web fallback is equally fixed
-    web = _fallback_plan("make a page about my grandmother's secret soup recipe")
-    assert web is not None
-    assert "grandmother" not in " ".join(t["description"] for t in web)
-    assert "soup" not in " ".join(t["description"] for t in web)
-
-
-def test_fallback_plan_without_deliverable_returns_none() -> None:
-    assert _fallback_plan("xyzzy the whole thing somehow") is None
-
-
-def test_fallback_plan_rejects_placeholder_filename_from_request() -> None:
-    # "create your_code.py please" is a confirmed CODE_TASK whose only
-    # filename is a placeholder -> no fallback (needs_human upstream).
-    assert _fallback_plan("create your_code.py please") is None
-
-
-def test_fallback_plan_uses_filename_from_request() -> None:
-    plan = _fallback_plan("fix the bug in utils.py")
-    assert plan is not None
-    assert plan[0]["path"] == "utils.py"
-    assert _valid_plan_task(plan[0]) is None
+    result = UnderstandResult({
+        "mode": "code", "reply": None,
+        "tasks": [
+            {"path": "your_code.py", "action": "create",
+             "description": "a sufficiently long description for this task here"},
+            {"path": "blog_page.py", "action": "create",
+             "description": "a sufficiently long description for this task here"},
+        ],
+        "assumptions": [], "question": None,
+    })
+    result.apply_task_rules(_valid_plan_task)
+    assert [t["path"] for t in result.tasks] == ["blog_page.py"]
 
 
 # --- coder prompt contents -----------------------------------------------------
@@ -110,15 +83,19 @@ def test_fallback_plan_uses_filename_from_request() -> None:
 def test_coder_prompt_contains_request_paths_language() -> None:
     captured: list[str] = []
 
-    async def fake(model, prompt, system="", temperature=0.2):
+    async def fake(model, prompt, system="", temperature=0.2, **kwargs):
+        if "UNDERSTAND JSON:" in prompt:
+            return json.dumps({
+                "mode": "code", "reply": None,
+                "tasks": [_task(
+                    "greet.py",
+                    "Python module with a greet function returning a greeting string",
+                )],
+                "assumptions": [], "question": None,
+            })
         if model == CODER:
             captured.append(prompt)
             return "```python\ndef greet(name):\n    return f'hi {name}'\n```"
-        if "JSON array of tasks" in prompt:
-            return json.dumps([_task(
-                "greet.py",
-                "Python module with a greet function returning a greeting string",
-            )])
         return VALIDATE_OK
 
     with TemporaryDirectory() as tmp:
@@ -137,7 +114,17 @@ def test_coder_prompt_contains_request_paths_language() -> None:
 def test_index_html_prompt_requires_exact_link_names() -> None:
     captured: list[str] = []
 
-    async def fake(model, prompt, system="", temperature=0.2):
+    async def fake(model, prompt, system="", temperature=0.2, **kwargs):
+        if "UNDERSTAND JSON:" in prompt:
+            return json.dumps({
+                "mode": "code", "reply": None,
+                "tasks": [
+                    _task("index.html", "HTML page structure linking stylesheet and script files"),
+                    _task("style.css", "Stylesheet with layout typography colors and responsive rules"),
+                    _task("script.js", "JavaScript for dynamic content loading and user interactions"),
+                ],
+                "assumptions": [], "question": None,
+            })
         if model == CODER and "TARGET FILE: index.html" in prompt:
             captured.append(prompt)
             return ("```html\n<!doctype html><html><head>"
@@ -148,12 +135,6 @@ def test_index_html_prompt_requires_exact_link_names() -> None:
             return "```css\nbody { margin: 0; padding: 0; }\n```"
         if model == CODER and "TARGET FILE: script.js" in prompt:
             return "```javascript\ndocument.addEventListener('DOMContentLoaded', () => {});\n```"
-        if "JSON array of tasks" in prompt:
-            return json.dumps([
-                _task("index.html", "HTML page structure linking stylesheet and script files"),
-                _task("style.css", "Stylesheet with layout typography colors and responsive rules"),
-                _task("script.js", "JavaScript for dynamic content loading and interactions"),
-            ])
         return VALIDATE_OK
 
     with TemporaryDirectory() as tmp:
@@ -166,24 +147,17 @@ def test_index_html_prompt_requires_exact_link_names() -> None:
     assert set(result["staged_files"]) == {"index.html", "style.css", "script.js"}
 
 
-def test_placeholder_plan_triggers_fallback() -> None:
-    calls = {"planner": 0}
-
-    async def fake(model, prompt, system="", temperature=0.2):
-        if "JSON array of tasks" in prompt:
-            calls["planner"] += 1
-            # Both attempts return placeholder names -> deterministic fallback.
-            return json.dumps([_task("foo.py", "x"), _task("untitled.html", "y")])
-        if model == CODER:
-            if "TARGET FILE: index.html" in prompt:
-                return ("```html\n<!doctype html><html><head>"
-                        '<link rel="stylesheet" href="style.css">'
-                        '<script src="script.js"></script>'
-                        "</head><body><h1>Blog</h1></body></html>\n```")
-            if "TARGET FILE: style.css" in prompt:
-                return "```css\nbody { margin: 0; padding: 0; }\n```"
-            if "TARGET FILE: script.js" in prompt:
-                return "```javascript\ndocument.addEventListener('DOMContentLoaded', () => {});\n```"
+def test_placeholder_plan_returns_graceful_reply_no_files() -> None:
+    """Understand keeps returning placeholder tasks -> they are dropped in
+    code, and with zero valid tasks the pipeline replies gracefully (the
+    deterministic fallback plan is retired in v4)."""
+    async def fake(model, prompt, system="", temperature=0.2, **kwargs):
+        if "UNDERSTAND JSON:" in prompt:
+            return json.dumps({
+                "mode": "code", "reply": None,
+                "tasks": [_task("foo.py", "x"), _task("untitled.html", "y")],
+                "assumptions": [], "question": None,
+            })
         return VALIDATE_OK
 
     with TemporaryDirectory() as tmp:
@@ -191,7 +165,5 @@ def test_placeholder_plan_triggers_fallback() -> None:
             "make a blog site in html css js",
             tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
         ))
-    assert calls["planner"] == 2  # one retry, then fallback
-    assert set(result["staged_files"]) == {"index.html", "style.css", "script.js"}
-    plan = next(t for t in result["trace"] if t["stage"] == "PLAN")
-    assert "fallback" in plan["note"]
+    assert "staged_files" not in result
+    assert "couldn't understand" in result["answer"]

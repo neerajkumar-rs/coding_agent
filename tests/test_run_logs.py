@@ -167,6 +167,44 @@ def test_rich_metadata_in_llm_call_block() -> None:
 
 
 # ---------------------------------------------------------------------------
+# ConversationState: per-workspace memory at .agent_runs/session.json
+# ---------------------------------------------------------------------------
+
+def test_conversation_state_roundtrip(tmp_path: Path) -> None:
+    from agent_core.run_state import ConversationState
+
+    state = ConversationState.load(tmp_path)
+    assert state.turns == [] and state.pending_question == ""
+    state.record_turn("make a page", "code", "staged index.html",
+                      trace=[{"stage": "CODE", "status": "ok", "seconds": 3.0}],
+                      last_result={"type": "code", "text": "x" * 5000, "files": ["index.html"]})
+    state.record_turn("what did you do", "reply", "answered from trace")
+    state.record_turn("thanks", "reply", "canned")
+    state.record_turn("fourth turn", "reply", "ok")  # pushes out the first
+
+    loaded = ConversationState.load(tmp_path)
+    assert len(loaded.turns) == 3  # capped
+    assert loaded.turns[0]["user"] == "what did you do"  # oldest dropped
+    assert loaded.turns[-1]["user"] == "fourth turn"
+    assert loaded.last_trace[0]["stage"] == "CODE"
+    assert len(loaded.last_result["text"]) == 1500  # capped
+    assert (tmp_path / ".agent_runs" / "session.json").exists()
+
+
+def test_conversation_state_pending_question(tmp_path: Path) -> None:
+    from agent_core.run_state import ConversationState
+
+    state = ConversationState.load(tmp_path)
+    state.record_turn("vague request", "question", "asked once",
+                      pending_question="Which file should I create?")
+    loaded = ConversationState.load(tmp_path)
+    assert loaded.pending_question == "Which file should I create?"
+    # next turn resolves it
+    loaded.record_turn("app.py", "code", "staged app.py", pending_question="")
+    assert ConversationState.load(tmp_path).pending_question == ""
+
+
+# ---------------------------------------------------------------------------
 # No-runs case: the exact searched path is reported.
 # ---------------------------------------------------------------------------
 

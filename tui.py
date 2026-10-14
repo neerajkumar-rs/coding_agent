@@ -1229,6 +1229,16 @@ async def _submit_locked(request_text: str, workspace_dir: str) -> None:
         console.print("[dim]⏳ Running pipeline (ROUTE → PLAN → CODE → CHECK → VALIDATE → SUMMARY)...[/dim]")
         result = await _post_run_with_confirm(request_text, workspace_dir)
 
+        # 0. Structured error envelope (never a bare 500): stage + detail + run_id
+        if result.get("error"):
+            console.print(
+                f"[bold red]Run failed at {result.get('stage', '?')}[/bold red] "
+                f"[red]{result.get('error')}: {result.get('detail', '')}[/red]\n"
+                f"[dim]run_id: {result.get('run_id', '?')}[/dim]"
+                + (f"\n[yellow]{result['hint']}[/yellow]" if result.get("hint") else "")
+            )
+            return
+
         # 1. Trace (also feeds the header's "Last run" vitals)
         global _last_trace
         _last_trace = result.get("trace", [])

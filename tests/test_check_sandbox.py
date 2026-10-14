@@ -72,7 +72,7 @@ def test_infra_error_aborts_without_retry() -> None:
     from orchestrator import run_pipeline
     from tests.test_run_pipeline import CODER, PLANNER, make_fake_generate
 
-    plan = '[{"path": "app.py", "action": "create", "description": "Python application implementing the requested feature fully"}]'
+    plan = '[{"path": "app.py", "action": "create", "description": "Python application implementing the requested calculator feature fully and correctly"}]'
     fake = make_fake_generate({
         "JSON array of tasks": plan,
         "TARGET FILE: app.py": "```python\nX = 1\n```",

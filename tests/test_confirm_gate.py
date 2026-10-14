@@ -40,13 +40,17 @@ class _FakeGateway:
         import re
 
         self.calls.append({"role": role, "prompt": prompt})
+        if "UNDERSTAND JSON:" in prompt:
+            return json.dumps({
+                "mode": "code", "reply": None,
+                "tasks": json.loads(WEB_PLAN),
+                "assumptions": [], "question": None,
+            })
         target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
         if target:
             body = {"index.html": INDEX_HTML, "style.css": STYLE_CSS,
                     "script.js": SCRIPT_JS}[target.group(1)]
             return f"```\n{body}\n```"
-        if "JSON array of tasks" in prompt:
-            return WEB_PLAN
         if "satisfies_request" in prompt:
             return VALIDATE_OK
         if "Describe only features visible" in prompt:
@@ -106,7 +110,7 @@ def test_confirm_gate_pause_answer_approve(workspace) -> None:
             break
         time.sleep(0.05)
     assert plan is not None, "pipeline never paused for confirmation"
-    assert "CODE_TASK" in plan["intent"]
+    assert "code" in plan["intent"]
     assert {t_["path"] for t_ in plan["plan"]} == {"index.html", "style.css", "script.js"}
 
     a = client.post("/agent/confirm", json={"workspace_dir": workspace, "approved": True})
@@ -170,3 +174,32 @@ def test_pending_confirm_empty_when_no_run(workspace) -> None:
     client = TestClient(main.app)
     p = client.get("/agent/pending_confirm", params={"workspace_dir": workspace}).json()
     assert p == {"pending": False}
+
+
+# --- Section 5: structured error envelope (never a bare 500) ------------------
+
+def test_run_failure_returns_stage_detail_run_id(workspace) -> None:
+    """A forced gateway exception -> {error, stage, detail, run_id} + a journal."""
+
+    class _ExplodingGateway(_FakeGateway):
+        async def generate(self, role, prompt, **kwargs):
+            raise RuntimeError("synthetic GPU fault for the test")
+
+    main.state._gateway = _ExplodingGateway()
+    try:
+        client = TestClient(main.app)
+        r = client.post("/agent/run", json={
+            "prompt": "make a blog site in html5 css and js",
+            "workspace_dir": workspace,
+        })
+        assert r.status_code == 200, r.text  # never a bare 500
+        data = r.json()
+        assert data["error"] == "RuntimeError"
+        assert data["stage"]  # the stage that was running when it blew
+        assert "synthetic GPU fault" in data["detail"]
+        assert data["run_id"]
+        # journal exists for the failed turn too
+        state_path = Path(workspace) / ".agent_runs" / data["run_id"] / "state.json"
+        assert state_path.exists()
+    finally:
+        main.state._gateway = _FakeGateway()

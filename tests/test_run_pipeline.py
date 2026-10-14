@@ -39,11 +39,27 @@ VALIDATE_OK = json.dumps({
 def make_fake_generate(routes: dict[str, str], default: str = ""):
     """routes: marker-in-prompt -> response. Coder routes by 'TARGET FILE: x'
     (matched via regex so retry feedback above the marker still routes).
-    The router's T2 prompt routes on its own 'ROUTER INTENT JSON:' marker;
-    extra kwargs (num_predict, think, _format_schema) are accepted and ignored."""
+    The Understand call routes on its 'UNDERSTAND JSON:' marker; a route value
+    that is a JSON task array is wrapped into an Understand payload
+    (mode=code + tasks). Extra kwargs (num_predict, think, role) are accepted
+    and ignored."""
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
         import re
 
+        # The Understand call: a direct "UNDERSTAND JSON:" route wins (reply /
+        # question payloads); otherwise the test's "JSON array of tasks" plan
+        # is wrapped as an Understand code payload.
+        if "UNDERSTAND JSON:" in prompt:
+            if "UNDERSTAND JSON:" in routes:
+                return routes["UNDERSTAND JSON:"]
+            plan = routes.get("JSON array of tasks", "")
+            if plan.lstrip().startswith("["):
+                return json.dumps({
+                    "mode": "code", "reply": None,
+                    "tasks": json.loads(plan),
+                    "assumptions": [], "question": None,
+                })
+            return plan or default
         target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
         if target:
             file_marker = f"TARGET FILE: {target.group(1)}"
@@ -64,15 +80,20 @@ def test_summary_call_uses_writer_role() -> None:
 
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
         import re
+        if "UNDERSTAND JSON:" in prompt:
+            return json.dumps({
+                "mode": "code", "reply": None,
+                "tasks": [{"path": "greet.py", "action": "create",
+                           "description": "Create a greet function returning a greeting string",
+                           "uses_last_result": False}],
+                "assumptions": [], "question": None,
+            })
         if "Describe only features visible" in prompt:
             seen_roles.append(kwargs.get("role", ""))
             return "A small python module."
         target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
         if target and target.group(1) == "greet.py":
             return "```python\ndef greet(name: str) -> str:\n    return f'Hello, {name}!'\n```"
-        if "JSON array of tasks" in prompt:
-            return json.dumps([{"path": "greet.py", "action": "create",
-                                "description": "Create a greet function returning a greeting string"}])
         if "satisfies_request" in prompt:
             return json.dumps({"satisfies_request": True, "problems": [], "summary": "ok"})
         return ""
@@ -83,16 +104,22 @@ def test_summary_call_uses_writer_role() -> None:
             tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
         ))
     assert result["staged_files"] == ["greet.py"]
-    assert seen_roles == ["writer"]
+    assert seen_roles == ["thinker"]  # summary prose runs on the thinker
 
 
 def _run(coro):
     return asyncio.run(coro)
 
 
-# 1. Question input -> zero tasks, text answer
+# 1. Question input -> zero tasks, text answer (via the Understand step)
 def test_question_gets_answer_no_tasks() -> None:
-    fake = make_fake_generate({"QUESTION:": "<think>thinking</think>Rust compiles to native code; Python is interpreted."})
+    fake = make_fake_generate({
+        "UNDERSTAND JSON:": json.dumps({
+            "mode": "reply",
+            "reply": "Rust compiles to native code; Python is interpreted.",
+            "tasks": [], "assumptions": [], "question": None,
+        }),
+    })
     with TemporaryDirectory() as tmp:
         result = _run(run_pipeline(
             "what is the difference between rust and python",
@@ -100,13 +127,13 @@ def test_question_gets_answer_no_tasks() -> None:
         ))
     assert "answer" in result
     assert "Rust compiles" in result["answer"]
-    assert "think" not in result["answer"].lower()
     assert "staged_files" not in result  # nothing staged
     stages = [t["stage"] for t in result["trace"]]
-    assert stages == ["ROUTE", "ANSWER"]
+    assert stages == ["UNDERSTAND", "ANSWER"]
 
 
 def test_classify_rules() -> None:
+    # classify_request stays the cheap rules-only pre-check (fast path).
     assert classify_request("what is the difference between rust and python") == "QUESTION"
     assert classify_request("make a blog site in html5 css and js") == "CODE_TASK"
     assert classify_request("create app.py") == "CODE_TASK"
@@ -145,7 +172,7 @@ def test_failing_task_not_staged() -> None:
     fake = make_fake_generate({
         "JSON array of tasks": json.dumps([
             {"path": "app.py", "action": "create",
-             "description": "Python application implementing the requested feature fully"}
+             "description": "Python application implementing the requested calculator feature fully and correctly"}
         ]),
         "TARGET FILE: app.py": "```python\ndef broken(:\n```",  # never compiles
     })
@@ -207,35 +234,42 @@ def test_check_independent_of_cwd(monkeypatch) -> None:
         monkeypatch.undo()  # release the dir handle before Windows cleanup
 
 
-# Plan validation: placeholders and short descriptions rejected -> fallback
-def test_plan_placeholder_falls_back_to_web_defaults() -> None:
+# Understand post-validation: placeholder/short-description tasks are
+# rejected in code (never trusted), so a bad Understand plan yields no files.
+def test_understand_placeholder_tasks_rejected() -> None:
     fake = make_fake_generate({
-        "JSON array of tasks": json.dumps([
-            {"path": "your_code.html", "action": "create", "description": "page"},
-            {"path": "example.py", "action": "create", "description": "does things"},
-        ]),
+        "UNDERSTAND JSON:": json.dumps({
+            "mode": "code", "reply": None,
+            "tasks": [
+                {"path": "your_code.html", "action": "create", "description": "page"},
+                {"path": "example.py", "action": "create", "description": "does things"},
+            ],
+            "assumptions": [], "question": None,
+        }),
         "TARGET FILE: index.html": f"```html\n{INDEX_HTML}\n```",
-        "TARGET FILE: style.css": f"```css\n{STYLE_CSS}\n```",
-        "TARGET FILE: script.js": f"```javascript\n{SCRIPT_JS}\n```",
-        "satisfies_request": VALIDATE_OK,
     })
     with TemporaryDirectory() as tmp:
         result = _run(run_pipeline(
             "make a blog site in html5 css and js",
             tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
         ))
-        assert set(result["staged_files"]) == {"index.html", "style.css", "script.js"}
-        plan = next(t for t in result["trace"] if t["stage"] == "PLAN")
-        assert "fallback" in plan["note"]
+    # placeholders rejected by _valid_plan_task at the edge; with zero valid
+    # tasks the pipeline returns a graceful reply — never files.
+    assert "staged_files" not in result
+    assert "couldn't understand" in result["answer"] or "rephrase" in result["answer"]
 
 
 # VALIDATE error -> summary says UNVERIFIED
 def test_validate_error_marks_unverified() -> None:
-    async def fake(model, prompt, system="", temperature=0.2):
+    async def fake(model, prompt, system="", temperature=0.2, **kwargs):
+        if "UNDERSTAND JSON:" in prompt:
+            return json.dumps({
+                "mode": "code", "reply": None,
+                "tasks": json.loads(WEB_PLAN),
+                "assumptions": [], "question": None,
+            })
         if "satisfies_request" in prompt:
             raise RuntimeError("ollama died mid-review")
-        if "JSON array of tasks" in prompt:
-            return WEB_PLAN
         if "TARGET FILE: index.html" in prompt:
             return f"```html\n{INDEX_HTML}\n```"
         if "TARGET FILE: style.css" in prompt:
@@ -288,9 +322,13 @@ def test_cancel_during_code_stops_fast_and_stages_nothing_further() -> None:
 
     cancel = threading.Event()
 
-    async def fake(model, prompt, system="", temperature=0.2):
-        if "JSON array of tasks" in prompt:
-            return WEB_PLAN
+    async def fake(model, prompt, system="", temperature=0.2, **kwargs):
+        if "UNDERSTAND JSON:" in prompt:
+            return json.dumps({
+                "mode": "code", "reply": None,
+                "tasks": json.loads(WEB_PLAN),
+                "assumptions": [], "question": None,
+            })
         if "TARGET FILE: index.html" in prompt:
             # Cancel lands while the first coder call is in flight.
             cancel.set()
@@ -371,15 +409,19 @@ def test_confirm_gate_decline_stages_nothing_and_never_calls_coder() -> None:
     coder_calls: list[str] = []
 
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
+        if "UNDERSTAND JSON:" in prompt:
+            return json.dumps({
+                "mode": "code", "reply": None,
+                "tasks": json.loads(WEB_PLAN),
+                "assumptions": [], "question": None,
+            })
         if model == CODER:
             coder_calls.append(prompt)
-        if "JSON array of tasks" in prompt:
-            return WEB_PLAN
         return VALIDATE_OK
 
     async def decline(tasks, intent_line):
         assert {t["path"] for t in tasks} == {"index.html", "style.css", "script.js"}
-        assert "CODE_TASK" in intent_line
+        assert "code" in intent_line
         return False
 
     with TemporaryDirectory() as tmp:
@@ -459,22 +501,19 @@ def test_fallback_never_runs_for_non_code_intents() -> None:
     assert plan_calls == []  # the planner never ran for CHAT/UNCLEAR/QUESTION
 
 
-def test_fallback_without_deliverable_is_needs_human() -> None:
-    # Confirmed CODE_TASK ("create" + filename), planner fails twice, and the
-    # only filename in the request is a placeholder -> needs_human.
+def test_understand_total_failure_is_graceful_reply() -> None:
+    # The Understand model returns unparseable junk twice -> graceful reply,
+    # never files, no loop.
     async def fake(model, prompt, system="", temperature=0.2, **kw):
-        if "JSON array of tasks" in prompt:
-            return "not json"
-        return "```python\npass\n```"
+        return "not json at all"
 
     with TemporaryDirectory() as tmp:
         result = _run(run_pipeline(
             "create your_code.py with the logic",
             tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
         ))
-        assert result["status"] == "needs_human"
-        assert result["staged_files"] == []
-        assert "name a target file" in result["summary"]
+        assert "staged_files" not in result
+        assert "couldn't understand" in result["answer"]
 
 
 def test_validator_follows_thinker_at_most_one_swap_pair() -> None:
@@ -485,8 +524,12 @@ def test_validator_follows_thinker_at_most_one_swap_pair() -> None:
 
     async def fake(model, prompt, system="", temperature=0.2, **kw):
         models.append(model)
-        if "JSON array of tasks" in prompt:
-            return WEB_PLAN
+        if "UNDERSTAND JSON:" in prompt:
+            return json.dumps({
+                "mode": "code", "reply": None,
+                "tasks": json.loads(WEB_PLAN),
+                "assumptions": [], "question": None,
+            })
         target = None
         import re
         m = re.search(r"TARGET FILE:\s*(\S+)", prompt)
@@ -509,8 +552,8 @@ def test_validator_follows_thinker_at_most_one_swap_pair() -> None:
         ))
     # compress consecutive duplicates -> the phase sequence
     phases = [m for i, m in enumerate(models) if i == 0 or m != models[i - 1]]
-    # The thinker and validator share one model and the summary also runs on
-    # the thinker, so a full run is exactly: thinker (route/plan) -> coder
-    # (all code tasks) -> thinker (validate + summary) = ONE swap pair.
+    # Understand runs on the CODER model, validator/summary on the thinker:
+    # exactly coder (understand + all code tasks) -> thinker (validate +
+    # summary) = ONE swap pair.
     assert set(models) <= {PLANNER, CODER}
-    assert phases == [PLANNER, CODER, PLANNER], phases
+    assert phases == [CODER, PLANNER], phases

@@ -690,6 +690,17 @@ class OllamaAgentApp(App):
     def _pipeline_done(self, result: dict) -> None:
         trace = result.get("trace", [])
         tui._last_trace = trace
+
+        # Structured error envelope (never a bare 500): stage + detail + run_id.
+        if result.get("error"):
+            self._write(
+                f"[{RED}]Run failed at {result.get('stage', '?')}: "
+                f"{result.get('error')}: {result.get('detail', '')}[/]\n"
+                f"[{DIM}]run_id: {result.get('run_id', '?')}[/]"
+                + (f"\n[yellow]{result['hint']}[/]" if result.get("hint") else "")
+            )
+            return
+
         self._write(f"[{DIM}]" + trace_line(trace) + "[/]")
 
         if "answer" in result:
