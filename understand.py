@@ -111,7 +111,6 @@ async def classify_mode(
     file_names: list[str],
     last_turn: str,
     role: str = "understand",
-    think_supported: bool | None = None,
 ) -> str:
     """Classify into reply|code|both with ONE tiny call. Always valid.
 
@@ -128,15 +127,13 @@ async def classify_mode(
         .replace("{text}", text[:2_000])
         .replace("{CLASSIFY_MARKER}", CLASSIFY_MARKER)
     )
-    kwargs: dict[str, Any] = {}
-    # think:false only when the probe says the model supports it; never send
-    # think to the coder (the caller resolves the role's model; understand
-    # may point at either).
-    if think_supported is True:
-        kwargs["think"] = False
+    # Never send `think` here: the understand role defaults to the coder
+    # model (an instruct model — think is meaningless), and the gateway
+    # itself sends think=False for a reasoning model whose probe confirmed
+    # support. This layer stays think-free.
     raw = await generate(
         None, prompt, system="", temperature=0.0,
-        role=role, num_predict=12, _format_schema=CLASSIFY_SCHEMA, **kwargs,
+        role=role, num_predict=12, _format_schema=CLASSIFY_SCHEMA,
     )
     answer, _think, _chars = strip_think(raw)
     match = _LABEL_RE.search(answer.lower())

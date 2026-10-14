@@ -267,3 +267,85 @@ def test_cli_benchmark_forwards_unknown_args() -> None:
 def test_cli_yes_flag() -> None:
     args = tui._parse_cli(["--yes"])
     assert args.yes is True
+
+
+# ---------------------------------------------------------------------------
+# Startup model audit: retired-name migration + missing-model table
+# ---------------------------------------------------------------------------
+
+def _legacy_agent(tmp_path: Path) -> None:
+    """A .agent with the retired thinker name via legacy top-level fields."""
+    import json
+    (tmp_path / ".agent").write_text(json.dumps({
+        "planner_model": "deepseek-r1:1.5b",
+        "coder.5b_or_3b": "qwen2.5-coder:3b-instruct",
+        "max_context_tokens": 4096,
+    }), encoding="utf-8")
+
+
+def _fake_tags(installed: list[str]):
+    import io, json as _json
+    payload = _json.dumps({"models": [{"name": n} for n in installed]}).encode()
+
+    class _Resp(io.BytesIO):
+        status = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+    return _Resp(payload)
+
+
+NEW_NAME = "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
+
+
+def test_migration_prompt_y_persists(tmp_path, monkeypatch) -> None:
+    """Retired name configured, new default installed, answer y -> persisted."""
+    import json
+    from agent_config import load_agent_config
+
+    _legacy_agent(tmp_path)
+    installed = [NEW_NAME, "qwen2.5-coder:3b-instruct"]
+    monkeypatch.setattr(tui.urllib.request, "urlopen",
+                        lambda *a, **k: _fake_tags(installed))
+    monkeypatch.setattr(tui.Prompt, "ask", lambda *a, **k: "y")
+
+    tui._check_configured_models(str(tmp_path), assume_yes=False)
+
+    cfg = load_agent_config(tmp_path)
+    assert cfg.roles["thinker"]["model"] == NEW_NAME
+    assert cfg.roles["validator"]["model"] == NEW_NAME
+    # legacy ctx 4096 ignored: role defaults stand
+    assert cfg.roles["thinker"]["num_ctx"] == 8192
+    assert cfg.roles["coder"]["num_ctx"] == 6144
+
+
+def test_migration_prompt_n_keeps_old_and_prints_table(tmp_path, monkeypatch, capsys) -> None:
+    """Answer N: the old name stays AND the missing-model table prints with
+    the exact pull command."""
+    from agent_config import load_agent_config
+
+    _legacy_agent(tmp_path)
+    installed = [NEW_NAME, "qwen2.5-coder:3b-instruct"]
+    monkeypatch.setattr(tui.urllib.request, "urlopen",
+                        lambda *a, **k: _fake_tags(installed))
+    monkeypatch.setattr(tui.Prompt, "ask", lambda *a, **k: "n")
+
+    tui._check_configured_models(str(tmp_path), assume_yes=False)
+
+    cfg = load_agent_config(tmp_path)
+    assert cfg.roles["thinker"]["model"] == "deepseek-r1:1.5b"  # unchanged
+    out = capsys.readouterr().out
+    assert "deepseek-r1:1.5b" in out
+    assert "ollama pull deepseek-r1:1.5b" in out
+
+
+def test_migration_ollama_down_is_silent(tmp_path, monkeypatch) -> None:
+    """Ollama unreachable: the audit returns quietly (preflight reports it)."""
+    _legacy_agent(tmp_path)
+
+    def boom(*a, **k):
+        raise OSError("connection refused")
+    monkeypatch.setattr(tui.urllib.request, "urlopen", boom)
+    # must not raise, must not prompt
+    tui._check_configured_models(str(tmp_path), assume_yes=False)

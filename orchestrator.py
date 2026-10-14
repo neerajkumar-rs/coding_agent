@@ -583,7 +583,6 @@ async def run_pipeline(
             generate=_llm,
             file_names=file_names,
             last_turn=last_turn_line,
-            think_supported=think_supported,
         )
         record("CLASSIFY", "ok", time.monotonic() - t0, mode, model=coder_model)
 
