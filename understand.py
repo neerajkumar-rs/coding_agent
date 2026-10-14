@@ -95,12 +95,7 @@ Last turn: {last_turn}
 "hi bro" -> reply
 "how many lines in index.html" -> reply
 "show me the file sizes" -> reply
-"what does app.py do" -> reply
-"make a todo page in index.html" -> code
 "create a script that renames files" -> code
-"save that table into notes.md" -> code
-"explain app.py and add a health endpoint" -> both
-"what is a closure, then write an example file" -> both
 
 Message: "{text}"
 
