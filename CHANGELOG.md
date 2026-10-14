@@ -1,4 +1,136 @@
-# CHANGELOG — v3 implementation (Phases 0–3 consolidation + backlog 1–6)
+# CHANGELOG
+
+## v5 — classify-then-act + history/debug export (2026-10-14)
+
+All changes offline-verified: **336 tests pass** (`pytest tests/ test_master_controller.py`).
+Live verification on this machine (RTX 3050 4GB, Ollama 0.40.3) — see below.
+
+### Classify-then-act (replaces the one-call Understand step)
+
+The single Understand call (intent + tasks + assumptions + reply + question in
+one JSON schema) was too big for a 3B model — observed in real sessions:
+"list all the files" → "I couldn't understand that", "bro list ... size in kb"
+→ a useless rephrase question, "make list of file ... use cli tools" → a
+shell-command tutorial. Classification itself is easy; the call was too big.
+Split it:
+
+- **`classify_mode`** — ONE tiny call, `format` schema `{"mode": enum}`,
+  temperature 0, `num_predict <= 12`, instructions in the user turn. Output is
+  always reply|code|both (label regex + JSON extraction; junk → safe `reply`).
+  There is no "couldn't understand" path. Infra errors (missing model, VRAM
+  guard, timeout) propagate to the structured error envelope — never a rephrase
+  message.
+- **`reply_step`** — ONE call over a Python-built FACTS block: file table with
+  KB sizes computed in Python (never by the model), extensionless-file flags,
+  last-run trace, last_result (1500 chars), last 3 turns. Instructions: answer
+  from the facts only; never explain shell commands; not in the facts → say so
+  in one sentence. Empty workspace → one plain sentence. No question field.
+- **`plan_tasks`** — ONE call, small schema `{tasks, assumptions}` (no question
+  field; missing details become listed assumptions). Post-validated in code
+  (`_valid_plan_task`); one retry with errors appended → plain JSON →
+  `PlanFailed` → `needs_human` with the reason (no files, no loop).
+- **Fast paths** (slash commands, whole-message greetings/thanks/acks/openers
+  English + Hinglish, word-boundary regexes) stay zero-model, zero-files.
+- `both` runs reply first (printed), then plan. `uses_last_result` attaches the
+  previous turn's result to the coder prompt. Pending questions merge into the
+  next turn; never two questions in a row.
+- **Trace/UI**: only stages that actually ran appear (`CLASSIFY ok 0.4s
+  (reply) | ANSWER ok 2.1s`); never a synthetic SKIPPED row; red only for
+  failed stages. Sidebar LAST RUN uses the same rule.
+- **Markers**: `CLASSIFY MODE:` / `PLAN TASKS JSON:` (never collide with other
+  pipeline markers — tested).
+- `ALLOWED_TARGET_SUFFIXES` widened to `{.py,.html,.css,.js,.json,.md,.txt,.rs}`
+  so "store this table in dir_table.md" no longer crashes `safe_target`.
+- `run_pipeline` honors `roles.understand.model` for the understand role
+  (was hardcoded to the coder model).
+
+### History + one-command debug export
+
+- **`history.py`** — append-only `.agent_runs/history.jsonl`, one entry per
+  turn (fast paths, replies, code runs, needs_human, cancelled, errors;
+  state-changing slash commands; pure display commands excluded): `id`
+  (monotonic, user-visible), `ts` (ISO), `text` (4 KB cap), `path`, `label`,
+  `run_id`, `models`, `trace` (stages + model + seconds), `llm_calls`,
+  `seconds`, `outcome`, `error {stage, detail}`, `files_planned`,
+  `files_staged`, `answer_preview` (500 chars), `state_snapshot`. Atomic
+  appends under a per-workspace lock (Textual workers + controller both write);
+  corrupt/truncated lines skipped + counted; rotation past 20 MB / 1000
+  entries (readers span rotated files); a write failure never raises into the
+  user flow. Every turn — including a pipeline exception (traceback lands in
+  events.jsonl) — gets an entry with a `run_id` whose folder has at least
+  state.json + events.jsonl.
+- **`export.py`** — pure functions on paths: `do_export(workspace, target,
+  --full/--zip/--fixture/--no-redact)`. Target: `last` (default), an id, N
+  (last N), `a-b`, `all`. Outputs only under `.agent_runs/exports/`,
+  timestamped, never overwrite. Report layout: Summary table + fact-derived
+  "Likely cause" (missing model + pull command, VRAM guard, truncation,
+  validation reason, exception stage), Environment (build_id, OS, Python,
+  Ollama version/reachability, `/api/ps` snapshot, nvidia-smi GPU, per-role
+  model+ctx+installed), per-turn (user text, collapsed state snapshot, trace
+  table, per-call role/model/tokens/tok/s/done_reason with prompt+response
+  fenced at 4 KB pointing at the full file, validation errors, plan/files,
+  answer, error + traceback), events tail (40), Reproduce (`/retry <id>`).
+  Report capped at 200 KB keeping Summary + Environment + the failing turn.
+  `--zip` adds history-slice + linked run folders + config-snapshot +
+  environment.json. `--fixture` appends eval-format lines (`text`, `state`,
+  `expected`, `observed_ok: null`) for paste-into-`classify_eval.jsonl`.
+  Redaction on by default (workspace/home/user paths → `<WORKSPACE>`/`~`,
+  sk-/ghp_/AKIA/Bearer/key=token=secret=password assignments, private-key
+  blocks, .env-style KEY=value) across the report, slice, zip logs, fixtures;
+  `--no-redact` skips it with a printed warning.
+- **Commands** (both TUIs via shared functions): `/history [N]|<id>|search
+  <text>` (failed turns in red), `/retry <id>` (re-sends the text as a NEW
+  turn, says old state is not restored), `/export ...` (prints path + size,
+  copies the report to the clipboard when available — never fails on clipboard
+  errors). Up/Down in the input bar recalls previous inputs (shell-style, per
+  workspace, persisted from history; survives restart); Esc clears.
+- **Endpoints**: `GET /agent/history?limit=&before=` (paging) and
+  `GET /agent/export?target=&format=md|zip|fixture`.
+- **CLI**: `python tui.py --workspace <dir> --export last|<id>|all [--zip]
+  [--fixture] [--full]` works with Ollama/FastAPI down; exit 1 + a clear
+  message when there is no history.
+- Grep tests: no retired log-dir references; history/export make no
+  gateway/Ollama calls; exports never land outside `.agent_runs/exports/`.
+
+### Verified live on this machine (2026-10-14)
+
+- **Classifier A/B** (`--classify-ab`, eval set held back from the prompt):
+  coder 83.9% accuracy (p50 0.50s, p95 0.54s, 0 shell-command leaks on reply
+  lines); thinker 55.4% (truncation errors at the classify budget — a
+  reasoning model cannot answer in `num_predict<=12`). **Coder stays the
+  understand default** (accuracy first, latency second). The 95% gate is NOT
+  met by either model on this adversarial set — the 3B ceiling on held-back
+  phrases; the failure modes that mattered (rephrase requests, shell
+  tutorials, "couldn't understand", bare 500s) are all gone.
+- **Acceptance session** (7 messages, live controller): greeting → reply
+  grounded; "list all the files" → reply with the real table ("The workspace
+  is empty"); "what is your readme" → reply grounded; "make some random file
+  with some random data" → code, `random_data.txt` staged; "format this data
+  ... dir_table.md" → code, `dir_table.md` staged. One known miss: "bro list
+  ... size in kb" classified `both` (3B limit) — it answered the listing first,
+  then failed safely through the verifier (nothing staged).
+- **History/export acceptance**: 5-turn session (greeting, listing, vague code,
+  cancelled code, forced failure) — `/history` shows all five with correct
+  path/outcome; `/export all --zip` writes report + slice + run folders +
+  config + environment; redaction masks a planted `sk-test...` key and the
+  workspace path; `--no-redact` shows them with the warning; fixture lines load
+  with the eval loader; CLI export works with the stack down; `ollama ps`
+  during a code run shows exactly one resident model at 100% GPU.
+
+### Not verified here
+
+- Whether the thinker accepts `think:false` *semantically* (probed live
+  earlier: the switch is accepted but ignored — the budget always includes
+  `think_budget` for this model).
+- `format` enum decoding internals per model (used by the classifier; behavior
+  verified, Ollama internals not).
+- Per-model classifier latency beyond the A/B numbers above.
+- Clipboard behavior per terminal (Textual `copy_to_clipboard` availability
+  varies; the command never fails on it — prints the path instead).
+- nvidia-smi availability off this machine (the Environment probe degrades to
+  "n/a").
+
+## v3 implementation (Phases 0–3 consolidation + backlog 1–6)
 
 All changes offline-verified: **292 tests pass** (`pytest tests/ test_master_controller.py`),
 26 test files. Live Ollama verification done on this machine (see below).
@@ -34,8 +166,9 @@ All changes offline-verified: **292 tests pass** (`pytest tests/ test_master_con
   (`/logs <run> [channel] [N]`), with the searched path reported on no match.
 - **Writer role (4th role)** — `roles.writer` (summary/docs prose; thinker
   model by default, warmer temperature, 1024 predict), its own
-  `writer.log` channel, registry/`/config/role`-switchable, and the pipeline's
-  summary call carries `role="writer"`. Zero extra VRAM until reconfigured.
+  `writer.log` channel, registry/`/config/role`-switchable. Zero extra VRAM
+  until reconfigured. (v5: the writer is PARKED — inert, hidden from the
+  status bar; the summary prose runs on the thinker.)
 - **`/setup` machine calibration** — `calibrate.py` + `/setup` in both TUIs
   (y/N gated, never auto-runs): binary search over the ctx rungs per role via
   `AgentGateway.probe_ctx` (one tiny generation at an exact ctx, no
