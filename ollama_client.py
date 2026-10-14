@@ -92,6 +92,12 @@ class VramGuardError(OllamaError):
     the GPU even at the lowest context rung. Never fall back to CPU silently."""
 
 
+class ModelOnCpuError(VramGuardError):
+    """size_vram == 0 after a generate: Ollama is running the model on CPU
+    (the GPU was never used). Fail fast with this exact message — never the
+    context step-down hint (the model would never fit on CPU anyway)."""
+
+
 # Context rungs for the VRAM guard's step-down retry.
 CTX_RUNGS = [4096, 6144, 8192, 12288, 16384]
 
@@ -1035,6 +1041,15 @@ class AgentGateway:
                     "prompt_eval_count": meta.get("prompt_eval_count"),
                 },
             })
+            if size_vram == 0 and size:
+                # The GPU was never used: fail fast, never the step-down loop.
+                await self._unload(client, resolved)
+                self._resident_model = None
+                raise ModelOnCpuError(
+                    f"{resolved} is running on CPU: Ollama is not using the GPU "
+                    f"(size_vram=0, size={size}). Fix the Ollama setup "
+                    f"(GPU drivers / CUDA) — never a context-size problem."
+                )
             if fraction < self.min_gpu_fraction:
                 await self._unload(client, resolved)
                 self._resident_model = None

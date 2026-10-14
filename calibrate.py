@@ -122,6 +122,16 @@ async def run_calibration(
             # Nothing passed at any rung: keep the lowest rung as the ceiling
             # so the role still runs (the guard will step down as needed).
             result["ceiling"] = RUNGS[0]
+        # A calibration made on CPU (every probe showed size_vram == 0) is
+        # unusable: refuse to write it and say so.
+        fractions = result.get("fractions") or {}
+        if fractions and all(v == 0.0 for v in fractions.values()):
+            print(
+                f"  {role}: every probe ran on CPU (size_vram=0) — this "
+                "calibration is unusable; not written. Fix the Ollama GPU "
+                "setup first."
+            )
+            continue
         data["roles"][role] = result
         write_calibration_atomic(data, out_path)
         if on_role_done:

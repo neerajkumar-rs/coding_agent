@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from agent_core.coder import ALLOWED_TARGET_SUFFIXES, parse_coder_output, apply_file_edit
+from agent_core.coder import ALLOWED_TARGET_SUFFIXES
 from agent_core.context import ContextBudget
 from agent_core.run_state import (
     RUNS_DIR_NAME,
@@ -890,36 +890,34 @@ async def run_pipeline(
                 validate_ran = True
 
                 if data.get("satisfies_request") is False:
-                    # ONE fix pass through the coder, then re-run CHECK.
-                    fix_prompt = (
-                        "Fix the reported problems. Return every corrected file as "
-                        "```FILE: path blocks with full contents.\n"
-                        f"PROBLEMS: {json.dumps(validate_problems)}\n"
-                        f"REQUEST: {user_request}\n\n"
-                        + "\n\n".join(
-                            f"FILE: {n}\n```\n{c}\n```" for n, c in generated.items()
-                        )
+                    # ONE more loop pass with the validator's problems as
+                    # context: the model fixes through the loop's tools (never
+                    # a separate fix-call path). New writes stage after their
+                    # own checks; the confirm gate already covered this turn.
+                    missing_note = "; ".join(validate_problems)[:400]
+                    follow_up = await agent_turn(
+                        f"{message}\n\nVALIDATION PROBLEMS TO FIX: {missing_note}",
+                        workspace,
+                        generate=_loop_llm,
+                        llm=_loop_llm,
+                        history_lines=history_lines,
+                        max_steps=3,
                     )
-                    raw_fix = await _llm(
-                        coder_model, fix_prompt,
-                        system="You output only corrected FILE blocks.",
-                        temperature=TEMPERATURE_CODE,
-                    )
-                    _, clean_fix = strip_think_blocks(raw_fix)
-                    try:
-                        for file_edit in parse_coder_output(clean_fix):
-                            base = generated.get(file_edit.path)
-                            fixed = apply_file_edit(base, file_edit)
-                            fix_error = _check_generated(file_edit.path, fixed)
-                            if fix_error is None:
-                                staging.stage_file(file_edit.path, fixed)
-                                generated[file_edit.path] = fixed
-                            else:
-                                validate_problems.append(
-                                    f"{file_edit.path}: fix failed CHECK ({fix_error})"
-                                )
-                    except ValueError:
-                        validate_problems.append("fix pass returned unusable output")
+                    for obs in follow_up.observations:
+                        journal.emit_event({"event": "loop_step",
+                                            "text": ("fix: " + obs)[:300]})
+                    for rel, content in {**follow_up.writes, **follow_up.edits}.items():
+                        err = follow_up.checks.get(rel)
+                        if err is not None:
+                            validate_problems.append(f"{rel}: fix failed CHECK ({err})")
+                            continue
+                        try:
+                            safe_target(workspace, rel)
+                        except Exception as exc:
+                            validate_problems.append(f"{rel}: fix rejected ({exc})")
+                            continue
+                        staging.stage_file(rel, content)
+                        generated[rel] = content
                     validate_note = "fix pass applied" if not validate_problems else "problems remain"
                 else:
                     validate_note = "satisfies request"
