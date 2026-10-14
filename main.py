@@ -548,6 +548,7 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
             think_supported=gateway.think_supported(state.config.planner_model),
             think_budget=int(thinker_cfg.get("think_budget", 512)),
             log_llm_calls=False,
+            understand_model=str(state.config.get_role_config("understand")["model"]),
         )
         if result.get("status") == "cancelled":
             # Cancel is a normal outcome, not a 500: unload whatever is resident.

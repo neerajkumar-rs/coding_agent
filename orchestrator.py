@@ -418,6 +418,7 @@ async def run_pipeline(
     think_supported: bool | None = None,
     think_budget: int = 512,
     log_llm_calls: bool = True,
+    understand_model: str | None = None,
 ) -> dict[str, Any]:
     """ROUTE -> PLAN -> CODE -> CHECK -> VALIDATE -> SUMMARY.
 
@@ -544,9 +545,12 @@ async def run_pipeline(
         llm_calls += 1
         role = kwargs.get("role") or ("coder" if model == coder_model else "thinker")
         # Role-scoped calls (understand) may pass model=None: resolve the model
-        # name for logging + the generate seam from the role.
+        # name for logging + the generate seam from the role. The understand
+        # role honors roles.understand.model (the A/B-tested classifier model),
+        # defaulting to the coder.
         if model is None:
-            model = {"understand": coder_model, "coder": coder_model,
+            model = {"understand": understand_model or coder_model,
+                     "coder": coder_model,
                      "writer": planner_model}.get(role, planner_model)
         trimmed = budget.trim(prompt)
         call_t0 = time.monotonic()
