@@ -41,8 +41,8 @@ _GREETING_RE = re.compile(
     r"|(?:shukriya|dhanyavad|dhanyawaad|thank\s*(?:you|u)(?:\s*so\s*much)?"
     r"|thanks(?:\s*a\s*lot)?(?:\s*so\s*much)?|thx)\b"
     r"(?:\s+(?:so\s+much|a\s+lot|for\s+[\w\s]+?))?\s*[!.]*"
-    r"|(?:ok(?:ay)?|theek\s*hai|accha|sahi|great|nice|cool|perfect|awesome)\b\s*[!.]*"
-    r"|(?:chalo|chalu|shuru)\s+(?:karte|karen|kar)\s+(?:hain|hai|h)\b\s*[!.]*"
+    r"|(?:(?:ok(?:ay)?|theek\s*hai|accha|sahi|great|nice|cool|perfect|awesome)\b[\s,!.]*)+"
+    r"|(?:(?:chalo|chalu|shuru)\s+)+(?:karte|karen|kar)?\s*(?:hain|hai|h)?\b\s*[!.]*"
     r")$",
     re.IGNORECASE,
 )
