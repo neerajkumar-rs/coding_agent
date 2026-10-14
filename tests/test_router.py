@@ -303,9 +303,9 @@ def test_chat_zero_model_calls_zero_files() -> None:
             ))
             assert "answer" in result
             assert "staged_files" not in result
-            # FAST-PATH: no UNDERSTAND stage, zero model calls
+            # FAST-PATH: no CLASSIFY stage, zero model calls
             stages = [t["stage"] for t in result["trace"]]
-            assert stages == ["ANSWER"]
+            assert stages == ["FAST-PATH"]
     assert calls == []  # canned reply: zero model calls by default
 
 
@@ -318,35 +318,32 @@ def test_command_intent_never_touches_files() -> None:
     assert "staged_files" not in result
 
 
-def test_unclear_asks_clarifying_question() -> None:
+def test_vague_request_gets_grounded_reply_no_files() -> None:
+    # The classify->reply path: no question field exists; a vague message
+    # gets a short grounded answer, never files.
     fake = make_fake_generate({
-        "UNDERSTAND JSON:": json.dumps({
-            "mode": "reply", "reply": None,
-            "tasks": [], "assumptions": [],
-            "question": "What should I build — a page, a script, or something else?",
-        }),
+        "CLASSIFY MODE:": "reply",
+        "REPLY:": "I can do that — which file should I change?",
     })
     with TemporaryDirectory() as tmp:
         result = _run(run_pipeline("make something", tmp, generate=fake,
                                    planner_model=PLANNER, coder_model=CODER))
     assert "answer" in result
-    assert "?" in result["answer"]
+    assert "staged_files" not in result
 
 
-# --- FILE_QUESTION end to end ------------------------------------------------------
+# --- reply path: grounded in FACTS, no files ----------------------------------------
 
-def test_file_question_grounded_in_facts_via_understand() -> None:
-    """'what is in my dir' — the Understand model answers from the FACTS
-    table only (grounded in the workspace, no invented files)."""
+def test_file_question_grounded_in_facts_via_reply_step() -> None:
+    """'what is in my dir' — classify=reply, then the reply step answers
+    from the Python-built FACTS block only (grounded, no invented files)."""
     async def fake(model, prompt, system="", temperature=0.2, **kw):
-        if "UNDERSTAND JSON:" in prompt:
+        if "CLASSIFY MODE:" in prompt:
+            return "reply"
+        if "FACTS:" in prompt:
             assert "main.py" in prompt  # FACTS table went in
             assert "notes.txt" in prompt
-            return json.dumps({
-                "mode": "reply",
-                "reply": "The workspace contains main.py (python) and notes.txt.",
-                "tasks": [], "assumptions": [], "question": None,
-            })
+            return "The workspace contains main.py (python) and notes.txt."
         return "some answer"
 
     with TemporaryDirectory() as tmp:
@@ -359,17 +356,15 @@ def test_file_question_grounded_in_facts_via_understand() -> None:
     assert "answer" in result
     assert "main.py" in result["answer"]
     stages = [t["stage"] for t in result["trace"]]
-    assert stages == ["UNDERSTAND", "ANSWER"]
+    assert stages == ["CLASSIFY", "ANSWER"]
 
 
-def test_file_question_explain_via_understand() -> None:
+def test_file_question_explain_via_reply_step() -> None:
     async def fake(model, prompt, system="", temperature=0.2, **kw):
-        if "UNDERSTAND JSON:" in prompt:
-            return json.dumps({
-                "mode": "reply",
-                "reply": "main.py is the entry point.",
-                "tasks": [], "assumptions": [], "question": None,
-            })
+        if "CLASSIFY MODE:" in prompt:
+            return "reply"
+        if "FACTS:" in prompt:
+            return "main.py is the entry point."
         return "unused"
 
     with TemporaryDirectory() as tmp:
@@ -381,15 +376,12 @@ def test_file_question_explain_via_understand() -> None:
     assert "main.py is the entry point" in result["answer"]
 
 
-# --- QUESTION creates zero tasks ----------------------------------------------------
+# --- reply creates zero tasks --------------------------------------------------------
 
 def test_question_creates_zero_tasks() -> None:
     fake = make_fake_generate({
-        "UNDERSTAND JSON:": json.dumps({
-            "mode": "reply",
-            "reply": "Rust is compiled; Python is interpreted.",
-            "tasks": [], "assumptions": [], "question": None,
-        }),
+        "CLASSIFY MODE:": "reply",
+        "REPLY:": "Rust is compiled; Python is interpreted.",
     })
     with TemporaryDirectory() as tmp:
         result = _run(run_pipeline(

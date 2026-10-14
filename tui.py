@@ -968,7 +968,7 @@ async def _post_run_with_confirm(request_text: str, workspace_dir: str) -> dict:
     return await task
 
 
-EXPECTED_STAGES = ["ROUTE", "PLAN", "CODE", "CHECK", "VALIDATE", "SUMMARY"]
+EXPECTED_STAGES = ["CLASSIFY", "PLAN", "CODE", "CHECK", "VALIDATE", "SUMMARY"]
 
 
 # ---------------------------------------------------------------------------
@@ -1203,20 +1203,20 @@ async def _save_staged(workspace_dir: str) -> None:
 
 
 def _print_trace(trace: list[dict]) -> None:
-    """One line: 'ROUTE ok 0.0s | PLAN ok 12.3s | ...'.
-    A stage missing from the trace prints as SKIPPED in red — a missing
-    stage can never go unnoticed."""
+    """One line: 'CLASSIFY ok 0.4s | ANSWER ok 2.1s' — only stages that
+    actually ran appear; red only for failed stages, never a synthetic
+    SKIPPED row."""
     parts: list[str] = []
-    seen = {t.get("stage") for t in trace}
     for entry in trace:
         stage = entry.get("stage", "?")
         status = entry.get("status", "ok")
         seconds = entry.get("seconds", 0.0)
         color = "bright_green" if status == "ok" else ("yellow" if status == "skipped" else "red")
-        parts.append(f"[{color}]{stage} {status} {seconds:.1f}s[/{color}]")
-    for stage in EXPECTED_STAGES:
-        if stage not in seen:
-            parts.append(f"[red]{stage} SKIPPED[/red]")
+        model = entry.get("model", "")
+        parts.append(
+            f"[{color}]{stage} {status} {seconds:.1f}s[/{color}]"
+            + (f" [dim]({model})[/dim]" if model else "")
+        )
     console.print(" | ".join(parts))
 
 

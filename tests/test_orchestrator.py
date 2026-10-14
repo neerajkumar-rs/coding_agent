@@ -29,15 +29,19 @@ def _fake(routes: dict[str, str]):
     import re
 
     async def fake(model, prompt, system="", temperature=0.2, **kw):
-        # The Understand call: the test's plan, wrapped as an Understand payload.
-        if "UNDERSTAND JSON:" in prompt:
+        # Classify-then-act: classify -> code when the test set a plan, then
+        # the plan call returns the test's plan wrapped as {"tasks": [...]}.
+        if "CLASSIFY MODE:" in prompt:
+            if "CLASSIFY MODE:" in routes:
+                return routes["CLASSIFY MODE:"]
+            plan = routes.get("JSON array of tasks", "")
+            return "code" if plan.lstrip().startswith("[") else "reply"
+        if "PLAN TASKS JSON:" in prompt:
+            if "PLAN TASKS JSON:" in routes:
+                return routes["PLAN TASKS JSON:"]
             plan = routes.get("JSON array of tasks", "")
             if plan.lstrip().startswith("["):
-                return json.dumps({
-                    "mode": "code", "reply": None,
-                    "tasks": json.loads(plan),
-                    "assumptions": [], "question": None,
-                })
+                return json.dumps({"tasks": json.loads(plan), "assumptions": []})
             return plan
         target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
         if target and f"TARGET FILE: {target.group(1)}" in routes:
@@ -140,12 +144,10 @@ def test_garbage_coder_fails_without_stub_files() -> None:
 
     async def fake(model, prompt, system="", temperature=0.2, **kw):
         import re
-        if "UNDERSTAND JSON:" in prompt:
-            return json.dumps({
-                "mode": "code", "reply": None,
-                "tasks": json.loads(PLAN),
-                "assumptions": [], "question": None,
-            })
+        if "CLASSIFY MODE:" in prompt:
+            return "code"
+        if "PLAN TASKS JSON:" in prompt:
+            return json.dumps({"tasks": json.loads(PLAN), "assumptions": []})
         target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
         if target:
             calls["n"] += 1

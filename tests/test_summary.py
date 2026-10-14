@@ -78,12 +78,10 @@ def test_summary_prose_dropped_when_inventing_features() -> None:
 
 def test_summary_falls_back_to_skeleton_when_model_fails() -> None:
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
-        if "UNDERSTAND JSON:" in prompt:
-            return json.dumps({
-                "mode": "code", "reply": None,
-                "tasks": json.loads(ONE_FILE_PLAN),
-                "assumptions": [], "question": None,
-            })
+        if "CLASSIFY MODE:" in prompt:
+            return "code"
+        if "PLAN TASKS JSON:" in prompt:
+            return json.dumps({"tasks": json.loads(ONE_FILE_PLAN), "assumptions": []})
         if "Describe only features visible" in prompt:
             raise RuntimeError("model unavailable")
         if "TARGET FILE: greet.py" in prompt:
@@ -126,12 +124,10 @@ def test_summary_lists_failed_tasks_with_reasons() -> None:
 
 def test_unverified_summary_when_validate_errors() -> None:
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
-        if "UNDERSTAND JSON:" in prompt:
-            return json.dumps({
-                "mode": "code", "reply": None,
-                "tasks": json.loads(ONE_FILE_PLAN),
-                "assumptions": [], "question": None,
-            })
+        if "CLASSIFY MODE:" in prompt:
+            return "code"
+        if "PLAN TASKS JSON:" in prompt:
+            return json.dumps({"tasks": json.loads(ONE_FILE_PLAN), "assumptions": []})
         if "satisfies_request" in prompt:
             raise RuntimeError("ollama died mid-review")
         if "TARGET FILE: greet.py" in prompt:

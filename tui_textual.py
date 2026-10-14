@@ -49,7 +49,7 @@ COLOR_FOUR = "#4fc3f7"
 COLOR_PIE = "#ce93d8"
 WORDMARK = f"[{DIM}]<_[/][bold {COLOR_FOUR}]FOUR[/][{DIM}]_[/][bold {COLOR_PIE}]PIE[/]"
 
-QUESTION_LIKE_ROUTES = {"QUESTION", "FILE_QUESTION", "UNCLEAR", "CHAT", "COMMAND"}
+QUESTION_LIKE_ROUTES = {"reply", "fast-path"}
 
 
 # ---------------------------------------------------------------------------
@@ -68,47 +68,35 @@ def collect_system_lines() -> list[str]:
 
 
 def _route_of(trace: list[dict]) -> str:
+    """The classifier label for this trace: CLASSIFY note, or 'fast-path'
+    when the turn never reached the classifier."""
     for entry in trace:
-        if entry.get("stage") == "ROUTE":
-            # note looks like "CODE_TASK (tier 1)" — compare on the intent word
+        if entry.get("stage") == "CLASSIFY":
             return str(entry.get("note", "")).split(" ", 1)[0]
+        if entry.get("stage") == "FAST-PATH":
+            return "fast-path"
     return ""
 
 
 def trace_stage_rows(trace: list[dict]) -> list[tuple[str, str, str]]:
-    """(stage, value, color) rows. Route-aware:
-    - QUESTION/FILE_QUESTION/UNCLEAR: only the stages present, never red SKIPPED.
-    - CODE_TASK: every expected stage; missing = red SKIPPED, pipeline-skipped
-      = dim n/a.
-    """
-    route = _route_of(trace)
+    """(stage, value, color) rows. Only stages that ACTUALLY RAN appear —
+    never a synthetic SKIPPED row. Red only for failed stages; an
+    explicitly pipeline-skipped stage renders as dim n/a."""
     rows: list[tuple[str, str, str]] = []
-    if route in QUESTION_LIKE_ROUTES:
-        for entry in trace:
-            status = entry.get("status", "ok")
-            seconds = f"{entry.get('seconds', 0.0):.1f}s"
-            value = f"ok {seconds}" if status == "ok" else status
-            color = GREEN if status == "ok" else RED
-            rows.append((entry.get("stage", "?"), value, color))
-        return rows
-    seen = {t.get("stage"): t for t in trace}
-    for stage in EXPECTED_STAGES:
-        entry = seen.get(stage)
-        if entry is None:
-            rows.append((stage, "SKIPPED", RED))
-            continue
+    for entry in trace:
         status = entry.get("status", "ok")
+        seconds = f"{entry.get('seconds', 0.0):.1f}s"
         if status == "ok":
-            rows.append((stage, f"ok {entry.get('seconds', 0.0):.1f}s", GREEN))
+            rows.append((entry.get("stage", "?"), f"ok {seconds}", GREEN))
         elif status == "skipped":
-            rows.append((stage, "n/a", DIM))
+            rows.append((entry.get("stage", "?"), "n/a", DIM))
         else:
-            rows.append((stage, status, RED))
+            rows.append((entry.get("stage", "?"), status, RED))
     return rows
 
 
 def trace_line(trace: list[dict]) -> str:
-    """Single dim chat line, e.g. 'UNDERSTAND ok 2.1s (qwen2.5-coder:3b-instruct)'.
+    """Single dim chat line, e.g. 'CLASSIFY ok 0.4s (reply) | ANSWER ok 2.1s'.
     Stages that ran a model show it in parentheses; FAST-PATH stages show no
     model (0 model calls)."""
     models = {t.get("stage"): t.get("model", "") for t in trace}

@@ -111,7 +111,7 @@ async def test_question_route_prints_no_red_text() -> None:
         app._pipeline_done({
             "answer": "Rust is compiled; Python is interpreted.",
             "trace": [
-                {"stage": "ROUTE", "status": "ok", "seconds": 0.0, "note": "QUESTION"},
+                {"stage": "CLASSIFY", "status": "ok", "seconds": 0.4, "note": "reply"},
                 {"stage": "ANSWER", "status": "ok", "seconds": 1.2, "note": ""},
             ],
         })
@@ -120,21 +120,38 @@ async def test_question_route_prints_no_red_text() -> None:
         for strip in chat.lines:
             for seg in getattr(strip, "_segments", []):
                 style = str(seg.style or "")
-                assert "red" not in style.lower(), f"red style in question route: {style}"
-        # and no SKIPPED anywhere for a question route
+                assert "red" not in style.lower(), f"red style in reply route: {style}"
+        # and no SKIPPED anywhere: only stages that ran appear
         assert "SKIPPED" not in "\n".join(_plain_lines(app))
 
 
-def test_trace_line_code_task_marks_missing_stages_skipped() -> None:
-    trace = [{"stage": "ROUTE", "status": "ok", "seconds": 0.0, "note": "CODE_TASK"}]
+def test_trace_line_shows_only_stages_that_ran() -> None:
+    # A code run shows every stage that ran; nothing synthetic is added.
+    trace = [
+        {"stage": "CLASSIFY", "status": "ok", "seconds": 0.4, "note": "code"},
+        {"stage": "PLAN", "status": "ok", "seconds": 1.1, "note": "2 tasks"},
+        {"stage": "CODE", "status": "ok", "seconds": 9.5},
+    ]
     line = trace_line(trace)
-    assert "PLAN SKIPPED" in line
-    assert "ROUTE ok 0.0s" in line
+    assert "CLASSIFY ok 0.4s" in line
+    assert "PLAN ok 1.1s" in line
+    assert "CODE ok 9.5s" in line
+    assert "SKIPPED" not in line  # never a synthetic row
+
+
+def test_trace_line_failed_stage_is_red() -> None:
+    trace = [
+        {"stage": "CLASSIFY", "status": "ok", "seconds": 0.4, "note": "code"},
+        {"stage": "PLAN", "status": "failed", "seconds": 0.3, "note": "no valid plan"},
+    ]
+    line = trace_line(trace)
+    assert "PLAN failed" in line
+    assert "red" in line  # failed stages render red
 
 
 def test_trace_line_question_has_no_skipped() -> None:
     trace = [
-        {"stage": "ROUTE", "status": "ok", "seconds": 0.0, "note": "QUESTION"},
+        {"stage": "CLASSIFY", "status": "ok", "seconds": 0.4, "note": "reply"},
         {"stage": "ANSWER", "status": "ok", "seconds": 0.7},
     ]
     line = trace_line(trace)

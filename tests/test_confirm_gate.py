@@ -40,12 +40,10 @@ class _FakeGateway:
         import re
 
         self.calls.append({"role": role, "prompt": prompt})
-        if "UNDERSTAND JSON:" in prompt:
-            return json.dumps({
-                "mode": "code", "reply": None,
-                "tasks": json.loads(WEB_PLAN),
-                "assumptions": [], "question": None,
-            })
+        if "CLASSIFY MODE:" in prompt:
+            return "code"
+        if "PLAN TASKS JSON:" in prompt:
+            return json.dumps({"tasks": json.loads(WEB_PLAN), "assumptions": []})
         target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
         if target:
             body = {"index.html": INDEX_HTML, "style.css": STYLE_CSS,

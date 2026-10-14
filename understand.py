@@ -1,21 +1,22 @@
-"""The Understand step: LLM-first routing, replacing the rules router.
+"""Classify-then-act routing: tiny classifier, then one call per label.
 
-One schema-constrained gateway call (role ``understand``, coder model by
-default) reads the user message + workspace FACTS + CONVERSATION STATE and
-returns:
+Replaces the single one-call "Understand" step (too big for a 3B model).
+Three steps, each ONE gateway call at most:
 
-    { "mode": "reply" | "code" | "code_and_reply",
-      "reply": string|null,
-      "tasks": [ { "path", "action": "create"|"edit", "description",
-                   "uses_last_result": bool } ],
-      "assumptions": [string],
-      "question": string|null }
+1. ``classify_mode`` — ``CLASSIFY MODE:`` marker, ``format`` = JSON schema
+   ``{"mode": {"enum": [...]}}``, temperature 0, ``num_predict`` <= 12.
+   Output is always one of reply|code|both; there is no "couldn't
+   understand" path.
+2. ``reply_step`` — answers from a Python-built FACTS block only (file
+   table with KB sizes computed in Python, flags, last-run trace,
+   last_result, last 3 turns). Never a question, never a rephrase request,
+   never shell-command tutorials.
+3. ``plan_tasks`` — ``PLAN TASKS JSON:`` marker, small schema
+   ``{"tasks": [...], "assumptions": [...]}`` (no question field). Missing
+   details become defaults listed in assumptions. Post-validated in code.
 
-Post-validation lives here in code (never trust the model): schema + mode
-consistency, one retry with the errors appended, then a plain-JSON regex
-fallback, then a graceful "couldn't understand" reply. Fast paths (slash
-commands, whole-message greetings/thanks/acks/openers in English + Hinglish)
-never touch the model and never create files.
+Fast paths (slash commands, whole-message greetings/thanks/acks/openers in
+English + Hinglish) never touch a model and never create files.
 """
 
 from __future__ import annotations
@@ -26,7 +27,8 @@ from typing import Any, Awaitable, Callable
 
 from ollama_client import strip_think
 
-UNDERSTAND_MARKER = "UNDERSTAND JSON:"
+CLASSIFY_MARKER = "CLASSIFY MODE:"
+PLAN_MARKER = "PLAN TASKS JSON:"
 
 # ---------------------------------------------------------------------------
 # Fast paths (no model call, no files — ever)
@@ -56,7 +58,7 @@ _WORK_OPENER_RE = re.compile(
 
 
 def fast_path(text: str) -> str | None:
-    """Return the canned reply for a fast-path message, or None.
+    """Return the fast-path kind for a message, or None.
 
     Fast paths: slash commands (COMMAND) and whole-message greetings/thanks/
     acks/work-openers (CHAT, English + Hinglish, word-boundary regexes).
@@ -73,54 +75,187 @@ def fast_path(text: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# The Understand call
+# Step 1: the classifier (tiny, always valid)
 # ---------------------------------------------------------------------------
 
-UNDERSTAND_SYSTEM = (
-    "You are the routing brain of a local coding agent. Read the message, the "
-    "workspace FACTS and the CONVERSATION STATE, then output ONE JSON object. "
-    "Rules: act with stated assumptions instead of asking (list them in "
-    "assumptions); ask at most ONE question and only when truly blocked, with "
-    "a proposed default in the question; one task = one file; real file names "
-    "only, never placeholder names; never use the request text as file "
-    "content; mode reply uses ONLY FACTS and CONVERSATION STATE (say 'not in "
-    "this workspace' or 'I don't know' otherwise); questions about what the "
-    "agent did are answered from the LAST RUN TRACE; respect explicit "
-    "constraints ('single html file' = exactly one file). Output JSON only."
+CLASSIFY_SCHEMA = {
+    "type": "object",
+    "properties": {"mode": {"enum": ["reply", "code", "both"]}},
+    "required": ["mode"],
+    "additionalProperties": False,
+}
+
+CLASSIFY_PROMPT = """Classify the message. Answer with one word: reply, code, or both.
+reply = user wants information, a list, an explanation, or chat. No file is created or changed.
+code  = user wants a file created or changed.
+both  = user wants something explained AND a file created or changed.
+Files in workspace: {files}
+Last turn: {last_turn}
+
+"hi bro" -> reply
+"how many lines in index.html" -> reply
+"show me the file sizes" -> reply
+"what does app.py do" -> reply
+"make a todo page in index.html" -> code
+"create a script that renames files" -> code
+"save that table into notes.md" -> code
+"explain app.py and add a health endpoint" -> both
+"what is a closure, then write an example file" -> both
+
+Message: "{text}"
+
+{CLASSIFY_MARKER}"""
+
+_LABEL_RE = re.compile(r"\b(reply|code|both)\b")
+
+
+async def classify_mode(
+    text: str,
+    *,
+    generate: Callable[..., Awaitable[str]],
+    file_names: list[str],
+    last_turn: str,
+    role: str = "understand",
+    think_supported: bool | None = None,
+) -> str:
+    """Classify into reply|code|both with ONE tiny call. Always valid.
+
+    Constrained decoding (``format`` schema, temperature 0, num_predict<=12)
+    plus a label regex over the think-stripped output; any non-label junk
+    falls back to the first recognised label, default ``reply``.
+    Infra errors (model missing, VRAM guard, timeout) propagate to the
+    caller's structured-error envelope — never a rephrase message.
+    """
+    prompt = (
+        CLASSIFY_PROMPT
+        .replace("{files}", ", ".join(file_names[:40]) or "(empty workspace)")
+        .replace("{last_turn}", last_turn or "none")
+        .replace("{text}", text[:2_000])
+        .replace("{CLASSIFY_MARKER}", CLASSIFY_MARKER)
+    )
+    kwargs: dict[str, Any] = {}
+    # think:false only when the probe says the model supports it; never send
+    # think to the coder (the caller resolves the role's model; understand
+    # may point at either).
+    if think_supported is True:
+        kwargs["think"] = False
+    raw = await generate(
+        None, prompt, system="", temperature=0.0,
+        role=role, num_predict=12, _format_schema=CLASSIFY_SCHEMA, **kwargs,
+    )
+    answer, _think, _chars = strip_think(raw)
+    match = _LABEL_RE.search(answer.lower())
+    if match:
+        return match.group(1)
+    # The JSON-schema path returns {"mode": "..."} — extract via json too.
+    try:
+        data = json.loads(answer)
+        mode = str(data.get("mode", "")).lower()
+        if mode in ("reply", "code", "both"):
+            return mode
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return "reply"  # safe default: no files, a grounded answer
+
+
+# ---------------------------------------------------------------------------
+# Step 2a: the reply call (facts only, no questions, no tutorials)
+# ---------------------------------------------------------------------------
+
+REPLY_SYSTEM = (
+    "You answer questions about the user's workspace from facts. Be short."
 )
 
-UNDERSTAND_PROMPT = """MESSAGE: {message}
+REPLY_PROMPT = """Answer using ONLY the facts below. Copy file names, sizes and line counts
+exactly from the table. Do the task yourself; never explain how the user
+could do it with shell commands or tools. If the answer is not in the facts,
+say so in one sentence. Be short.
 
-FACTS (workspace file table — path, language, lines, size; flags for common
-extensionless files present: readme/license/dockerfile/makefile/requirements):
-{facts}
+MESSAGE: {message}
 
-CONVERSATION STATE (last turns one-liners, last_result, last-run trace of
-stages/models/files/seconds, pending_question):
-{state}
-
-{UNDERSTAND_MARKER}
-{{ "mode": "reply" | "code" | "code_and_reply",
-  "reply": string|null,
-  "tasks": [ {{ "path": string, "action": "create"|"edit",
-               "description": string, "uses_last_result": bool }} ],
-  "assumptions": [string],
-  "question": string|null }}"""
+FACTS:
+{facts}"""
 
 
-class UnderstandResult:
-    """Validated Understand output. All fields code-verified, never trusted."""
+async def reply_step(
+    message: str,
+    *,
+    generate: Callable[..., Awaitable[str]],
+    facts_block: str,
+    role: str = "understand",
+) -> str:
+    """One reply call grounded in the Python-built FACTS block. Never raises
+    (infra errors propagate; an empty reply becomes a one-sentence fallback)."""
+    prompt = (
+        REPLY_PROMPT
+        .replace("{message}", message[:4_000])
+        .replace("{facts}", facts_block)
+    )
+    raw = await generate(
+        None, prompt, system=REPLY_SYSTEM, temperature=0.0,
+        role=role, num_predict=400,
+    )
+    answer, _think, _chars = strip_think(raw)
+    answer = answer.strip()
+    return answer or "I don't know — that is not in the workspace facts."
+
+
+# ---------------------------------------------------------------------------
+# Step 2b: the planning call (small schema, no question field)
+# ---------------------------------------------------------------------------
+
+PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tasks": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 6,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "action": {"enum": ["create", "edit"]},
+                    "description": {"type": "string"},
+                    "uses_last_result": {"type": "boolean"},
+                },
+                "required": ["path", "action", "description"],
+                "additionalProperties": False,
+            },
+        },
+        "assumptions": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["tasks"],
+    "additionalProperties": False,
+}
+
+PLAN_SYSTEM = (
+    "You are a software planner. Output only the JSON plan."
+)
+
+PLAN_PROMPT = """Plan the files for this request. One task = one file, ordered, 1..6 tasks.
+When details are missing, choose sensible defaults and list them in
+assumptions — never ask a question. Real file names only, never placeholder
+names. Descriptions: at least 8 words, matching the file's language. Respect
+explicit constraints in the request ("single html file" = exactly one file).
+
+REQUEST: {message}
+
+WORKSPACE FILES: {files}
+
+{PLAN_MARKER}
+{{ "tasks": [ {{ "path": "...", "action": "create"|"edit",
+                "description": "...", "uses_last_result": false }} ],
+   "assumptions": ["..."] }}"""
+
+
+class PlanResult:
+    """Validated plan output. All fields code-verified, never trusted."""
 
     def __init__(self, data: dict[str, Any]) -> None:
-        mode = str(data.get("mode", ""))
-        self.mode = mode if mode in ("reply", "code", "code_and_reply") else "reply"
-        self.reply = data.get("reply") if isinstance(data.get("reply"), str) else None
         self.assumptions = [
             str(a) for a in data.get("assumptions", []) if isinstance(a, str)
         ][:6]
-        self.question = (
-            data.get("question") if isinstance(data.get("question"), str) else None
-        )
         self.tasks: list[dict[str, Any]] = []
         for task in (data.get("tasks") or [])[:6]:
             if not isinstance(task, dict):
@@ -137,26 +272,19 @@ class UnderstandResult:
             })
 
     def validate(self) -> list[str]:
-        """Mode-consistency rules. Returns rejection reasons."""
         reasons: list[str] = []
-        if self.mode in ("code", "code_and_reply") and not self.tasks:
-            reasons.append(f"mode {self.mode} requires at least one task")
-        if self.mode == "reply" and not (self.reply or self.question):
-            reasons.append("mode reply requires a reply or a question")
+        if not self.tasks:
+            reasons.append("plan requires at least one task")
         return reasons
 
     def apply_task_rules(self, task_validator: Callable[[dict[str, Any]], str | None]) -> None:
         """Run the pipeline's per-task rules (placeholder/junk/extension)
         over every task, dropping rejected ones. Code-side, never the model."""
-        kept: list[dict[str, Any]] = []
-        for task in self.tasks:
-            if task_validator(task) is None:
-                kept.append(task)
-        self.tasks = kept
+        self.tasks = [t for t in self.tasks if task_validator(t) is None]
 
 
 def _extract_json(text: str) -> dict[str, Any]:
-    """Plain-JSON regex fallback: first balanced {...} block."""
+    """Plain-JSON fallback: first {...} block."""
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
         return {}
@@ -167,93 +295,105 @@ def _extract_json(text: str) -> dict[str, Any]:
         return {}
 
 
-async def understand(
+class PlanFailed(Exception):
+    """Raised when the plan call fails validation after retry + plain JSON.
+    Carries the reasons for the needs_human result."""
+
+
+async def plan_tasks(
     message: str,
     *,
     generate: Callable[..., Awaitable[str]],
-    facts_table: str,
-    state_block: str,
+    file_names: list[str],
     role: str = "understand",
     task_validator: Callable[[dict[str, Any]], str | None] | None = None,
-) -> UnderstandResult:
-    """One Understand call with validation + one retry + regex fallback.
+) -> PlanResult:
+    """One planning call with the small schema; one retry with the errors
+    appended; then the plain-JSON path; then PlanFailed (no files, no loop).
 
-    Never raises. On total failure returns a graceful 'couldn't understand'
-    reply result (no files, no loop).
+    Infra errors propagate to the caller's structured-error envelope.
     """
-    # Plain replacement, never str.format: the template embeds a literal JSON
-    # example whose braces would be eaten by format().
     prompt = (
-        UNDERSTAND_PROMPT
-        .replace("{message}", message)
-        .replace("{facts}", facts_table)
-        .replace("{state}", state_block)
-        .replace("{UNDERSTAND_MARKER}", UNDERSTAND_MARKER)
+        PLAN_PROMPT
+        .replace("{message}", message[:4_000])
+        .replace("{files}", ", ".join(file_names[:40]) or "(empty workspace)")
+        .replace("{PLAN_MARKER}", PLAN_MARKER)
     )
-    raw = ""
     last_reasons: list[str] = []
     for attempt in range(2):
         eff_prompt = prompt
         if last_reasons:
             eff_prompt += (
-                "\n\nYour previous reply failed validation: "
+                "\n\nYour previous plan was rejected: "
                 + "; ".join(last_reasons)
-                + "\nReturn ONLY a corrected JSON object."
+                + "\nReturn ONLY a corrected JSON plan."
             )
-        # Infra/transport exceptions (model down, VRAM guard, GPU fault)
-        # propagate to the caller's structured-error envelope — the retry
-        # loop exists for VALIDATION failures (bad content), not dead models.
         raw = await generate(
-            None, eff_prompt, system=UNDERSTAND_SYSTEM,
-            temperature=0.0, role=role, num_predict=700,
+            None, eff_prompt, system=PLAN_SYSTEM, temperature=0.0,
+            role=role, num_predict=700,
+            _format_schema=PLAN_SCHEMA if attempt == 0 else None,
         )
         answer, _think, _chars = strip_think(raw)
-        data = _extract_json(answer)
-        result = UnderstandResult(data)
+        result = PlanResult(_extract_json(answer))
         if task_validator is not None:
             result.apply_task_rules(task_validator)
         last_reasons = result.validate()
         if not last_reasons:
             return result
-    # Total failure: graceful reply, no files, no loop.
-    return UnderstandResult({
-        "mode": "reply",
-        "reply": "I couldn't understand that — could you rephrase it?",
-        "tasks": [], "assumptions": [], "question": None,
-    })
+    raise PlanFailed("; ".join(last_reasons) or "planner returned no valid plan")
 
 
 # ---------------------------------------------------------------------------
-# Conversation-state block builder (compact, ContextBudget-capped)
+# FACTS block builder (Python-side; sizes in KB computed here, never by LLM)
 # ---------------------------------------------------------------------------
 
-def build_state_block(
-    turns: list[dict[str, Any]],
-    last_result: dict[str, Any],
-    last_trace: list[dict[str, Any]],
-    pending_question: str,
+def build_facts_block(
+    facts: dict[str, Any],
+    *,
+    turns: list[dict[str, Any]] | None = None,
+    last_result: dict[str, Any] | None = None,
+    last_trace: list[dict[str, Any]] | None = None,
+    pending_question: str = "",
     max_chars: int = 3_000,
 ) -> str:
-    """One compact CONVERSATION STATE block for the Understand prompt."""
+    """The FACTS block for reply_step: file table (path, language, lines,
+    size in KB with one decimal — computed here), extensionless-file flags,
+    last-run trace, last_result (capped), last 3 turns, pending question."""
     lines: list[str] = []
-    for turn in turns[-3:]:
-        lines.append(
-            f"- user: {turn.get('user', '')[:200]} -> {turn.get('mode', '')} "
-            f"({turn.get('result', '')[:120]})"
-        )
-    if last_result:
-        text = str(last_result.get("text", ""))[:1_500]
-        files = ", ".join(str(f) for f in last_result.get("files", [])[:10])
-        lines.append(f"last_result [{last_result.get('type', '?')}]: {text}")
-        if files:
-            lines.append(f"last_result files: {files}")
+    files = facts.get("files", [])
+    if not files:
+        lines.append("The workspace is empty (no files).")
+    else:
+        lines.append("FILE TABLE (path | language | lines | size KB):")
+        for f in files[:60]:
+            size_kb = float(f.get("bytes", 0)) / 1024.0
+            lines.append(
+                f"- {f.get('name', '?')} | {f.get('language', '?')} | "
+                f"{f.get('lines', 0)} lines | {size_kb:.1f} KB"
+            )
+        flags = facts.get("flags", {})
+        if flags:
+            present = [k for k, v in flags.items() if v]
+            lines.append(
+                "Extensionless files present: " + (", ".join(present) if present else "none")
+            )
     if last_trace:
         trace_line = " ".join(
             f"{t.get('stage', '?')}:{t.get('status', '?')}:{t.get('seconds', 0)}s"
             for t in last_trace[-8:]
         )
         lines.append(f"last_run trace: {trace_line}")
+    if last_result:
+        text = str(last_result.get("text", ""))[:1_500]
+        lines.append(f"last_result [{last_result.get('type', '?')}]: {text}")
+        files_prev = ", ".join(str(f) for f in last_result.get("files", [])[:10])
+        if files_prev:
+            lines.append(f"last_result files: {files_prev}")
+    for turn in (turns or [])[-3:]:
+        lines.append(
+            f"- user: {turn.get('user', '')[:200]} -> {turn.get('mode', '')} "
+            f"({turn.get('result', '')[:120]})"
+        )
     if pending_question:
         lines.append(f"pending_question: {pending_question}")
-    block = "\n".join(lines) or "(no prior conversation)"
-    return block[:max_chars]
+    return "\n".join(lines)[:max_chars]

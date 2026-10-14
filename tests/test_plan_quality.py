@@ -57,22 +57,21 @@ def test_web_plan_must_include_html_css_js() -> None:
     assert _valid_plan(full, "make a blog site in html css js") == []
 
 
-# --- Understand task rules (the fallback plan is retired in v4) ---------------
+# --- plan task rules (post-validation lives in code) --------------------------
 
-def test_understand_tasks_pass_through_valid_plan_rules() -> None:
-    """UnderstandResult tasks go through the same per-task rules; rejected
-    tasks are dropped in code, never trusted from the model."""
-    from understand import UnderstandResult
+def test_plan_tasks_pass_through_valid_plan_rules() -> None:
+    """PlanResult tasks go through the same per-task rules; rejected tasks
+    are dropped in code, never trusted from the model."""
+    from understand import PlanResult
 
-    result = UnderstandResult({
-        "mode": "code", "reply": None,
+    result = PlanResult({
         "tasks": [
             {"path": "your_code.py", "action": "create",
              "description": "a sufficiently long description for this task here"},
             {"path": "blog_page.py", "action": "create",
              "description": "a sufficiently long description for this task here"},
         ],
-        "assumptions": [], "question": None,
+        "assumptions": [],
     })
     result.apply_task_rules(_valid_plan_task)
     assert [t["path"] for t in result.tasks] == ["blog_page.py"]
@@ -84,14 +83,15 @@ def test_coder_prompt_contains_request_paths_language() -> None:
     captured: list[str] = []
 
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
-        if "UNDERSTAND JSON:" in prompt:
+        if "CLASSIFY MODE:" in prompt:
+            return "code"
+        if "PLAN TASKS JSON:" in prompt:
             return json.dumps({
-                "mode": "code", "reply": None,
                 "tasks": [_task(
                     "greet.py",
                     "Python module with a greet function returning a greeting string",
                 )],
-                "assumptions": [], "question": None,
+                "assumptions": [],
             })
         if model == CODER:
             captured.append(prompt)
@@ -115,15 +115,16 @@ def test_index_html_prompt_requires_exact_link_names() -> None:
     captured: list[str] = []
 
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
-        if "UNDERSTAND JSON:" in prompt:
+        if "CLASSIFY MODE:" in prompt:
+            return "code"
+        if "PLAN TASKS JSON:" in prompt:
             return json.dumps({
-                "mode": "code", "reply": None,
                 "tasks": [
                     _task("index.html", "HTML page structure linking stylesheet and script files"),
                     _task("style.css", "Stylesheet with layout typography colors and responsive rules"),
                     _task("script.js", "JavaScript for dynamic content loading and user interactions"),
                 ],
-                "assumptions": [], "question": None,
+                "assumptions": [],
             })
         if model == CODER and "TARGET FILE: index.html" in prompt:
             captured.append(prompt)
@@ -147,16 +148,16 @@ def test_index_html_prompt_requires_exact_link_names() -> None:
     assert set(result["staged_files"]) == {"index.html", "style.css", "script.js"}
 
 
-def test_placeholder_plan_returns_graceful_reply_no_files() -> None:
-    """Understand keeps returning placeholder tasks -> they are dropped in
-    code, and with zero valid tasks the pipeline replies gracefully (the
-    deterministic fallback plan is retired in v4)."""
+def test_placeholder_plan_is_needs_human_no_files() -> None:
+    """The planner keeps returning placeholder tasks -> dropped in code; with
+    zero valid tasks the plan step fails to needs_human (no files, no loop)."""
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
-        if "UNDERSTAND JSON:" in prompt:
+        if "CLASSIFY MODE:" in prompt:
+            return "code"
+        if "PLAN TASKS JSON:" in prompt:
             return json.dumps({
-                "mode": "code", "reply": None,
                 "tasks": [_task("foo.py", "x"), _task("untitled.html", "y")],
-                "assumptions": [], "question": None,
+                "assumptions": [],
             })
         return VALIDATE_OK
 
@@ -165,5 +166,5 @@ def test_placeholder_plan_returns_graceful_reply_no_files() -> None:
             "make a blog site in html css js",
             tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
         ))
-    assert "staged_files" not in result
-    assert "couldn't understand" in result["answer"]
+    assert result["status"] == "needs_human"
+    assert result["staged_files"] == []

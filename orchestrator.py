@@ -532,15 +532,21 @@ async def run_pipeline(
 
     try:
         # ------------------------------------------------------------------ ROUTE
-        # Understand step: fast paths (no model, no files) first, then ONE
-        # schema-constrained call (role understand) that reads the message +
-        # workspace FACTS + CONVERSATION STATE and returns mode/tasks.
-        from understand import build_state_block, fast_path, understand
+        # Classify-then-act: fast paths (no model, no files) first, then ONE
+        # tiny CLASSIFY call, then ONE act call per label (reply facts / plan).
+        from understand import (
+            PlanFailed,
+            build_facts_block,
+            classify_mode,
+            fast_path,
+            plan_tasks,
+            reply_step,
+        )
 
         t0 = time.monotonic()
         fp = fast_path(user_request)
         if fp == "COMMAND":
-            record("ANSWER", "ok", 0.0, "FAST-PATH (command handled by the client)")
+            record("FAST-PATH", "ok", 0.0, "command handled by the client")
             _finish("completed")
             return {
                 "answer": "Slash commands are handled by the client UI — "
@@ -550,15 +556,14 @@ async def run_pipeline(
             }
         if fp == "CHAT":
             reply = canned_chat_reply(user_request)
-            record("ANSWER", "ok", 0.0, "FAST-PATH (canned)", model="")
+            record("FAST-PATH", "ok", 0.0, "canned", model="")
             _finish("completed")
             return {"answer": reply, "trace": trace, "run_id": journal.run_id}
 
-        # Conversation state: the Understand model resolves references from it.
+        # Conversation state: the models resolve references from it.
         convo = ConversationState.load(workspace)
-        # Merge a pending question into the message; yes/ok/default/do it
-        # accepts the proposed default. After one question we proceed with
-        # assumptions even if the answer is vague — never two in a row.
+        # Merge a pending question into the message; after one question we
+        # proceed with assumptions — never two questions in a row.
         message = user_request
         if convo.pending_question:
             message = (
@@ -566,56 +571,75 @@ async def run_pipeline(
                 f"USER ANSWER: {user_request}"
             )
         facts = build_file_facts(workspace)
-        facts_table = format_file_table(facts)
-        state_block = build_state_block(
-            convo.turns, convo.last_result, convo.last_trace, convo.pending_question,
-        )
-        uresult = await understand(
+        file_names = [str(f.get("name", "")) for f in facts.get("files", [])][:40]
+        last_turn_line = ""
+        if convo.turns:
+            last = convo.turns[-1]
+            last_turn_line = f"{last.get('user', '')[:80]} -> {last.get('mode', '')}"
+
+        # ---------------------------------------------------------- CLASSIFY
+        mode = await classify_mode(
             message,
             generate=_llm,
-            facts_table=facts_table,
-            state_block=state_block,
-            task_validator=_valid_plan_task,
+            file_names=file_names,
+            last_turn=last_turn_line,
+            think_supported=think_supported,
         )
-        record("UNDERSTAND", "ok", time.monotonic() - t0,
-               f"{uresult.mode} ({len(uresult.tasks)} tasks)",
-               model=coder_model)
+        record("CLASSIFY", "ok", time.monotonic() - t0, mode, model=coder_model)
 
-        # -------------------------------------------------- dispatch per mode
-        if uresult.question and not uresult.tasks and uresult.mode == "reply":
-            # One question, stored; the next turn merges with it.
-            convo.record_turn(
-                user_request, "question", "asked one question",
-                trace=trace, pending_question=uresult.question,
+        reply_text: str | None = None
+
+        if mode in ("reply", "both"):
+            # ---------------------------------------------------------- ANSWER
+            t0 = time.monotonic()
+            facts_block = build_facts_block(
+                facts,
+                turns=convo.turns,
+                last_result=convo.last_result,
+                last_trace=convo.last_trace,
+                pending_question=convo.pending_question,
             )
-            record("ANSWER", "ok", 0.0, "needs clarification")
-            _finish("completed")
+            reply_text = await reply_step(
+                message, generate=_llm, facts_block=facts_block,
+            )
+            record("ANSWER", "ok", time.monotonic() - t0, model=coder_model)
+            if mode == "reply":
+                convo.record_turn(
+                    user_request, "reply", reply_text[:120],
+                    trace=trace,
+                    last_result={"type": "reply", "text": reply_text},
+                )
+                _finish("completed")
+                return {"answer": reply_text, "trace": trace, "run_id": journal.run_id}
+            # both: print the reply first, then continue to the plan step.
+            journal.emit_event({"event": "reply", "text": reply_text[:500]})
+
+        # -------------------------------------------------------------- PLAN
+        t0 = time.monotonic()
+        try:
+            plan = await plan_tasks(
+                message,
+                generate=_llm,
+                file_names=file_names,
+                task_validator=_valid_plan_task,
+            )
+        except PlanFailed as exc:
+            record("PLAN", "failed", time.monotonic() - t0, str(exc)[:200])
+            _finish("needs_human", {"staged_files": [], "failed_tasks": []})
             return {
-                "answer": uresult.question,
+                "status": "needs_human",
+                "summary": f"Could not produce a valid plan: {exc}",
+                "staged_files": [],
+                "failed_tasks": [],
                 "trace": trace,
                 "run_id": journal.run_id,
             }
-
-        if uresult.mode == "reply" or (not uresult.tasks and uresult.reply):
-            reply = (uresult.reply or "").strip() or "I don't know."
-            convo.record_turn(
-                user_request, "reply", reply[:120],
-                trace=trace,
-                last_result={"type": "reply", "text": reply},
-            )
-            record("ANSWER", "ok", 0.0, "reply (no files)")
-            _finish("completed")
-            return {"answer": reply, "trace": trace, "run_id": journal.run_id}
-
-        # code / code_and_reply: tasks become the plan (PLAN stage is gone;
-        # Understand produced it). code_and_reply prints the reply first.
-        if uresult.mode == "code_and_reply" and uresult.reply:
-            journal.emit_event({"event": "reply", "text": uresult.reply[:500]})
-        tasks = uresult.tasks
-        assumptions = uresult.assumptions
-        record("PLAN", "ok", 0.0,
-               f"{len(tasks)} tasks from Understand"
-               + (f" (assumptions: {'; '.join(assumptions[:3])})" if assumptions else ""))
+        tasks = plan.tasks
+        assumptions = plan.assumptions
+        record("PLAN", "ok", time.monotonic() - t0,
+               f"{len(tasks)} tasks"
+               + (f" (assumptions: {'; '.join(assumptions[:3])})" if assumptions else ""),
+               model=coder_model)
 
         planned_paths = {t["path"] for t in tasks}
 
@@ -626,7 +650,7 @@ async def run_pipeline(
         if confirm is not None:
             _check_cancel()
             intent_line = (
-                f"{uresult.mode}: plan is "
+                f"{mode}: plan is "
                 + ", ".join(f"{t['action']} {t['path']}" for t in tasks)
             )
             journal.emit_event({"event": "confirm_requested",
@@ -918,7 +942,7 @@ async def run_pipeline(
         # Conversation state: every turn recorded (reply-first for
         # code_and_reply was emitted as an event at PLAN time).
         convo.record_turn(
-            user_request, uresult.mode, summary[:120],
+            user_request, mode, summary[:120],
             trace=trace,
             last_result={
                 "type": "code",
@@ -933,8 +957,8 @@ async def run_pipeline(
             "trace": trace,
             "run_id": journal.run_id,
         }
-        if uresult.mode == "code_and_reply" and uresult.reply:
-            out["reply"] = uresult.reply
+        if mode == "both" and reply_text:
+            out["reply"] = reply_text
         return out
     except (RunCancelled, OllamaCancelledError):
         _finish("cancelled")
