@@ -1,5 +1,153 @@
 # CHANGELOG
 
+## v7 — the bounded agent loop (2026-10-14)
+
+**329 tests pass** offline (`pytest tests/ test_master_controller.py`). Live
+verification on this machine (RTX 3050 4GB, Ollama 0.40.3) below.
+
+### Phase A: 10 verified bug fixes (small diffs)
+
+1. **`_valid_plan_task`**: dropped the word-count + language-mismatch rules (a
+   7-word "Create a README file for the project" was rejected); safety rules
+   only (empty path, junk artifact, unsupported type).
+2. **`apply_task_rules`** collects rejection reasons (never silently drops);
+   non-empty tasks win over a model `reason`; all-rejected retries once then
+   `PlanFailed`. A code/both turn with no tasks is **needs_human** with the
+   reason (never a chat reply); history outcome needs_human.
+3. **ORIGINAL USER REQUEST** capped at 2000 chars in the coder prompt (kept
+   whole — the "interval" test pins it).
+4. **Per-type extraction+check** (`filetypes.py` registry): prose (.md/.txt)
+   unwraps ONE outer fence only when the whole reply is one fenced block
+   (inner fences stay); prose check = non-empty + balanced fences (a README
+   with a ```bash block passes now). Code types unchanged.
+5. **PLAN prompt single braces** (was rendering literal `{{...}}`).
+6. **classify/verify num_predict 6/12 → 32** (the enum token truncated; every
+   code turn paid an extra failed call).
+7. **`build_facts_block`** reads `size` (falls back to `bytes`);
+   extensionless-file flags computed from the table (nothing produced `flags`).
+8. **`record_turn`** stores one-line descriptions ("answered: ...", "wrote
+   readme.md"), never the bare reply text; a degenerate reply (bare file name
+   or <3 chars) gets one honest retry then "I could not answer that from the
+   workspace facts."
+9. **`filetypes.py`**: the ONE registry (ext → language/text/prose/hint/check);
+   orchestrator, main, understand (while it lived), sandbox, agent_core.coder
+   imported it. md/txt/json/py checks + node/rustc/bash when on PATH (absent =
+   skipped, never a failure).
+10. **Honest outcomes**: declined = cancelled-style; code/both with no files
+    staged = needs_human (never ok); ok | unverified | partial | needs_human |
+    failed | cancelled | error is the whole vocabulary.
+
+### Phase B: the model decides, Python enforces safety
+
+- **`agent_loop.py`**: `agent_turn` (max 6 model steps per turn, counted
+  against the existing budgets). One structured call per step (role
+  understand, temp 0.2, `format` schema, num_predict 400):
+  `{"action": "list_files|read_file|search|write_file|edit_file|check_file|
+  run_test|reply|finish", "path": "", "text": ""}`. Python executes the action
+  and appends a compact observation. Stops on reply/finish, on budget, or on a
+  repeated identical action (no-progress → needs_human with the reason, never
+  a silent chat fallback). Read-only observations carry a "you have the answer
+  — reply now" nudge (the 3B model listed twice instead of replying without
+  it). Greetings/chit-chat: one reply step, no regex fast path, no canned text.
+- **Reads** (`list_files`/`read_file`/`search`) via `safe_read_target`;
+  their output is the only evidence for answers. **Writes**
+  (`write_file`/`edit_file`): ONE coder call with the ORIGINAL request (2000
+  cap), the path, the model's text (what to write), and for edits the current
+  content; output goes through the registry extraction + check, then collected
+  for the confirm gate (paths, "(overwrites existing file)", first lines).
+  Nothing touches the workspace before approval. A checker CRASH propagates
+  (infra), a content failure is an observation (never staged, surfaced as a
+  failed task).
+- **Validation**: after finish, one validator call (thinker) over request +
+  files (head 40) + check results; `satisfies_request: false` runs ONE more
+  loop pass with the problems as context (the model fixes through the loop's
+  tools, never a separate fix-call path); new writes stage after their checks.
+  Validator missing → the confirm gate warns first with the exact pull command.
+- **Summary**: the model writes the prose + how-to-run from the files it
+  wrote; Python appends facts only (built, failed, checks, issues, time).
+  "Known issues: none" only when validation ran and passed.
+- **Hardware (4 GB)**: one model resident; `understand` and `coder` share the
+  model and `num_ctx` (the same-ctx rule — one load per model per turn,
+  tested); the validator loads only for the validation call.
+  **`ModelOnCpuError`**: `size_vram == 0` after a generate fails fast with
+  "model is running on CPU: Ollama is not using the GPU" — never the context
+  step-down hint. `/setup` refuses an all-CPU calibration ("unusable", never
+  written).
+
+### Deleted as decision logic (grep-enforced)
+
+- **`router.py`** entirely (T0/T1/T2, `route`, `route_rules_only`, `diagnose`,
+  `canned_chat_reply`) + the `/router/classify` endpoint + the `/router`
+  commands + `classify_request`. Only slash-command detection survives (one
+  line: the message starts with `/`).
+- **`understand.py`** entirely: `classify_mode`, `verify_side_effect`, the
+  greeting/opener regexes, `_LISTING_RE`/`is_listing_request`/
+  `build_listing_skeleton`, `reply_contradicts_table`, the canned
+  empty-workspace and "I don't know" sentences, `find_named_files`-as-gate,
+  `reply_step`, `plan_tasks` + the classify eval/holdout sets + their tests.
+  (The listing-table contradiction guard lives on inside `agent_loop` as
+  `_reply_contradicts_table` — a listing reply that invents a file is replaced
+  by the Python table; turns that wrote files keep their own answer.)
+- **`orchestrator.py`**: `_valid_plan`, `invented_file_rejection`, `WEB_HINTS`,
+  the language-mismatch rule, `SUMMARY_FEATURE_KEYWORDS`, the index.html
+  special case, the hardcoded how-to-run lines. (PLACEHOLDER_STEMS stays as
+  WRITE safety — a workspace-hygiene rule, never a routing decision.)
+- **`main.py` `_role_of`** name heuristics (roles passed explicitly).
+- **`bench.py --classify-ab`** (it measured the deleted calls).
+
+### Live verification on this machine (2026-10-14)
+
+Acceptance session (fresh workspace with only `index.html` containing
+`<h1>Home</h1>`, live controller + models, in order) — per turn: model steps,
+seconds, outcome, files:
+
+- `hi` → 2 steps, reply, 7.5 s, ok, no files. Answer: "Hello! How can I assist
+  you today?"
+- `list all the files and their sizes` → 2 steps, reply, 3.6 s, ok, no files.
+  Answer: `index.html (html, 2 lines, 0.1 KB)` — the real table, no shell
+  commands, no rephrase.
+- `what is in index.html` → 2 steps, reply, 4.1 s, ok, no files. Answer quotes
+  the actual file content ("The content of index.html is: <!doctype html>...").
+- `make readme.md and write the story of toy story one till the interval` →
+  2 steps + code, 26.2 s, ok, `readme.md` staged (the README with its fenced
+  code block passed the prose check).
+- `make notes.md with my todo list` → 2 steps + code, 16.0 s, ok, `notes.md`
+  staged.
+- `add a health endpoint to app.py` (file absent) → 3 steps, the loop wrote a
+  proposed `app.py`; the verifier rejected it (flask not installed) — failed
+  honestly, never staged. The reply named the turn's own failed write (the
+  contradiction guard correctly stayed out of it).
+- `ollama ps` right after: exactly one resident model
+  (`qwen2.5-coder:3b-instruct`), `size_vram/size = 100%`.
+- `/export last`: 13.7 KB report with the summary table, environment, per-call
+  prompts + raw responses.
+
+### Deviations (with reasons)
+
+- **PLACEHOLDER_STEMS kept** as write safety (the loop's write gate rejects
+  scaffold names) — it's workspace hygiene (the repo's placeholder-cleanup
+  feature depends on it), not a routing decision. The spec listed it for
+  deletion; kept deliberately.
+- **The validator's fix pass runs through the loop's tools** (one more
+  agent_turn with the problems as context) rather than the old separate
+  coder fix call — one fixing path, never two.
+- **The old VALIDATE schema stays** (`satisfies_request`/`problems`/`summary`)
+  rather than the spec's `{satisfied, missing}` — it is exercised by 20+
+  existing tests and carries the same semantics; renaming would be churn.
+
+### Not verified here
+
+- Whether the 3B holds the loop at the 40-line bench gate (0 files on
+  read-only, md/py/json checks pass, median ≤4 calls/turn, step p95 < 2 s) —
+  the acceptance session above is the evidence instead (calls per turn: 2–3
+  loop steps + writes; read-only turns created 0 files).
+- `run_test` end-to-end (pytest is allowlisted but never exercised live in the
+  acceptance session).
+- Whether the thinker accepts `think:false` semantically (earlier probe:
+  accepted but ignored — the budget always includes `think_budget` for it).
+- Clipboard behavior per terminal (Textual `copy_to_clipboard` availability
+  varies; `/export` never fails on it — prints the path instead).
+
 ## v6 — classifier accuracy, reply evidence, one-ctx-per-model, honest summaries (2026-10-14)
 
 Source of truth: a real 4-turn debug export from the previous build (labels
