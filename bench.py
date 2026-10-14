@@ -35,6 +35,11 @@ DEFAULT_OLLAMA = "http://localhost:11434"
 EXIT_OK = 0
 EXIT_OLLAMA_UNREACHABLE = 2
 
+# The held-back classify eval set (tests/classify_eval.jsonl). Bench reads it
+# for the classifier A/B (accuracy first, latency second); the prompt examples
+# never contain these phrases.
+EVAL_PATH = Path(__file__).parent / "tests" / "classify_eval.jsonl"
+
 
 # --- role probes: prompt + deterministic quality checks ----------------------
 # Each check is (name, predicate). Quality = 100 * passed / total; a role is
@@ -139,6 +144,7 @@ class BenchReport:
     best_per_role: dict[str, str] = field(default_factory=dict)
     coexist_verdict: str = ""
     errors: list[str] = field(default_factory=list)
+    classify_ab: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -148,6 +154,7 @@ class BenchReport:
             "best_per_role": self.best_per_role,
             "coexist_verdict": self.coexist_verdict,
             "errors": self.errors,
+            "classify_ab": self.classify_ab,
         }
 
 
@@ -299,7 +306,138 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--coexist", action="store_true", help="test model coexistence")
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA)
+    parser.add_argument(
+        "--classify-ab", action="store_true",
+        help="A/B the coder vs thinker as the classifier over tests/classify_eval.jsonl "
+             "(label accuracy, p50/p95 latency, shell-command leakage on reply lines)",
+    )
     return parser
+
+
+# ---------------------------------------------------------------------------
+# Classifier A/B (Section 6): which model owns the understand role
+# ---------------------------------------------------------------------------
+
+_SHELL_HINT_RE = re.compile(
+    r"\b(?:ls|dir|find|grep|cat|head|tail|du|stat|tree|fd)\b\s+[-~\w.]",
+    re.IGNORECASE,
+)
+
+
+def _pctl(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, int(round((pct / 100.0) * (len(ordered) - 1))))
+    return round(ordered[idx], 3)
+
+
+async def _classify_ab_model(
+    gateway: Any, model: str, eval_lines: list[dict[str, Any]], ollama_url: str
+) -> dict[str, Any]:
+    """Run the classifier + reply step over the eval set with `model` pinned
+    as the understand role. Returns accuracy/latency/leakage metrics."""
+    from understand import build_facts_block, classify_mode, reply_step
+
+    gateway.config = _BenchConfig(gateway.config, "understand", model)
+
+    async def _gen(m, prompt, system="", temperature=0.0, **kwargs):
+        return await gateway.generate(
+            "understand", prompt, system=system, temperature=temperature,
+            num_predict=kwargs.get("num_predict", 12),
+            _format_schema=kwargs.get("_format_schema"),
+        )
+
+    facts_block = build_facts_block({"files": [], "flags": {}})
+    correct = 0
+    total = 0
+    latencies: list[float] = []
+    shell_leaks = 0
+    reply_lines = 0
+    for entry in eval_lines:
+        if entry["expected"] == "fast":
+            continue  # fast paths never touch a model — nothing to measure
+        total += 1
+        t0 = time.monotonic()
+        label = await classify_mode(
+            entry["text"], generate=_gen, file_names=[], last_turn="",
+        )
+        latencies.append(time.monotonic() - t0)
+        if label == entry["expected"]:
+            correct += 1
+        if label == "reply":
+            reply_lines += 1
+            answer = await reply_step(entry["text"], generate=_gen, facts_block=facts_block)
+            if _SHELL_HINT_RE.search(answer):
+                shell_leaks += 1
+    accuracy = round(100.0 * correct / total, 1) if total else 0.0
+    return {
+        "model": model,
+        "accuracy": accuracy,
+        "correct": correct,
+        "total": total,
+        "p50": _pctl(latencies, 50),
+        "p95": _pctl(latencies, 95),
+        "reply_lines": reply_lines,
+        "shell_leaks": shell_leaks,
+    }
+
+
+async def _classify_ab(config: AgentConfig, ollama_url: str, installed: list[str]) -> dict[str, Any]:
+    """A/B coder vs thinker as the classifier. Picks roles.understand.model by
+    accuracy first, latency second. Gate: >=95% accuracy, 0 shell leaks, p95 < 2s."""
+    import asyncio as _asyncio  # local: the lock binds to this loop
+
+    from ollama_client import AgentGateway, OllamaSupervisorClient
+
+    if not EVAL_PATH.exists():
+        return {"error": f"eval set missing: {EVAL_PATH}"}
+    eval_lines = [
+        json.loads(raw) for raw in EVAL_PATH.read_text(encoding="utf-8").splitlines()
+        if raw.strip()
+    ]
+    candidates = {
+        "coder": str(config.get_role_config("coder")["model"]),
+        "thinker": str(config.get_role_config("thinker")["model"]),
+    }
+    supervisor = OllamaSupervisorClient(base_url=ollama_url)
+    gateway = AgentGateway(supervisor, config)
+    rows: dict[str, Any] = {}
+    for label, model in candidates.items():
+        if model not in installed:
+            rows[label] = {"model": model, "error": f"missing — ollama pull {model}"}
+            print(f"SKIP classify/{label}: missing model {model} — ollama pull {model}")
+            continue
+        print(f"classify A/B: {label} = {model} ...")
+        rows[label] = await _classify_ab_model(gateway, model, eval_lines, ollama_url)
+        print(
+            f"  {label}: acc={rows[label]['accuracy']}% "
+            f"p50={rows[label]['p50']}s p95={rows[label]['p95']}s "
+            f"shell_leaks={rows[label]['shell_leaks']}/{rows[label]['reply_lines']}"
+        )
+        await gateway.unload(model)
+    gateway.config = config  # restore
+
+    # Pick by accuracy first, latency second.
+    winner = None
+    scored = {k: v for k, v in rows.items() if "accuracy" in v}
+    if scored:
+        winner = max(
+            scored,
+            key=lambda k: (scored[k]["accuracy"], -scored[k]["p95"]),
+        )
+    result: dict[str, Any] = {"rows": rows, "winner": winner}
+    if winner:
+        w = scored[winner]
+        gate_ok = w["accuracy"] >= 95.0 and w["shell_leaks"] == 0 and w["p95"] < 2.0
+        result["gate_ok"] = gate_ok
+        result["recommendation"] = (
+            f"roles.understand.model = {scored[winner]['model']}"
+            if gate_ok else
+            f"no model passes the gate (winner {winner} misses: "
+            f"acc={w['accuracy']}% p95={w['p95']}s leaks={w['shell_leaks']})"
+        )
+    return result
 
 
 def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
@@ -394,17 +532,33 @@ def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
                 await gateway.unload(model)
         gateway.config = config  # restore
 
+    classify_ab_result: dict[str, Any] | None = None
+
     try:
         asyncio.run(_bench_all())
     except Exception as exc:  # gateway/transport failure mid-bench
         report.errors.append(str(exc)[:300])
         print(f"ERROR: bench aborted: {exc}")
 
-    # Best per role = highest throughput score among ok results
+    if args.classify_ab:
+        import asyncio as _asyncio
+
+        try:
+            classify_ab_result = _asyncio.run(_classify_ab(config, args.ollama_url, installed))
+            report.classify_ab = classify_ab_result
+            if classify_ab_result.get("recommendation"):
+                print(f"\nClassifier A/B: {classify_ab_result['recommendation']}")
+        except Exception as exc:
+            report.errors.append(f"classify-ab: {str(exc)[:300]}")
+            print(f"ERROR: classify A/B failed: {exc}")
+
+    # Best per role = highest score among ok results; every probed role is
+    # listed ("none passed" instead of omitting a role whose probes failed).
     for role in role_models:
         candidates = [r for r in report.results if r.role == role and r.ok]
-        if candidates:
-            report.best_per_role[role] = max(candidates, key=lambda r: r.score).model
+        report.best_per_role[role] = (
+            max(candidates, key=lambda r: r.score).model if candidates else "none passed"
+        )
 
     if args.coexist:
         # With OLLAMA_MAX_LOADED_MODELS=1 the expectation is sequential residency.
