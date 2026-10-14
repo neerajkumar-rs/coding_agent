@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from orchestrator import _valid_plan, _valid_plan_task, run_pipeline
+from orchestrator import _valid_plan_task, run_pipeline
 from tests.test_run_pipeline import CODER, PLANNER, VALIDATE_OK, make_fake_generate
 
 
@@ -41,66 +41,39 @@ def test_safety_rules_only_no_quality_gates() -> None:
     assert _valid_plan_task(_task("x.exe", "binary target not supported here")) is not None  # type
 
 
-# --- plan-level rules ----------------------------------------------------------
+# --- plan-level text-matching rules are deleted with the rules router --------
 
-def test_app_py_rejected_when_not_requested() -> None:
-    tasks = [_task("app.py", "Python application implementing the requested feature fully")]
-    assert _valid_plan(tasks, "make a blog site in html css js") != []
-    # ...but allowed when explicitly requested
-    assert _valid_plan(tasks, "create app.py with a calculator") == []
+def test_plan_level_rules_are_gone() -> None:
+    """_valid_plan / invented_file_rejection / WEB_HINTS are deleted: the agent
+    loop decides what to write; Python enforces safety only."""
+    import orchestrator
 
-
-def test_web_plan_must_include_html_css_js() -> None:
-    only_html = [_task("index.html", "HTML page with all structure and content included")]
-    reasons = _valid_plan(only_html, "make a blog site in html css js")
-    assert any("missing" in r for r in reasons)
-    full = [
-        _task("index.html", "HTML page structure linking stylesheet and script files"),
-        _task("style.css", "Stylesheet with layout typography colors and responsive rules"),
-        _task("script.js", "JavaScript for dynamic content loading and interactions"),
-    ]
-    assert _valid_plan(full, "make a blog site in html css js") == []
+    for gone in ("_valid_plan", "invented_file_rejection", "WEB_HINTS"):
+        assert not hasattr(orchestrator, gone), gone
 
 
-# --- plan task rules (post-validation lives in code) --------------------------
+def test_placeholder_stems_stay_as_write_safety() -> None:
+    """PLACEHOLDER_STEMS stays: the write gate rejects scaffold names (hygiene,
+    never a routing decision)."""
+    import orchestrator
 
-def test_plan_tasks_pass_through_valid_plan_rules() -> None:
-    """PlanResult tasks go through the same per-task rules; rejected tasks
-    are dropped in code, never trusted from the model."""
-    from understand import PlanResult
-
-    result = PlanResult({
-        "tasks": [
-            {"path": "your_code.py", "action": "create",
-             "description": "a sufficiently long description for this task here"},
-            {"path": "blog_page.py", "action": "create",
-             "description": "a sufficiently long description for this task here"},
-        ],
-        "assumptions": [],
-    })
-    result.apply_task_rules(_valid_plan_task)
-    assert [t["path"] for t in result.tasks] == ["blog_page.py"]
+    assert hasattr(orchestrator, "PLACEHOLDER_STEMS")
+    assert "your_code" in orchestrator.PLACEHOLDER_STEMS
 
 
 # --- coder prompt contents -----------------------------------------------------
 
 def test_coder_prompt_contains_request_paths_language() -> None:
     captured: list[str] = []
+    loop_actions = iter([
+        {"action": "write_file", "path": "greet.py", "text": "a greet function returning a greeting string"},
+        {"action": "finish"},
+    ])
 
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
-        if "CLASSIFY MODE:" in prompt:
-            return "code"
-        if "VERIFY SIDE EFFECT:" in prompt:
-            return "yes"
-        if "PLAN TASKS JSON:" in prompt:
-            return json.dumps({
-                "tasks": [_task(
-                    "greet.py",
-                    "Python module with a greet function returning a greeting string",
-                )],
-                "assumptions": [],
-            })
-        if model == CODER:
+        if "AGENT ACTION JSON:" in prompt:
+            return json.dumps(next(loop_actions, {"action": "finish"}))
+        if model == CODER and "Write greet.py." in prompt:
             captured.append(prompt)
             return "```python\ndef greet(name):\n    return f'hi {name}'\n```"
         return VALIDATE_OK
@@ -113,37 +86,34 @@ def test_coder_prompt_contains_request_paths_language() -> None:
     assert captured, "coder was never called"
     prompt = captured[0]
     assert "create greet.py with a greet function" in prompt   # original request
-    assert "greet.py" in prompt                                  # planned paths
-    assert "greet function returning a greeting" in prompt       # task description
+    assert "greet.py" in prompt                                  # the target file
+    assert "greet function returning a greeting" in prompt       # what to write
     assert "python" in prompt.lower()                            # language from extension
 
 
-def test_index_html_prompt_requires_exact_link_names() -> None:
+def test_index_html_prompt_reaches_the_coder_with_the_request() -> None:
+    """The loop's coder call for index.html carries the original request and
+    the registry's type hint; the staged html passes its checks."""
     captured: list[str] = []
+    loop_actions = iter([
+        {"action": "write_file", "path": "index.html", "text": "the blog page structure"},
+        {"action": "write_file", "path": "style.css", "text": "the blog stylesheet"},
+        {"action": "write_file", "path": "script.js", "text": "the blog interactions"},
+        {"action": "finish"},
+    ])
 
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
-        if "CLASSIFY MODE:" in prompt:
-            return "code"
-        if "VERIFY SIDE EFFECT:" in prompt:
-            return "yes"
-        if "PLAN TASKS JSON:" in prompt:
-            return json.dumps({
-                "tasks": [
-                    _task("index.html", "HTML page structure linking stylesheet and script files"),
-                    _task("style.css", "Stylesheet with layout typography colors and responsive rules"),
-                    _task("script.js", "JavaScript for dynamic content loading and user interactions"),
-                ],
-                "assumptions": [],
-            })
-        if model == CODER and "TARGET FILE: index.html" in prompt:
+        if "AGENT ACTION JSON:" in prompt:
+            return json.dumps(next(loop_actions, {"action": "finish"}))
+        if model == CODER and "Write index.html." in prompt:
             captured.append(prompt)
             return ("```html\n<!doctype html><html><head>"
                     '<link rel="stylesheet" href="style.css">'
                     '<script src="script.js"></script>'
                     "</head><body><h1>Blog</h1></body></html>\n```")
-        if model == CODER and "TARGET FILE: style.css" in prompt:
+        if model == CODER and "Write style.css." in prompt:
             return "```css\nbody { margin: 0; padding: 0; }\n```"
-        if model == CODER and "TARGET FILE: script.js" in prompt:
+        if model == CODER and "Write script.js." in prompt:
             return "```javascript\ndocument.addEventListener('DOMContentLoaded', () => {});\n```"
         return VALIDATE_OK
 
@@ -153,21 +123,22 @@ def test_index_html_prompt_requires_exact_link_names() -> None:
             tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
         ))
     assert captured, "index.html coder prompt never captured"
-    assert "style.css" in captured[0] and "script.js" in captured[0]
+    assert "make a blog site in html css js" in captured[0]  # original request
     assert set(result["staged_files"]) == {"index.html", "style.css", "script.js"}
 
 
-def test_placeholder_plan_is_needs_human_no_files() -> None:
-    """The planner keeps returning placeholder tasks -> dropped in code; with
-    zero valid tasks the plan step fails to needs_human (no files, no loop)."""
+def test_placeholder_write_is_needs_human_no_files() -> None:
+    """The loop keeps writing placeholder paths -> the safety rule rejects
+    every one; the turn is needs_human (no files, no loop)."""
+    loop_actions = iter([
+        {"action": "write_file", "path": "foo.py", "text": "x"},
+        {"action": "write_file", "path": "untitled.html", "text": "y"},
+        {"action": "finish"},
+    ])
+
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
-        if "CLASSIFY MODE:" in prompt:
-            return "code"
-        if "PLAN TASKS JSON:" in prompt:
-            return json.dumps({
-                "tasks": [_task("foo.py", "x"), _task("untitled.html", "y")],
-                "assumptions": [],
-            })
+        if "AGENT ACTION JSON:" in prompt:
+            return json.dumps(next(loop_actions, {"action": "finish"}))
         return VALIDATE_OK
 
     with TemporaryDirectory() as tmp:

@@ -47,25 +47,41 @@ VALIDATE_OK = json.dumps({
 
 
 def _fake_generate(routes: dict[str, str]):
+    """Loop-aware fake: 'JSON array of tasks' becomes write_file actions +
+    finish; 'TARGET FILE: x' routes the coder write call for x."""
     import re
 
+    plan = routes.get("JSON array of tasks", "")
+    actions: list[dict] = []
+    if plan.lstrip().startswith("["):
+        for task in json.loads(plan):
+            actions.append({
+                "action": "write_file" if task.get("action", "create") == "create" else "edit_file",
+                "path": task["path"],
+                "text": task.get("description", ""),
+            })
+        actions.append({"action": "finish"})
+
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
-        if "CLASSIFY MODE:" in prompt:
-            plan = routes.get("JSON array of tasks", "")
-            return "code" if plan.lstrip().startswith("[") else "reply"
-        if "PLAN TASKS JSON:" in prompt:
-            plan = routes.get("JSON array of tasks", "")
-            if plan.lstrip().startswith("["):
-                return json.dumps({"tasks": json.loads(plan), "assumptions": []})
-            return plan
-        target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
-        if target and f"TARGET FILE: {target.group(1)}" in routes:
-            return routes[f"TARGET FILE: {target.group(1)}"]
+        if "AGENT ACTION JSON:" in prompt:
+            if not actions:
+                return json.dumps({"action": "reply", "text": "ok"})
+            idx = getattr(fake, "_n", 0)
+            fake._n = idx + 1
+            return json.dumps(actions[min(idx, len(actions) - 1)])
+        target = re.search(r"TARGET FILE:\s*(\S+)", prompt) or re.search(r"Write\s+(\S+\.\w+)\.", prompt)
+        if target:
+            marker = f"TARGET FILE: {target.group(1)}"
+            if marker in routes:
+                return routes[marker]
         for marker in sorted(routes, key=len, reverse=True):
+            if marker in ("JSON array of tasks",):
+                continue
             if marker in prompt:
                 return routes[marker]
         return ""
 
+    fake._n = 0  # type: ignore[attr-defined]
     return fake
 
 

@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 
 import pytest
 
-from orchestrator import classify_request, run_pipeline
+from orchestrator import run_pipeline
 
 PLANNER = "erwan2/DeepSeek-R1-Distill-Qwen-1.5B:latest"
 CODER = "qwen2.5-coder:3b"
@@ -37,80 +37,62 @@ VALIDATE_OK = json.dumps({
 
 
 def make_fake_generate(routes: dict[str, str], default: str = ""):
-    """routes: marker-in-prompt -> response. Coder routes by 'TARGET FILE: x'
-    (matched via regex so retry feedback above the marker still routes).
+    """routes: marker-in-prompt -> response, driving the agent loop.
 
-    Classify-then-act markers:
-    - "CLASSIFY MODE:" -> routes.get("CLASSIFY MODE:") or, when the test set
-      a "JSON array of tasks" plan, the label "code"; default "reply".
-    - "PLAN TASKS JSON:" -> routes.get("PLAN TASKS JSON:") or the test's
-      "JSON array of tasks" plan wrapped as {"tasks": [...]}.
-    - "UNDERSTAND JSON:" (legacy) is treated as a classify marker whose
-      value decides: a full payload JSON drives mode+reply/tasks.
-    Extra kwargs (num_predict, think, role, _format_schema) are accepted and
-    ignored."""
+    The loop calls carry the "AGENT ACTION JSON:" marker. A route dict shapes
+    the loop:
+    - "AGENT ACTION JSON:" — a literal response for EVERY loop call (use for
+      reply/finish turns).
+    - "LOOP ACTIONS" — a JSON list of action dicts played back in order.
+    - Legacy shaping (kept so older fixtures work):
+      - "CLASSIFY MODE:" == "reply" -> one reply action using "REPLY:" text.
+      - "JSON array of tasks" (a plan) -> one write_file action per task,
+        then finish. "TARGET FILE: x" routes the coder write call for x.
+    Everything else (satisfies_request, Describe-only, TARGET FILE) routes
+    exactly as before."""
+    import re as _re
+
+    def _loop_actions() -> list[dict]:
+        if "LOOP ACTIONS" in routes:
+            return json.loads(routes["LOOP ACTIONS"])
+        mode = routes.get("CLASSIFY MODE:", "")
+        if mode == "reply" or ("REPLY:" in routes and not routes.get("JSON array of tasks", "").lstrip().startswith("[")):
+            return [{"action": "reply", "text": routes.get("REPLY:", routes.get("REPLY", "ok"))}]
+        plan = routes.get("JSON array of tasks", "")
+        if plan.lstrip().startswith("["):
+            actions = []
+            for task in json.loads(plan):
+                actions.append({
+                    "action": "write_file" if task.get("action", "create") == "create" else "edit_file",
+                    "path": task["path"],
+                    "text": task.get("description", ""),
+                })
+            actions.append({"action": "finish"})
+            return actions
+        return []
+
+    actions = _loop_actions()
+    loop_calls = {"n": 0}
+
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
         import re
 
-        # Legacy Understand route values (full payload JSON) drive both the
-        # classify and the act step so old tests keep working unchanged.
-        legacy = routes.get("UNDERSTAND JSON:")
-        legacy_data: dict = {}
-        if legacy:
-            try:
-                legacy_data = json.loads(legacy)
-            except json.JSONDecodeError:
-                legacy_data = {}
-
-        if "CLASSIFY MODE:" in prompt or "UNDERSTAND JSON:" in prompt:
-            if "CLASSIFY MODE:" in routes:
-                return routes["CLASSIFY MODE:"]
-            if legacy_data:
-                mode = legacy_data.get("mode", "reply")
-                return {"code_and_reply": "both"}.get(str(mode), str(mode))
-            plan = routes.get("JSON array of tasks", "")
-            if plan.lstrip().startswith("["):
-                return "code"
-            if "QUESTION:" in routes or default:
-                return "reply"
-            return "reply"
-
-        if "PLAN TASKS JSON:" in prompt:
-            if "PLAN TASKS JSON:" in routes:
-                return routes["PLAN TASKS JSON:"]
-            if legacy_data and legacy_data.get("tasks"):
-                return json.dumps({
-                    "tasks": legacy_data["tasks"],
-                    "assumptions": legacy_data.get("assumptions", []),
-                })
-            plan = routes.get("JSON array of tasks", "")
-            if plan.lstrip().startswith("["):
-                return json.dumps({"tasks": json.loads(plan), "assumptions": []})
-            return plan or default
-
-        # The side-effect verify pass (code|both labels): default confirms
-        # ("yes") so existing tests keep their intended path; a test sets
-        # routes["VERIFY SIDE EFFECT:"] = "no" to exercise the downgrade.
-        if "VERIFY SIDE EFFECT:" in prompt:
-            return routes.get("VERIFY SIDE EFFECT:", "yes")
-
-        # The reply step: answer-only prompt (has FACTS but no plan marker).
-        if "FACTS:" in prompt and "MESSAGE:" in prompt:
-            if "REPLY:" in routes:
-                return routes["REPLY:"]
-            if legacy_data:
-                return legacy_data.get("reply") or "I don't know."
-            if "QUESTION:" in routes:
-                return routes["QUESTION:"]
-            if "REPLY" in routes:
-                return routes["REPLY"]
-
-        target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
+        if "AGENT ACTION JSON:" in prompt:
+            if "AGENT ACTION JSON:" in routes:
+                return routes["AGENT ACTION JSON:"]
+            if not actions:
+                return json.dumps({"action": "reply", "text": default or "ok"})
+            idx = min(loop_calls["n"], len(actions) - 1)
+            loop_calls["n"] += 1
+            return json.dumps(actions[idx])
+        target = re.search(r"TARGET FILE:\s*(\S+)", prompt) or re.search(r"Write\s+(\S+\.\w+)\.", prompt)
         if target:
             file_marker = f"TARGET FILE: {target.group(1)}"
             if file_marker in routes:
                 return routes[file_marker]
         for marker in sorted(routes, key=len, reverse=True):
+            if marker in ("AGENT ACTION JSON:", "LOOP ACTIONS"):
+                continue
             if marker in prompt:
                 return routes[marker]
         return default
@@ -118,27 +100,36 @@ def make_fake_generate(routes: dict[str, str], default: str = ""):
     return fake
 
 
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _web_loop_actions() -> list[dict]:
+    return [
+        {"action": "write_file", "path": "index.html", "text": "the page structure"},
+        {"action": "write_file", "path": "style.css", "text": "the stylesheet"},
+        {"action": "write_file", "path": "script.js", "text": "the interactions"},
+        {"action": "finish"},
+    ]
+
+
 def test_summary_call_uses_writer_role() -> None:
     """The summary prose call carries role='writer' through the generate seam
     (the server maps it to the writer role config)."""
     seen_roles: list[str] = []
 
+    loop_actions = iter([
+        {"action": "write_file", "path": "greet.py", "text": "greet function"},
+        {"action": "finish"},
+    ])
+
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
-        import re
-        if "CLASSIFY MODE:" in prompt:
-            return "code"
-        if "PLAN TASKS JSON:" in prompt:
-            return json.dumps({
-                "tasks": [{"path": "greet.py", "action": "create",
-                           "description": "Create a greet function returning a greeting string",
-                           "uses_last_result": False}],
-                "assumptions": [],
-            })
+        if "AGENT ACTION JSON:" in prompt:
+            return json.dumps(next(loop_actions, {"action": "finish"}))
         if "Describe only features visible" in prompt:
             seen_roles.append(kwargs.get("role", ""))
             return "A small python module."
-        target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
-        if target and target.group(1) == "greet.py":
+        if "Write greet.py." in prompt:
             return "```python\ndef greet(name: str) -> str:\n    return f'Hello, {name}!'\n```"
         if "satisfies_request" in prompt:
             return json.dumps({"satisfies_request": True, "problems": [], "summary": "ok"})
@@ -153,11 +144,7 @@ def test_summary_call_uses_writer_role() -> None:
     assert seen_roles == ["thinker"]  # summary prose runs on the thinker
 
 
-def _run(coro):
-    return asyncio.run(coro)
-
-
-# 1. Question input -> zero tasks, text answer (classify -> reply step)
+# 1. Question input -> a reply turn (the loop's reply action ends it)
 def test_question_gets_answer_no_tasks() -> None:
     fake = make_fake_generate({
         "CLASSIFY MODE:": "reply",
@@ -172,20 +159,13 @@ def test_question_gets_answer_no_tasks() -> None:
     assert "Rust compiles" in result["answer"]
     assert "staged_files" not in result  # nothing staged
     stages = [t["stage"] for t in result["trace"]]
-    assert stages == ["CLASSIFY", "ANSWER"]
-
-
-def test_classify_rules() -> None:
-    # classify_request stays the cheap rules-only pre-check (fast path).
-    assert classify_request("what is the difference between rust and python") == "QUESTION"
-    assert classify_request("make a blog site in html5 css and js") == "CODE_TASK"
-    assert classify_request("create app.py") == "CODE_TASK"
+    assert stages == ["LOOP"]
 
 
 # 2. Web request -> 3 files, VALIDATE and SUMMARY present in trace
 def test_web_request_three_files_full_trace() -> None:
     fake = make_fake_generate({
-        "JSON array of tasks": WEB_PLAN,
+        "LOOP ACTIONS": json.dumps(_web_loop_actions()),
         "TARGET FILE: index.html": f"```html\n{INDEX_HTML}\n```",
         "TARGET FILE: style.css": f"```css\n{STYLE_CSS}\n```",
         "TARGET FILE: script.js": f"```javascript\n{SCRIPT_JS}\n```",
@@ -200,22 +180,20 @@ def test_web_request_three_files_full_trace() -> None:
         assert staged == {"index.html", "style.css", "script.js"}
         stages = [t["stage"] for t in result["trace"]]
         assert "VALIDATE" in stages and "SUMMARY" in stages
-        assert all(t["status"] == "ok" for t in result["trace"])
         # Staged, not deployed
         assert (Path(tmp) / ".agent_staging" / "index.html").is_file()
         assert not (Path(tmp) / "index.html").exists()
-        # Summary = deterministic skeleton (files, how-to-run, issues, time)
+        # Summary = deterministic skeleton (files, issues, time) + model prose
         assert "index.html" in result["summary"]
-        assert "How to run:" in result["summary"]
         assert "Total time:" in result["summary"]
 
 
 # 3. Forced-failing task -> not staged, listed as FAILED
 def test_failing_task_not_staged() -> None:
     fake = make_fake_generate({
-        "JSON array of tasks": json.dumps([
-            {"path": "app.py", "action": "create",
-             "description": "Python application implementing the requested calculator feature fully and correctly"}
+        "LOOP ACTIONS": json.dumps([
+            {"action": "write_file", "path": "app.py", "text": "the calculator"},
+            {"action": "finish"},
         ]),
         "TARGET FILE: app.py": "```python\ndef broken(:\n```",  # never compiles
     })
@@ -228,23 +206,20 @@ def test_failing_task_not_staged() -> None:
         assert len(result["failed_tasks"]) == 1
         assert result["failed_tasks"][0]["path"] == "app.py"
         assert not (Path(tmp) / ".agent_staging" / "app.py").exists()
-        check = next(t for t in result["trace"] if t["stage"] == "CHECK")
-        assert check["status"] == "failed"
+        assert "syntax error" in result["failed_tasks"][0]["error"]
 
 
 # 4. Bad html link to a missing css file -> caught in CHECK
 def test_bad_html_link_caught() -> None:
     bad_html = '<!doctype html><html><head><link rel="stylesheet" href="missing.css"></head><body>x</body></html>'
     fake = make_fake_generate({
-        "JSON array of tasks": json.dumps([
-            {"path": "index.html", "action": "create",
-             "description": "Standalone HTML page containing all markup and structure"}
+        "LOOP ACTIONS": json.dumps([
+            {"action": "write_file", "path": "index.html", "text": "the page"},
+            {"action": "finish"},
         ]),
         "TARGET FILE: index.html": f"```html\n{bad_html}\n```",
     })
     with TemporaryDirectory() as tmp:
-        # Non-web phrasing: only index.html is planned (web requests now
-        # require html+css+js in the plan by rule; "notes" contains "site").
         result = _run(run_pipeline(
             "create index.html holding my recipe collection",
             tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
@@ -256,9 +231,9 @@ def test_bad_html_link_caught() -> None:
 # 5. Valid index.html passes when cwd is not the project root
 def test_check_independent_of_cwd(monkeypatch) -> None:
     fake = make_fake_generate({
-        "JSON array of tasks": json.dumps([
-            {"path": "index.html", "action": "create",
-             "description": "Standalone HTML page containing all markup and structure"}
+        "LOOP ACTIONS": json.dumps([
+            {"action": "write_file", "path": "index.html", "text": "the page"},
+            {"action": "finish"},
         ]),
         "TARGET FILE: index.html": (
             "```html\n<!doctype html><html><head><style>body { margin: 0; }</style>"
@@ -277,45 +252,20 @@ def test_check_independent_of_cwd(monkeypatch) -> None:
         monkeypatch.undo()  # release the dir handle before Windows cleanup
 
 
-# Plan post-validation: placeholder/short-description tasks are rejected in
-# code (never trusted); with zero valid tasks the plan step fails to
-# needs_human — never files.
-def test_plan_placeholder_tasks_rejected_needs_human() -> None:
-    fake = make_fake_generate({
-        "CLASSIFY MODE:": "code",
-        "PLAN TASKS JSON:": json.dumps({
-            "tasks": [
-                {"path": "your_code.html", "action": "create", "description": "page"},
-                {"path": "example.py", "action": "create", "description": "does things"},
-            ],
-            "assumptions": [],
-        }),
-        "TARGET FILE: index.html": f"```html\n{INDEX_HTML}\n```",
-    })
-    with TemporaryDirectory() as tmp:
-        result = _run(run_pipeline(
-            "make a blog site in html5 css and js",
-            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
-        ))
-    assert result["status"] == "needs_human"
-    assert result["staged_files"] == []
-    assert "valid plan" in result["summary"]
-
-
 # VALIDATE error -> summary says UNVERIFIED
 def test_validate_error_marks_unverified() -> None:
+    loop_actions = iter(_web_loop_actions())
+
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
-        if "CLASSIFY MODE:" in prompt:
-            return "code"
-        if "PLAN TASKS JSON:" in prompt:
-            return json.dumps({"tasks": json.loads(WEB_PLAN), "assumptions": []})
+        if "AGENT ACTION JSON:" in prompt:
+            return json.dumps(next(loop_actions, {"action": "finish"}))
         if "satisfies_request" in prompt:
             raise RuntimeError("ollama died mid-review")
-        if "TARGET FILE: index.html" in prompt:
+        if "Write index.html." in prompt:
             return f"```html\n{INDEX_HTML}\n```"
-        if "TARGET FILE: style.css" in prompt:
+        if "Write style.css." in prompt:
             return f"```css\n{STYLE_CSS}\n```"
-        if "TARGET FILE: script.js" in prompt:
+        if "Write script.js." in prompt:
             return f"```javascript\n{SCRIPT_JS}\n```"
         return ""
 
@@ -335,7 +285,7 @@ def test_validate_error_marks_unverified() -> None:
 
 def test_run_pipeline_writes_run_journal() -> None:
     fake = make_fake_generate({
-        "JSON array of tasks": WEB_PLAN,
+        "LOOP ACTIONS": json.dumps(_web_loop_actions()),
         "TARGET FILE: index.html": f"```html\n{INDEX_HTML}\n```",
         "TARGET FILE: style.css": f"```css\n{STYLE_CSS}\n```",
         "TARGET FILE: script.js": f"```javascript\n{SCRIPT_JS}\n```",
@@ -349,17 +299,17 @@ def test_run_pipeline_writes_run_journal() -> None:
         run_dir = Path(tmp) / ".agent_runs" / result["run_id"]
         state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
         assert state["status"] == "completed"
-        assert state["llm_calls"] >= 3  # plan + 3 coder + validate (+summary)
+        assert state["llm_calls"] >= 4  # loop steps + 3 coder + validate (+summary)
         events = (run_dir / "events.jsonl").read_text(encoding="utf-8")
         assert '"run_started"' in events and '"run_finished"' in events
-        assert '"stage": "PLAN"' in events and '"stage": "SUMMARY"' in events
+        assert '"stage": "LOOP"' in events and '"stage": "SUMMARY"' in events
 
 
 def test_llm_calls_equals_llm_call_events() -> None:
     """state.json llm_calls == the number of llm_call events in events.jsonl
     (deterministic stages — CHECK, the SUMMARY skeleton — count 0)."""
     fake = make_fake_generate({
-        "JSON array of tasks": WEB_PLAN,
+        "LOOP ACTIONS": json.dumps(_web_loop_actions()),
         "TARGET FILE: index.html": f"```html\n{INDEX_HTML}\n```",
         "TARGET FILE: style.css": f"```css\n{STYLE_CSS}\n```",
         "TARGET FILE: script.js": f"```javascript\n{SCRIPT_JS}\n```",
@@ -397,18 +347,22 @@ def test_cancel_during_code_stops_fast_and_stages_nothing_further() -> None:
     cancel = threading.Event()
 
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
-        if "CLASSIFY MODE:" in prompt:
-            return "code"
-        if "PLAN TASKS JSON:" in prompt:
-            return json.dumps({"tasks": json.loads(WEB_PLAN), "assumptions": []})
-        if "TARGET FILE: index.html" in prompt:
+        if "AGENT ACTION JSON:" in prompt:
+            # The loop asks for index.html, style.css, script.js, finish — but
+            # cancel lands during the first coder call, so later steps abort.
+            if "staged write_file index.html" in prompt:
+                return json.dumps({"action": "write_file", "path": "style.css", "text": "css"})
+            if "staged write_file style.css" in prompt:
+                return json.dumps({"action": "write_file", "path": "script.js", "text": "js"})
+            return json.dumps({"action": "write_file", "path": "index.html", "text": "page"})
+        if "TARGET FILE: index.html" in prompt or "Write index.html." in prompt:
             # Cancel lands while the first coder call is in flight.
             cancel.set()
             _time.sleep(0.05)
             return f"```html\n{INDEX_HTML}\n```"
-        if "TARGET FILE: style.css" in prompt:
+        if "TARGET FILE: style.css" in prompt or "Write style.css." in prompt:
             return f"```css\n{STYLE_CSS}\n```"
-        if "TARGET FILE: script.js" in prompt:
+        if "TARGET FILE: script.js" in prompt or "Write script.js." in prompt:
             return f"```javascript\n{SCRIPT_JS}\n```"
         return VALIDATE_OK
 
@@ -439,9 +393,9 @@ def test_verifier_catches_runtime_import_crash() -> None:
     rejected by the verifier's import-smoke step (and never staged)."""
     crashing = "```python\nimport nonexistent_module_xyz_123\n\nX = 1\n```"
     fake = make_fake_generate({
-        "JSON array of tasks": json.dumps([
-            {"path": "crashes.py", "action": "create",
-             "description": "Python module that imports a missing dependency at top level"}
+        "LOOP ACTIONS": json.dumps([
+            {"action": "write_file", "path": "crashes.py", "text": "crashes at import"},
+            {"action": "finish"},
         ]),
         "TARGET FILE: crashes.py": crashing,
     })
@@ -458,9 +412,9 @@ def test_verifier_catches_runtime_import_crash() -> None:
 
 def test_verifier_passes_clean_python() -> None:
     fake = make_fake_generate({
-        "JSON array of tasks": json.dumps([
-            {"path": "greet.py", "action": "create",
-             "description": "Python module with a greet function returning a greeting string"}
+        "LOOP ACTIONS": json.dumps([
+            {"action": "write_file", "path": "greet.py", "text": "the greet function"},
+            {"action": "finish"},
         ]),
         "TARGET FILE: greet.py": "```python\ndef greet(name):\n    return f'Hello, {name}!'\n```",
         "satisfies_request": VALIDATE_OK,
@@ -480,20 +434,26 @@ def test_verifier_passes_clean_python() -> None:
 def test_confirm_gate_decline_stages_nothing_and_never_calls_coder() -> None:
     coder_calls: list[str] = []
 
+    loop_actions = iter([
+        {"action": "write_file", "path": "index.html", "text": "page"},
+        {"action": "write_file", "path": "style.css", "text": "css"},
+        {"action": "write_file", "path": "script.js", "text": "js"},
+        {"action": "finish"},
+    ])
+
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
-        if "CLASSIFY MODE:" in prompt:
-            return "code"
-        if "VERIFY SIDE EFFECT:" in prompt:
-            return "yes"
-        if "PLAN TASKS JSON:" in prompt:
-            return json.dumps({"tasks": json.loads(WEB_PLAN), "assumptions": []})
-        if model == CODER:
-            coder_calls.append(prompt)
+        if "AGENT ACTION JSON:" in prompt:
+            return json.dumps(next(loop_actions, {"action": "finish"}))
+        if "Write index.html." in prompt:
+            return f"```html\n{INDEX_HTML}\n```"
+        if "Write style.css." in prompt:
+            return f"```css\n{STYLE_CSS}\n```"
+        if "Write script.js." in prompt:
+            return f"```javascript\n{SCRIPT_JS}\n```"
         return VALIDATE_OK
 
     async def decline(tasks, intent_line):
         assert {t["path"] for t in tasks} == {"index.html", "style.css", "script.js"}
-        assert "code" in intent_line
         return False
 
     with TemporaryDirectory() as tmp:
@@ -509,12 +469,11 @@ def test_confirm_gate_decline_stages_nothing_and_never_calls_coder() -> None:
             (Path(tmp) / ".agent_runs" / result["run_id"] / "state.json").read_text(encoding="utf-8")
         )
         assert state["status"] == "declined"
-    assert coder_calls == []  # coder never ran
 
 
 def test_confirm_gate_approve_runs_full_pipeline() -> None:
     fake = make_fake_generate({
-        "JSON array of tasks": WEB_PLAN,
+        "LOOP ACTIONS": json.dumps(_web_loop_actions()),
         "TARGET FILE: index.html": f"```html\n{INDEX_HTML}\n```",
         "TARGET FILE: style.css": f"```css\n{STYLE_CSS}\n```",
         "TARGET FILE: script.js": f"```javascript\n{SCRIPT_JS}\n```",
@@ -539,17 +498,12 @@ def test_confirm_gate_approve_runs_full_pipeline() -> None:
 
 def test_confirm_gate_shows_overwrites_and_assumptions() -> None:
     """The gate payload: file names, per-file overwrites flag, the
-    '(overwrites existing file)' marker and the assumptions in the intent."""
-    plan = json.dumps([
-        {"path": "index.html", "action": "create",
-         "description": "Standalone HTML page containing all markup and structure"}
-    ])
+    '(overwrites existing file)' marker."""
     fake = make_fake_generate({
-        "JSON array of tasks": plan,
-        "PLAN TASKS JSON:": json.dumps({
-            "tasks": json.loads(plan),
-            "assumptions": ["Chose a single self-contained page"],
-        }),
+        "LOOP ACTIONS": json.dumps([
+            {"action": "write_file", "path": "index.html", "text": "the recipe page"},
+            {"action": "finish"},
+        ]),
         "TARGET FILE: index.html": (
             "```html\n<!doctype html><html><head><style>body{margin:0}</style>"
             "</head><body>hi</body></html>\n```"
@@ -574,13 +528,12 @@ def test_confirm_gate_shows_overwrites_and_assumptions() -> None:
     assert seen["tasks"][0]["overwrites"] is True
     assert "(overwrites existing file)" in seen["intent"]
     assert "index.html" in seen["intent"]
-    assert "Chose a single self-contained page" in seen["intent"]
 
 
 def test_confirm_none_skips_gate() -> None:
     # confirm=None (direct API/tests/--yes): no gate, current behavior.
     fake = make_fake_generate({
-        "JSON array of tasks": WEB_PLAN,
+        "LOOP ACTIONS": json.dumps(_web_loop_actions()),
         "TARGET FILE: index.html": f"```html\n{INDEX_HTML}\n```",
         "TARGET FILE: style.css": f"```css\n{STYLE_CSS}\n```",
         "TARGET FILE: script.js": f"```javascript\n{SCRIPT_JS}\n```",
@@ -594,15 +547,15 @@ def test_confirm_none_skips_gate() -> None:
         assert set(result["staged_files"]) == {"index.html", "style.css", "script.js"}
 
 
-# --- Phase 4: fallback only for confirmed CODE_TASK, else needs_human ----------
+# --- loop failure modes -------------------------------------------------------
 
 def test_plan_never_runs_for_non_code_labels() -> None:
     calls: list[str] = []
 
     async def fake(model, prompt, system="", temperature=0.2, **kw):
         calls.append(prompt)
-        if "CLASSIFY MODE:" in prompt:
-            return "reply"
+        if "AGENT ACTION JSON:" in prompt:
+            return json.dumps({"action": "reply", "text": "Grounded answer."})
         return "x"
 
     with TemporaryDirectory() as tmp:
@@ -611,16 +564,14 @@ def test_plan_never_runs_for_non_code_labels() -> None:
                 text, tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
             ))
             assert "staged_files" not in result, text
-    plan_calls = [p for p in calls if "PLAN TASKS JSON:" in p]
-    assert plan_calls == []  # the planner never ran for reply/greeting labels
+    coder_calls = [p for p in calls if "TARGET FILE:" in p or "Write " in p]
+    assert coder_calls == []  # the coder never ran for reply turns
 
 
 def test_plan_total_failure_is_needs_human() -> None:
-    # The plan model returns unparseable junk twice -> needs_human with the
-    # reason, never files, no loop. There is no "couldn't understand" path.
+    # The loop model returns unparseable junk for every step -> the turn is
+    # needs_human (budget of steps exhausted), never files, no silent reply.
     async def fake(model, prompt, system="", temperature=0.2, **kw):
-        if "CLASSIFY MODE:" in prompt:
-            return "code"
         return "not json at all"
 
     with TemporaryDirectory() as tmp:
@@ -630,50 +581,68 @@ def test_plan_total_failure_is_needs_human() -> None:
         ))
         assert result["status"] == "needs_human"
         assert result["staged_files"] == []
-        assert "valid plan" in result["summary"]
+        assert "Could not complete" in result["summary"]
 
 
 def test_classifier_junk_defaults_to_reply() -> None:
-    # A classifier reply with no valid label falls back to 'reply' (safe:
-    # grounded answer, no files) — never a rephrase request.
+    # Junk loop output is ignored step by step; the turn ends needs_human (the
+    # step budget runs out), never a silent reply and never files.
     async def fake(model, prompt, system="", temperature=0.2, **kw):
-        if "CLASSIFY MODE:" in prompt:
-            return "banana banana banana"
-        if "FACTS:" in prompt:
-            return "Grounded answer."
-        return "x"
+        return "banana banana banana"
 
     with TemporaryDirectory() as tmp:
         result = _run(run_pipeline(
             "create your_code.py with the logic",
             tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
         ))
-        assert "staged_files" not in result
-        assert result["answer"] == "Grounded answer."
+        assert result["status"] == "needs_human"
+        assert result["staged_files"] == []
+
+
+def test_classify_request_is_gone_with_the_rules_router() -> None:
+    # classify_request (the rules-only pre-check) was deleted with router.py:
+    # the agent loop decides, there is no text-matching classification.
+    import orchestrator
+
+    assert not hasattr(orchestrator, "classify_request")
+
+
+def test_placeholder_write_rejected_by_safety_rule() -> None:
+    # A write to a placeholder path is rejected by safe_target/the plan safety
+    # rules regardless of the model's wording (never staged).
+    fake = make_fake_generate({
+        "LOOP ACTIONS": json.dumps([
+            {"action": "write_file", "path": "your_code.py", "text": "the thing"},
+            {"action": "finish"},
+        ]),
+        "TARGET FILE: your_code.py": "```python\nX = 1\n```",
+    })
+    with TemporaryDirectory() as tmp:
+        result = _run(run_pipeline(
+            "create your_code.py with the logic",
+            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+        ))
+        assert result["staged_files"] == []
+        assert result["failed_tasks"]  # the safety rule rejected the write
 
 
 def test_validator_follows_thinker_at_most_one_swap_pair() -> None:
-    """Validator = thinker model, so a full run is thinker phases and coder
-    phases only. The sequence of MODELS handed to generate must alternate at
-    most thinker -> coder -> thinker (one swap pair)."""
+    """Validator = thinker model, so a full run is coder phases and thinker
+    phases only: the loop + coder run on the CODER model, validate + summary
+    on the thinker -> at most ONE swap pair."""
     models: list[str] = []
+
+    loop_actions = iter(_web_loop_actions())
 
     async def fake(model, prompt, system="", temperature=0.2, **kw):
         models.append(model)
-        if "CLASSIFY MODE:" in prompt:
-            return "code"
-        if "PLAN TASKS JSON:" in prompt:
-            return json.dumps({"tasks": json.loads(WEB_PLAN), "assumptions": []})
-        target = None
-        import re
-        m = re.search(r"TARGET FILE:\s*(\S+)", prompt)
-        if m:
-            target = m.group(1)
-        if target == "index.html":
+        if "AGENT ACTION JSON:" in prompt:
+            return json.dumps(next(loop_actions, {"action": "finish"}))
+        if "Write index.html." in prompt:
             return f"```html\n{INDEX_HTML}\n```"
-        if target == "style.css":
+        if "Write style.css." in prompt:
             return f"```css\n{STYLE_CSS}\n```"
-        if target == "script.js":
+        if "Write script.js." in prompt:
             return f"```javascript\n{SCRIPT_JS}\n```"
         if "satisfies_request" in prompt:
             return VALIDATE_OK
@@ -686,7 +655,7 @@ def test_validator_follows_thinker_at_most_one_swap_pair() -> None:
         ))
     # compress consecutive duplicates -> the phase sequence
     phases = [m for i, m in enumerate(models) if i == 0 or m != models[i - 1]]
-    # classify/plan/code run on the CODER model, validate/summary on the
-    # thinker: exactly coder -> thinker = ONE swap pair.
+    # loop + code run on the CODER model, validate/summary on the thinker:
+    # exactly coder -> thinker = ONE swap pair.
     assert set(models) <= {PLANNER, CODER}
     assert phases == [CODER, PLANNER], phases

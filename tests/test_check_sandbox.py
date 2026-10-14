@@ -65,26 +65,36 @@ def test_checker_crash_is_infra_error() -> None:
 
 
 def test_infra_error_aborts_without_retry() -> None:
-    """Pipeline level: infra error -> task FAILED with 'infrastructure', the
-    coder is NOT retried, and no file is staged."""
+    """Pipeline level (agent loop): a checker CRASH is an infra error — it
+    aborts the turn (re-raised for the server's structured error envelope),
+    the coder is NOT retried, and no file is staged."""
     import asyncio
+    import json
 
     from orchestrator import run_pipeline
-    from tests.test_run_pipeline import CODER, PLANNER, make_fake_generate
 
-    plan = '[{"path": "app.py", "action": "create", "description": "Python application implementing the requested calculator feature fully and correctly"}]'
-    fake = make_fake_generate({
-        "JSON array of tasks": plan,
-        "TARGET FILE: app.py": "```python\nX = 1\n```",
-    })
+    write_calls: list[str] = []
+
+    async def fake(model, prompt, system="", temperature=0.2, **kwargs):
+        if "AGENT ACTION JSON:" in prompt:
+            return json.dumps({"action": "write_file", "path": "app.py",
+                               "text": "the calculator"})
+        if "Write app.py." in prompt:
+            write_calls.append(prompt)
+            return "```python\nX = 1\n```"
+        return ""
+
     with TemporaryDirectory() as tmp:
         with patch("filetypes.compile", side_effect=RuntimeError("boom")):
-            result = asyncio.run(run_pipeline(
-                "create app.py with a calculator",
-                tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
-            ))
-        assert result["staged_files"] == []
-        assert len(result["failed_tasks"]) == 1
-        assert "infrastructure" in result["failed_tasks"][0]["error"].lower()
-        check = next(t for t in result["trace"] if t["stage"] == "CHECK")
-        assert check["status"] == "failed"
+            with pytest.raises(RuntimeError, match="boom"):
+                asyncio.run(run_pipeline(
+                    "create app.py with a calculator",
+                    tmp, generate=fake, planner_model="P", coder_model="C",
+                ))
+        # the crash aborted the turn: exactly one coder call, nothing staged
+        assert len(write_calls) == 1
+        assert not (Path(tmp) / ".agent_staging" / "app.py").exists()
+        # the turn still lands in history with the error stage
+        import history as _history
+        entries, _ = _history.read_history(tmp)
+        assert entries[-1]["outcome"] == "error"

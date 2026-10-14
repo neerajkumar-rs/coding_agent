@@ -104,14 +104,15 @@ def _fake_ok(model, prompt, system="", temperature=0.2, **kw):
 
 
 @pytest.mark.parametrize("text,expected_path", [
-    ("hello", "fast-path"),
-    ("/save", "fast-path"),
+    ("hello", "reply"),       # greetings go through the loop (one reply step)
+    ("/save", "fast-path"),   # only slash commands stay a zero-model fast path
 ])
 def test_fast_paths_write_history(tmp_path: Path, text: str, expected_path: str) -> None:
     from orchestrator import run_pipeline
 
     async def fake(model, prompt, **kw):
-        return ""
+        # the loop's reply step: one model call for a greeting
+        return json.dumps({"action": "reply", "text": "Hello! What are we building?"})
 
     _run(run_pipeline(text, tmp_path, generate=fake, planner_model="P", coder_model="C"))
     entries, _ = history_mod.read_history(tmp_path)
@@ -127,19 +128,15 @@ def test_reply_turn_writes_history(tmp_path: Path) -> None:
     from orchestrator import run_pipeline
 
     async def fake(model, prompt, system="", temperature=0.2, **kw):
-        if "CLASSIFY MODE:" in prompt:
-            return "reply"
-        if "FACTS:" in prompt:
-            return "Grounded answer."
+        if "AGENT ACTION JSON:" in prompt:
+            return json.dumps({"action": "reply", "text": "Grounded answer."})
         return ""
 
-    # A question (not a listing ask): the model answers from the FACTS block.
-    # (A listing ask on an empty workspace now gets a deterministic sentence.)
+    # A question: the loop answers with one reply step.
     _run(run_pipeline("what is a closure", tmp_path, generate=fake,
                       planner_model="P", coder_model="C"))
     entries, _ = history_mod.read_history(tmp_path)
     assert entries[-1]["path"] == "reply"
-    assert entries[-1]["label"] == "reply"
     assert entries[-1]["outcome"] == "ok"
     assert entries[-1]["answer_preview"] == "Grounded answer."
 
@@ -374,12 +371,13 @@ def test_export_contains_prompts_and_raw_responses(tmp_path: Path) -> None:
     """A turn with a run folder carrying calls/<n>.json: the report shows the
     prompt and the RAW response (think separate) in fenced blocks."""
     from orchestrator import run_pipeline
-    from tests.test_run_pipeline import make_fake_generate
 
-    fake = make_fake_generate({
-        "CLASSIFY MODE:": "reply",
-        "REPLY:": "<think>checking the table</think>The workspace has one file.",
-    })
+    async def fake(model, prompt, system="", temperature=0.2, **kw):
+        if "AGENT ACTION JSON:" in prompt:
+            return json.dumps({"action": "reply",
+                               "text": "<think>checking the table</think>The workspace has one file."})
+        return ""
+
     _run(run_pipeline("what is a closure", tmp_path, generate=fake,
                       planner_model="P", coder_model="C"))
     result = export_mod.do_export(tmp_path, "last")
@@ -396,12 +394,12 @@ def test_export_pre_turn_snapshot(tmp_path: Path) -> None:
     turn (taken before it) — turn 2's snapshot must NOT contain turn 2's own
     result."""
     from orchestrator import run_pipeline
-    from tests.test_run_pipeline import make_fake_generate
 
-    fake = make_fake_generate({
-        "CLASSIFY MODE:": "reply",
-        "REPLY:": "Grounded answer.",
-    })
+    async def fake(model, prompt, system="", temperature=0.2, **kw):
+        if "AGENT ACTION JSON:" in prompt:
+            return json.dumps({"action": "reply", "text": "Grounded answer."})
+        return ""
+
     _run(run_pipeline("what is a closure", tmp_path, generate=fake,
                       planner_model="P", coder_model="C"))
     _run(run_pipeline("what is a decorator", tmp_path, generate=fake,

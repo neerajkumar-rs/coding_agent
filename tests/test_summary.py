@@ -41,7 +41,8 @@ def test_summary_skeleton_contents() -> None:
         ))
     summary = result["summary"]
     assert "**Built:**" in summary and "`greet.py`" in summary
-    assert "**How to run:** run: `python greet.py`" in summary
+    # How-to-run is model-written (from the files); with the prose call
+    # stubbed empty, the skeleton carries facts only (never a hardcoded line).
     assert "**Known issues:** none" in summary
     assert "**Total time:**" in summary
 
@@ -60,7 +61,9 @@ def test_summary_prose_included_when_clean() -> None:
     assert "**Built:**" in result["summary"] and "`greet.py`" in result["summary"]
 
 
-def test_summary_prose_dropped_when_inventing_features() -> None:
+def test_summary_prose_included_as_written_by_the_model() -> None:
+    """The summary prose is the MODEL's words from the files it wrote (the old
+    feature-keyword text guard is deleted with the rules layer)."""
     routes = _base_routes(**{
         "Describe only features visible": "This app has dark mode, a login page, and a full-text search."
     })
@@ -70,21 +73,23 @@ def test_summary_prose_dropped_when_inventing_features() -> None:
             "create greet.py with a greet function",
             tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
         ))
-    # Invented keywords absent from the code -> prose dropped entirely
-    assert "dark mode" not in result["summary"]
-    assert "login" not in result["summary"]
+    # the model's prose is included as written (no Python keyword filter)
+    assert "dark mode" in result["summary"]
     assert "**Built:**" in result["summary"] and "`greet.py`" in result["summary"]
 
 
 def test_summary_falls_back_to_skeleton_when_model_fails() -> None:
+    loop_actions = iter([
+        {"action": "write_file", "path": "greet.py", "text": "the greet function"},
+        {"action": "finish"},
+    ])
+
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
-        if "CLASSIFY MODE:" in prompt:
-            return "code"
-        if "PLAN TASKS JSON:" in prompt:
-            return json.dumps({"tasks": json.loads(ONE_FILE_PLAN), "assumptions": []})
+        if "AGENT ACTION JSON:" in prompt:
+            return json.dumps(next(loop_actions, {"action": "finish"}))
         if "Describe only features visible" in prompt:
             raise RuntimeError("model unavailable")
-        if "TARGET FILE: greet.py" in prompt:
+        if "TARGET FILE: greet.py" in prompt or "Write greet.py." in prompt:
             return GREET_CODE
         return VALIDATE_OK
 
@@ -123,14 +128,17 @@ def test_summary_lists_failed_tasks_with_reasons() -> None:
 
 
 def test_unverified_summary_when_validate_errors() -> None:
+    loop_actions = iter([
+        {"action": "write_file", "path": "greet.py", "text": "the greet function"},
+        {"action": "finish"},
+    ])
+
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
-        if "CLASSIFY MODE:" in prompt:
-            return "code"
-        if "PLAN TASKS JSON:" in prompt:
-            return json.dumps({"tasks": json.loads(ONE_FILE_PLAN), "assumptions": []})
+        if "AGENT ACTION JSON:" in prompt:
+            return json.dumps(next(loop_actions, {"action": "finish"}))
         if "satisfies_request" in prompt:
             raise RuntimeError("ollama died mid-review")
-        if "TARGET FILE: greet.py" in prompt:
+        if "TARGET FILE: greet.py" in prompt or "Write greet.py." in prompt:
             return GREET_CODE
         if "Describe only features visible" in prompt:
             return ""
@@ -164,15 +172,18 @@ def test_unverified_summary_when_validate_errors() -> None:
 def test_unverified_summary_names_the_pull_fix_for_missing_model() -> None:
     """ModelNotInstalled detail carries 'ollama pull <name>' — the summary
     surfaces it as the fix."""
+    loop_actions = iter([
+        {"action": "write_file", "path": "greet.py", "text": "the greet function"},
+        {"action": "finish"},
+    ])
+
     async def fake(model, prompt, system="", temperature=0.2, **kwargs):
-        if "CLASSIFY MODE:" in prompt:
-            return "code"
-        if "PLAN TASKS JSON:" in prompt:
-            return json.dumps({"tasks": json.loads(ONE_FILE_PLAN), "assumptions": []})
+        if "AGENT ACTION JSON:" in prompt:
+            return json.dumps(next(loop_actions, {"action": "finish"}))
         if "satisfies_request" in prompt:
             raise RuntimeError(
                 "model not installed: 'qwen2.5-coder:7b'. Run: ollama pull qwen2.5-coder:7b")
-        if "TARGET FILE: greet.py" in prompt:
+        if "TARGET FILE: greet.py" in prompt or "Write greet.py." in prompt:
             return GREET_CODE
         return ""
 

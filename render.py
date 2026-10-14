@@ -115,16 +115,22 @@ def resolve_preview_target(workspace: str | Path, rel: str) -> tuple[Path, str]:
 
 
 def _latest_staged(workspace: str | Path) -> str | None:
-    """The most recently staged file (mtime), or None."""
+    """The most recently staged file, or None.
+
+    Keyed by mtime in nanoseconds; ties (coarse Windows mtime ticks) break
+    toward the file that comes LATER in the manager's sorted listing."""
     from workspace_staging import WorkspaceStagingManager
 
     ws = Path(workspace).resolve()
-    files = WorkspaceStagingManager(ws).list_staged_files()
+    mgr = WorkspaceStagingManager(ws)
+    files = mgr.list_staged_files()
     if not files:
         return None
-    staging = WorkspaceStagingManager(ws).staging_dir
     try:
-        return max(files, key=lambda f: (staging / f).stat().st_mtime)
+        return max(
+            files,
+            key=lambda f: ((mgr.staging_dir / f).stat().st_mtime_ns, f),
+        )
     except OSError:
         return files[-1]
 

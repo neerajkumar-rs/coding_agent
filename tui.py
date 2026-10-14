@@ -59,7 +59,7 @@ def _set_fastapi_port(port: int) -> None:
     """Repoint every FastAPI URL at *port* (busy-port fallback)."""
     global FASTAPI_PORT, FASTAPI_BASE, HEALTH_URL
     global STATUS_URL, DEPLOY_URL, INIT_URL, RUN_URL, CANCEL_URL, EVENTS_URL
-    global ROUTER_URL, PENDING_CONFIRM_URL, CONFIRM_URL, CONFIG_URL, ROLE_URL, MODELS_URL
+    global PENDING_CONFIRM_URL, CONFIRM_URL, CONFIG_URL, ROLE_URL, MODELS_URL
     FASTAPI_PORT = port
     FASTAPI_BASE = f"http://{FASTAPI_HOST}:{port}"
     HEALTH_URL = FASTAPI_BASE + "/health"
@@ -69,7 +69,6 @@ def _set_fastapi_port(port: int) -> None:
     RUN_URL = FASTAPI_BASE + "/agent/run"
     CANCEL_URL = FASTAPI_BASE + "/agent/cancel"
     EVENTS_URL = FASTAPI_BASE + "/agent/events"
-    ROUTER_URL = FASTAPI_BASE + "/router/classify"
     PENDING_CONFIRM_URL = FASTAPI_BASE + "/agent/pending_confirm"
     CONFIRM_URL = FASTAPI_BASE + "/agent/confirm"
     CONFIG_URL = FASTAPI_BASE + "/config"
@@ -942,7 +941,6 @@ def show_help() -> None:
             "/save        save staged files into the workspace (/deploy alias)\n"
             "/preview <file> [raw]  preview a staged/workspace file (md renders, code highlighted)\n"
             "/cancel      cancel the in-progress run for this workspace\n"
-            "/router <t>  show how a message would be routed (tier, scores, intent)\n"
             "/logs [role|events] [N]  tail the latest run's logs (default 60 lines)\n"
             "/setup       machine calibration (writes calibration.json; asks y/N)\n"
             "/models      list installed Ollama models\n"
@@ -1169,50 +1167,8 @@ def format_run_logs_text(workspace: str | Path, channel: str = "", lines: int = 
     return format_run_logs(tail_run_logs(workspace, channel, lines, run_id=run_id))
 
 
-def format_router_diagnosis(diag: dict, t2_note: str | None = None) -> str:
-    """`/router` output: tier, matched verb/deliverable, scores, T2 info."""
-    lines = [f"router: {diag.get('text', '')!r}"]
-    tier = diag.get("tier", "?")
-    lines.append(f"  tier: {tier}   intent: {diag.get('intent', '?')}   "
-                 f"confidence: {diag.get('confidence', 0.0):.2f}")
-    verb, deliv = diag.get("matched_verb"), diag.get("matched_deliverable")
-    if verb or deliv:
-        lines.append(f"  verb: {verb or '—'}   deliverable: {deliv or '—'}")
-    scores = diag.get("scores") or {}
-    if scores:
-        parts = "  ".join(f"{k} {v:+.0f}" for k, v in scores.items()
-                          if k != "total" and v)
-        lines.append(f"  score: {scores.get('total', 0):+.0f}   [{parts}]")
-    if diag.get("t2_ran"):
-        lines.append(f"  T2 ran. raw classifier JSON: {diag.get('t2_raw', '')[:300]!r}")
-    elif t2_note:
-        lines.append(f"  T2: {t2_note}")
-    else:
-        lines.append("  T2: not needed (decided by rules)")
-    if diag.get("clarifying_question"):
-        lines.append(f"  clarify: {diag['clarifying_question']}")
-    return "\n".join(lines)
-
-
-async def run_router_slash(arg_text: str, workspace_dir: str) -> None:
-    """/router <text> — classify with full diagnostics. T0/T1 work with no
-    Ollama running; the T2 grey zone goes through the server's gateway."""
-    from router import diagnose as local_diagnose
-
-    if not arg_text.strip():
-        console.print("[dim]Usage: /router <text>[/dim]")
-        return
-    try:
-        diag = await post_json(ROUTER_URL, {"text": arg_text, "workspace_dir": workspace_dir})
-        console.print(format_router_diagnosis(diag))
-    except Exception as exc:
-        # Server/Ollama unreachable: rules-only locally, T2 marked skipped.
-        try:
-            diag = await local_diagnose(arg_text)
-            console.print(format_router_diagnosis(
-                diag, t2_note=f"skipped: {type(exc).__name__} (server/Ollama unreachable)"))
-        except Exception as exc2:
-            console.print(f"[red]/router failed: {exc2}[/red]")
+# /router is deleted with the rules router: the agent loop decides; there is
+# no text-matching classification to inspect anymore.
 
 
 async def _save_staged(workspace_dir: str) -> None:
@@ -1676,9 +1632,6 @@ async def main() -> None:
             elif command.startswith("/benchmark"):
                 arg_string = text.strip()[len("/benchmark"):].strip()
                 await run_benchmark_slash(arg_string, workspace)
-
-            elif command.startswith("/router"):
-                await run_router_slash(text.strip()[len("/router"):].strip(), workspace)
 
             elif command.startswith("/history"):
                 import history as _history

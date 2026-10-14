@@ -35,10 +35,8 @@ DEFAULT_OLLAMA = "http://localhost:11434"
 EXIT_OK = 0
 EXIT_OLLAMA_UNREACHABLE = 2
 
-# The held-back classify HOLDOUT set (tests/classify_holdout.jsonl). Bench
-# reads it for the classifier A/B (accuracy first, latency second); the
-# prompt examples never contain these phrases.
-EVAL_PATH = Path(__file__).parent / "tests" / "classify_holdout.jsonl"
+# (The classify A/B lived here; it measured the classify/verify calls that
+# Phase B removed. Deleted with them.)
 
 
 # --- role probes: prompt + deterministic quality checks ----------------------
@@ -306,24 +304,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--coexist", action="store_true", help="test model coexistence")
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA)
-    parser.add_argument(
-        "--classify-ab", action="store_true",
-        help="A/B the coder vs thinker as the classifier over "
-             "tests/classify_holdout.jsonl, each with and without the retired "
-             "'Last turn' prompt line (label accuracy after the verify pass, "
-             "false-code rate, downgrade count, p50/p95 classify latency)",
-    )
     return parser
 
 
-# ---------------------------------------------------------------------------
-# Classifier A/B (Section 6): which model owns the understand role
-# ---------------------------------------------------------------------------
-
-_SHELL_HINT_RE = re.compile(
-    r"\b(?:ls|dir|find|grep|cat|head|tail|du|stat|tree|fd)\b\s+[-~\w.]",
-    re.IGNORECASE,
-)
+# The classify A/B measured the deleted classify/verify calls (Phase B removed
+# them). The agent loop replaced them; the loop's behavior is exercised live
+# by the acceptance flow, not by a label benchmark.
 
 
 def _pctl(values: list[float], pct: float) -> float:
@@ -332,192 +318,6 @@ def _pctl(values: list[float], pct: float) -> float:
     ordered = sorted(values)
     idx = min(len(ordered) - 1, int(round((pct / 100.0) * (len(ordered) - 1))))
     return round(ordered[idx], 3)
-
-
-# The retired "Last turn" line content for the A/B arm: the bias measured here
-# is exactly what a previous result ("Built: index.html") did to the label.
-_LEGACY_LAST_TURN = "make a page -> code (Built: index.html)"
-
-
-async def _classify_ab_model(
-    gateway: Any, model: str, eval_lines: list[dict[str, Any]], ollama_url: str,
-    *, last_turn: str = "",
-) -> dict[str, Any]:
-    """Run classify (+ verify pass) over the eval set with `model` pinned as
-    the understand role. ``last_turn`` non-empty = the legacy prompt arm.
-
-    Metrics: label accuracy AFTER the verify pass, false-`code` rate on reply
-    lines, verify-pass downgrade count, classify p50/p95 latency, and
-    shell-command leakage on reply lines."""
-    from understand import (
-        PlanFailed,
-        build_facts_block,
-        classify_mode,
-        plan_tasks,
-        reply_step,
-        verify_side_effect,
-    )
-
-    gateway.config = _BenchConfig(gateway.config, "understand", model)
-
-    async def _gen(m, prompt, system="", temperature=0.0, **kwargs):
-        return await gateway.generate(
-            "understand", prompt, system=system, temperature=temperature,
-            num_predict=kwargs.get("num_predict", 700),
-            _format_schema=kwargs.get("_format_schema"),
-        )
-
-    facts_block = build_facts_block({"files": [], "flags": {}})
-    correct = 0
-    total = 0
-    false_code = 0       # expected reply, final label code|both (after verify)
-    overcreate = 0       # expected files_created=0 but the PLAN step still named files
-    downgrades = 0       # verify pass flipped code|both -> reply
-    latencies: list[float] = []   # classify call latency only
-    shell_leaks = 0
-    reply_lines = 0
-    errors: list[str] = []
-    for entry in eval_lines:
-        if entry["expected"] == "fast":
-            continue  # fast paths never touch a model — nothing to measure
-        total += 1
-        t0 = time.monotonic()
-        try:
-            label = await classify_mode(
-                entry["text"], generate=_gen, file_names=[], last_turn=last_turn,
-            )
-        except Exception as exc:
-            # A model that cannot classify at this budget (e.g. a reasoning
-            # model truncated at num_predict<=12) records the line as wrong
-            # and the error — the A/B report shows it, never crashes.
-            latencies.append(time.monotonic() - t0)
-            errors.append(f"{entry['text'][:40]}: {str(exc)[:120]}")
-            continue
-        latencies.append(time.monotonic() - t0)
-        if label in ("code", "both"):
-            try:
-                if not await verify_side_effect(entry["text"], generate=_gen):
-                    label = "reply"
-                    downgrades += 1
-            except Exception as exc:
-                errors.append(f"verify {entry['text'][:40]}: {str(exc)[:120]}")
-        if label in ("code", "both"):
-            # The real harm metric: does the PLAN step still produce files for
-            # a line that should create none? Runs with the SAME validators the
-            # pipeline uses (per-task rules + invented-file rejection), so the
-            # safety net behind a wrong label is measured too.
-            from orchestrator import _valid_plan_task, invented_file_rejection
-            try:
-                plan = await plan_tasks(
-                    entry["text"], generate=_gen, file_names=[],
-                    task_validator=_valid_plan_task,
-                    plan_validator=lambda tasks, msg: invented_file_rejection(tasks, msg),
-                )
-                planned = len(plan.tasks)
-            except PlanFailed:
-                planned = 0
-            except Exception as exc:
-                planned = 0
-                errors.append(f"plan {entry['text'][:40]}: {str(exc)[:120]}")
-            if planned and not entry.get("files_created"):
-                overcreate += 1
-                errors.append(f"OVERCREATE {entry['text'][:50]}: {planned} file(s)")
-        if label == entry["expected"]:
-            correct += 1
-        elif entry["expected"] == "reply" and label in ("code", "both"):
-            false_code += 1
-        if label == "reply":
-            reply_lines += 1
-            try:
-                answer = await reply_step(entry["text"], generate=_gen, facts_block=facts_block)
-            except Exception as exc:
-                errors.append(f"reply {entry['text'][:40]}: {str(exc)[:120]}")
-                continue
-            if _SHELL_HINT_RE.search(answer):
-                shell_leaks += 1
-    accuracy = round(100.0 * correct / total, 1) if total else 0.0
-    return {
-        "model": model,
-        "arm": "legacy-last-turn" if last_turn else "clean",
-        "accuracy": accuracy,
-        "correct": correct,
-        "total": total,
-        "false_code": false_code,
-        "overcreate": overcreate,
-        "verify_downgrades": downgrades,
-        "p50": _pctl(latencies, 50),
-        "p95": _pctl(latencies, 95),
-        "reply_lines": reply_lines,
-        "shell_leaks": shell_leaks,
-        "errors": errors[:10],
-    }
-
-
-async def _classify_ab(config: AgentConfig, ollama_url: str, installed: list[str]) -> dict[str, Any]:
-    """A/B: coder vs thinker as the classifier, each with and without the
-    retired "Last turn" prompt line (4 arms), over tests/classify_holdout.jsonl
-    with the verify pass active. Picks roles.understand.model by accuracy
-    first, latency second, CLEAN arms only.
-    Gate: >=95% accuracy after verify, 0 false-`code` on reply lines,
-    classify p95 < 1.5 s (model resident)."""
-    from ollama_client import AgentGateway, OllamaSupervisorClient
-
-    if not EVAL_PATH.exists():
-        return {"error": f"eval set missing: {EVAL_PATH}"}
-    eval_lines = [
-        json.loads(raw) for raw in EVAL_PATH.read_text(encoding="utf-8").splitlines()
-        if raw.strip()
-    ]
-    candidates = {
-        "coder": str(config.get_role_config("coder")["model"]),
-        "thinker": str(config.get_role_config("thinker")["model"]),
-    }
-    supervisor = OllamaSupervisorClient(base_url=ollama_url)
-    gateway = AgentGateway(supervisor, config)
-    rows: dict[str, Any] = {}
-    for label, model in candidates.items():
-        if model not in installed:
-            rows[label] = {"model": model, "error": f"missing -- ollama pull {model}"}
-            print(f"SKIP classify/{label}: missing model {model} -- ollama pull {model}")
-            continue
-        for arm_name, last_turn in (("clean", ""), ("legacy", _LEGACY_LAST_TURN)):
-            key = f"{label}/{arm_name}"
-            print(f"classify A/B: {key} = {model} ...")
-            rows[key] = await _classify_ab_model(
-                gateway, model, eval_lines, ollama_url, last_turn=last_turn,
-            )
-            r = rows[key]
-            print(
-                f"  {key}: acc={r['accuracy']}% false_code={r['false_code']} "
-                f"overcreate={r['overcreate']} downgrades={r['verify_downgrades']} "
-                f"p50={r['p50']}s p95={r['p95']}s "
-                f"shell_leaks={r['shell_leaks']}/{r['reply_lines']}"
-            )
-        await gateway.unload(model)
-    gateway.config = config  # restore
-
-    # Winner among CLEAN arms, by accuracy first, latency second.
-    clean = {k: v for k, v in rows.items()
-             if k.endswith("/clean") and "accuracy" in v}
-    winner = None
-    if clean:
-        winner = max(clean, key=lambda k: (clean[k]["accuracy"], -clean[k]["p95"]))
-    result: dict[str, Any] = {"rows": rows, "winner": winner}
-    if winner:
-        w = clean[winner]
-        gate_ok = (
-            w["accuracy"] >= 95.0
-            and w["overcreate"] == 0
-            and w["p95"] < 1.5
-        )
-        result["gate_ok"] = gate_ok
-        result["recommendation"] = (
-            f"roles.understand.model = {clean[winner]['model']}"
-            if gate_ok else
-            f"no model passes the gate (clean winner {winner} misses: "
-            f"acc={w['accuracy']}% overcreate={w['overcreate']} p95={w['p95']}s)"
-        )
-    return result
 
 
 def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
@@ -612,25 +412,11 @@ def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
                 await gateway.unload(model)
         gateway.config = config  # restore
 
-    classify_ab_result: dict[str, Any] | None = None
-
     try:
         asyncio.run(_bench_all())
     except Exception as exc:  # gateway/transport failure mid-bench
         report.errors.append(str(exc)[:300])
         print(f"ERROR: bench aborted: {exc}")
-
-    if args.classify_ab:
-        import asyncio as _asyncio
-
-        try:
-            classify_ab_result = _asyncio.run(_classify_ab(config, args.ollama_url, installed))
-            report.classify_ab = classify_ab_result
-            if classify_ab_result.get("recommendation"):
-                print(f"\nClassifier A/B: {classify_ab_result['recommendation']}")
-        except Exception as exc:
-            report.errors.append(f"classify-ab: {str(exc)[:300]}")
-            print(f"ERROR: classify A/B failed: {exc}")
 
     # Best per role = highest score among ok results; every probed role is
     # listed ("none passed" instead of omitting a role whose probes failed).

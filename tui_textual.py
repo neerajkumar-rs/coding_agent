@@ -382,7 +382,7 @@ class OllamaAgentApp(App):
             self.exit()
         elif command == "/help":
             self._write(f"[{DIM}]/run · /benchmark · /save · /preview <file> [raw] · /status · /workspace · "
-                        f"/cancel · /router <text> · /models · /logs [role|events] [N] · /clear · /quit[/]\n")
+                        f"/cancel · /history [N|<id>|search <text>] · /retry <id> · /export [target] [--zip] [--fixture] · /models · /logs [role|events] [N] · /clear · /quit[/]\n")
         elif command == "/clear":
             self.query_one("#chat", RichLog).clear()
         elif command in {"/save", "/deploy"}:
@@ -441,8 +441,7 @@ class OllamaAgentApp(App):
             # Local render only: no model call, no GPU, safe during a run.
             self._write(render.preview_command(
                 self.workspace, text.strip()[len("/preview"):].strip()))
-        elif command.startswith("/router"):
-            self._router_work(text.strip()[len("/router"):].strip())
+
         elif command == "/roles":
             self._roles_work()
         elif command.startswith("/model"):
@@ -477,30 +476,6 @@ class OllamaAgentApp(App):
             self.call_from_thread(self._pipeline_error, str(exc))
             return
         self.call_from_thread(self._pipeline_done, result)
-
-    @work(thread=True)
-    def _router_work(self, arg_text: str) -> None:
-        if not arg_text:
-            self.call_from_thread(self._write, f"[{DIM}]Usage: /router <text>[/]")
-            return
-        try:
-            diag = _post_json_sync(tui.ROUTER_URL,
-                                   {"text": arg_text, "workspace_dir": self.workspace})
-            self.call_from_thread(self._write, f"[{DIM}]" + tui.format_router_diagnosis(diag) + "[/]")
-            return
-        except Exception as exc:
-            err = exc
-        try:
-            from router import diagnose as local_diagnose
-
-            diag = asyncio.run(local_diagnose(arg_text))
-            note = f"skipped: {type(err).__name__} (server/Ollama unreachable)"
-            self.call_from_thread(
-                self._write,
-                f"[{DIM}]" + tui.format_router_diagnosis(diag, t2_note=note) + "[/]",
-            )
-        except Exception as exc2:
-            self.call_from_thread(self._write, f"[{RED}]/router failed: {exc2}[/]")
 
     # ------------------------------------------------------- plan confirm gate
 

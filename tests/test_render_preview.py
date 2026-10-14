@@ -102,7 +102,6 @@ def test_summary_skeleton_markdown() -> None:
     )
     assert "**Built:**" in text
     assert "- `readme.md`" in text
-    assert "**How to run:**" in text
     assert "**Known issues:** none" in text
     assert "**Total time:** 1.5s" in text
 

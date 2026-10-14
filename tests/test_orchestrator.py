@@ -26,31 +26,42 @@ VALIDATE_OK = json.dumps({
 
 
 def _fake(routes: dict[str, str]):
+    """Loop-aware fake: 'JSON array of tasks' becomes write_file actions +
+    finish; 'TARGET FILE: x' routes the coder write call for x."""
     import re
 
+    plan = routes.get("JSON array of tasks", "")
+    actions: list[dict] = []
+    if plan.lstrip().startswith("["):
+        for task in json.loads(plan):
+            actions.append({
+                "action": "write_file" if task.get("action", "create") == "create" else "edit_file",
+                "path": task["path"],
+                "text": task.get("description", ""),
+            })
+        actions.append({"action": "finish"})
+
     async def fake(model, prompt, system="", temperature=0.2, **kw):
-        # Classify-then-act: classify -> code when the test set a plan, then
-        # the plan call returns the test's plan wrapped as {"tasks": [...]}.
-        if "CLASSIFY MODE:" in prompt:
-            if "CLASSIFY MODE:" in routes:
-                return routes["CLASSIFY MODE:"]
-            plan = routes.get("JSON array of tasks", "")
-            return "code" if plan.lstrip().startswith("[") else "reply"
-        if "PLAN TASKS JSON:" in prompt:
-            if "PLAN TASKS JSON:" in routes:
-                return routes["PLAN TASKS JSON:"]
-            plan = routes.get("JSON array of tasks", "")
-            if plan.lstrip().startswith("["):
-                return json.dumps({"tasks": json.loads(plan), "assumptions": []})
-            return plan
-        target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
-        if target and f"TARGET FILE: {target.group(1)}" in routes:
-            return routes[f"TARGET FILE: {target.group(1)}"]
+        if "AGENT ACTION JSON:" in prompt:
+            if not actions:
+                return json.dumps({"action": "reply", "text": "ok"})
+            # play the actions in order, then finish forever
+            idx = getattr(fake, "_n", 0)
+            fake._n = idx + 1
+            return json.dumps(actions[min(idx, len(actions) - 1)])
+        target = re.search(r"TARGET FILE:\s*(\S+)", prompt) or re.search(r"Write\s+(\S+\.\w+)\.", prompt)
+        if target:
+            marker = f"TARGET FILE: {target.group(1)}"
+            if marker in routes:
+                return routes[marker]
         for marker in sorted(routes, key=len, reverse=True):
+            if marker in ("JSON array of tasks",):
+                continue
             if marker in prompt:
                 return routes[marker]
         return ""
 
+    fake._n = 0  # type: ignore[attr-defined]
     return fake
 
 
@@ -119,20 +130,40 @@ def test_budget_exhaustion_wall_time() -> None:
 
 
 def test_no_progress_detector_marks_needs_human() -> None:
-    """Two consecutive attempts with the same diagnostic -> early stop marked
-    needs human (identical failure twice)."""
+    """The model repeating the same failing write twice -> the loop stops
+    (no-progress) and the turn is needs_human, never a silent retry burn."""
     fake = _fake({
         "JSON array of tasks": PLAN,
         "TARGET FILE: generated.py": BROKEN_CODE,  # identical broken code each time
     })
+    # The loop model keeps asking to write the same file (the no-progress
+    # rule catches it after one repeat).
+    loop_actions = [
+        {"action": "write_file", "path": "generated.py", "text": "the greet function"},
+        {"action": "write_file", "path": "generated.py", "text": "the greet function"},
+    ]
+    fake2 = _fake({
+        "JSON array of tasks": PLAN,
+        "TARGET FILE: generated.py": BROKEN_CODE,
+    })
+    fake2._n = 0
+
+    async def drive(model, prompt, system="", temperature=0.2, **kw):
+        if "AGENT ACTION JSON:" in prompt:
+            idx = drive._n
+            drive._n += 1
+            return json.dumps(loop_actions[min(idx, len(loop_actions) - 1)])
+        return await fake2(model, prompt, system=system, temperature=temperature, **kw)
+    drive._n = 0  # type: ignore[attr-defined]
+
     with TemporaryDirectory() as tmp:
         result = _run(run_pipeline(
             "create generated.py with a greet function",
-            tmp, generate=fake, planner_model=PLANNER, coder_model=CODER,
+            tmp, generate=drive, planner_model=PLANNER, coder_model=CODER,
         ))
         assert result["staged_files"] == []
-        assert len(result["failed_tasks"]) == 1
-        assert "needs human" in result["failed_tasks"][0]["error"].lower()
+        assert result["status"] == "needs_human"
+        assert "progress" in result["summary"].lower()
 
 
 def test_garbage_coder_fails_without_stub_files() -> None:
@@ -141,14 +172,16 @@ def test_garbage_coder_fails_without_stub_files() -> None:
     garbage_a = "```python\nthis is not python code at all just prose\n```"
     garbage_b = "```python\nstill prose but different words so hash differs here\n```"
     calls = {"n": 0}
+    loop_actions = iter([
+        {"action": "write_file", "path": "generated.py", "text": "the greet function"},
+        {"action": "finish"},
+    ])
 
     async def fake(model, prompt, system="", temperature=0.2, **kw):
         import re
-        if "CLASSIFY MODE:" in prompt:
-            return "code"
-        if "PLAN TASKS JSON:" in prompt:
-            return json.dumps({"tasks": json.loads(PLAN), "assumptions": []})
-        target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
+        if "AGENT ACTION JSON:" in prompt:
+            return json.dumps(next(loop_actions, {"action": "finish"}))
+        target = re.search(r"TARGET FILE:\s*(\S+)", prompt) or re.search(r"Write\s+(\S+\.\w+)\.", prompt)
         if target:
             calls["n"] += 1
             return garbage_a if calls["n"] == 1 else garbage_b

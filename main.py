@@ -137,12 +137,6 @@ class ConfirmRequest(BaseModel):
     approved: bool = Field(default=False, description="Approve (stage+code) or decline the pending plan")
 
 
-class RouterClassifyRequest(BaseModel):
-    text: str = Field(min_length=1, description="Message to classify")
-    workspace_dir: str | None = Field(default=None, description="Optional workspace override")
-    history: list[str] | None = Field(default=None, description="Last conversation turns for context")
-
-
 class CancelRequest(BaseModel):
     workspace_dir: str | None = Field(default=None, description="Workspace whose run to cancel")
 
@@ -429,17 +423,6 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
     # THE single process-wide gateway: one lock, VRAM guard, role config.
     gateway = state.gateway
 
-    def _role_of(model: str) -> str:
-        """Map a pipeline model name to its role (thinker vs coder)."""
-        if model == state.config.coder_model:
-            return "coder"
-        if model == str(state.config.get_role_config("validator")["model"]):
-            # validator shares the thinker model by default; route by name only
-            # when it differs from the thinker.
-            if model != state.config.planner_model:
-                return "validator"
-        return "thinker"
-
     async def _generate(
         model: str,
         prompt: str,
@@ -449,8 +432,12 @@ async def agent_run(payload: RunRequestPayload) -> dict[str, Any]:
         num_ctx: int | None = None,
         **kwargs: Any,
     ) -> str:
+        # Roles are passed explicitly (never name heuristics): the pipeline
+        # always says which role a call belongs to.
+        if role is None:
+            role = "coder" if model == state.config.coder_model else "thinker"
         return await gateway.generate(
-            role or _role_of(model),
+            role,
             prompt,
             system=system,
             temperature=temperature,
@@ -654,31 +641,8 @@ async def agent_confirm(payload: ConfirmRequest) -> dict[str, Any]:
     return {"status": "answered", "approved": payload.approved}
 
 
-@app.post("/router/classify")
-async def router_classify(payload: RouterClassifyRequest) -> dict[str, Any]:
-    """`/router <text>` backend: tier, matched verb/deliverable, scores,
-    whether T2 ran, and the raw classifier JSON. T0/T1 never touch a model;
-    the T2 grey-zone call goes through the single gateway (same lock)."""
-    from router import diagnose
-
-    state.ensure_workspace(payload.workspace_dir)
-    thinker_cfg = state.config.get_role_config("thinker")
-
-    async def _gen(model: str, prompt: str, system: str = "", temperature: float = 0.0,
-                   **kwargs: Any) -> str:
-        return await state.gateway.generate(
-            "thinker", prompt, system=system, temperature=temperature, **kwargs
-        )
-
-    return await diagnose(
-        payload.text,
-        generate=_gen,
-        thinker_model=str(thinker_cfg["model"]),
-        history=payload.history,
-        min_confidence=float(state.config.router.get("min_confidence", 0.7)),
-        think_supported=state.gateway.think_supported(str(thinker_cfg["model"])),
-        think_budget=int(thinker_cfg.get("think_budget", 512)),
-    )
+# /router/classify is deleted with the rules router: the agent loop decides.
+# The endpoint never existed in the loop build.
 
 
 @app.get("/agent/events")

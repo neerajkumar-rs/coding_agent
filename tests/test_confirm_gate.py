@@ -40,11 +40,17 @@ class _FakeGateway:
         import re
 
         self.calls.append({"role": role, "prompt": prompt})
-        if "CLASSIFY MODE:" in prompt:
-            return "code"
-        if "PLAN TASKS JSON:" in prompt:
-            return json.dumps({"tasks": json.loads(WEB_PLAN), "assumptions": []})
-        target = re.search(r"TARGET FILE:\s*(\S+)", prompt)
+        # The agent loop: write each web file, then finish.
+        if "AGENT ACTION JSON:" in prompt:
+            n = sum(1 for c in self.calls if "AGENT ACTION JSON:" in c["prompt"])
+            actions = [
+                {"action": "write_file", "path": "index.html", "text": "page"},
+                {"action": "write_file", "path": "style.css", "text": "css"},
+                {"action": "write_file", "path": "script.js", "text": "js"},
+                {"action": "finish"},
+            ]
+            return json.dumps(actions[min(n - 1, len(actions) - 1)])
+        target = re.search(r"TARGET FILE:\s*(\S+)", prompt) or re.search(r"Write\s+(\S+\.\w+)\.", prompt)
         if target:
             body = {"index.html": INDEX_HTML, "style.css": STYLE_CSS,
                     "script.js": SCRIPT_JS}[target.group(1)]
@@ -108,7 +114,7 @@ def test_confirm_gate_pause_answer_approve(workspace) -> None:
             break
         time.sleep(0.05)
     assert plan is not None, "pipeline never paused for confirmation"
-    assert "code" in plan["intent"]
+    assert "create index.html" in plan["intent"]
     assert {t_["path"] for t_ in plan["plan"]} == {"index.html", "style.css", "script.js"}
 
     a = client.post("/agent/confirm", json={"workspace_dir": workspace, "approved": True})
@@ -147,25 +153,11 @@ def test_confirm_gate_decline_stages_nothing(workspace) -> None:
     assert not (Path(workspace) / ".agent_staging" / "index.html").exists()
 
 
-def test_router_classify_rules_only_over_http(workspace) -> None:
+def test_router_endpoint_is_gone(workspace) -> None:
+    """The /router/classify endpoint was deleted with the rules router."""
     client = TestClient(main.app)
-    r = client.post("/router/classify", json={"text": "hello lets work together"})
-    assert r.status_code == 200, r.text
-    d = r.json()
-    assert d["intent"] == "CHAT"
-    assert d["tier"] == 0
-    assert d["t2_ran"] is False
-
-
-def test_router_classify_grey_zone_uses_gateway(workspace) -> None:
-    client = TestClient(main.app)
-    r = client.post("/router/classify",
-                    json={"text": "how do i make a todo page", "workspace_dir": workspace})
-    assert r.status_code == 200, r.text
-    d = r.json()
-    assert d["t2_ran"] is True
-    assert d["intent"] == "QUESTION"  # fake classifier said QUESTION @ 0.9
-    assert "QUESTION" in d["t2_raw"]
+    r = client.post("/router/classify", json={"text": "hello"})
+    assert r.status_code == 404
 
 
 def test_pending_confirm_empty_when_no_run(workspace) -> None:

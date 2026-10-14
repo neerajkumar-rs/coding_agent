@@ -69,12 +69,14 @@ class _CountingOllama(BaseHTTPRequestHandler):
     resident: dict[str, int] = {}      # model -> num_ctx currently loaded
     loads: list[tuple[str, int]] = []  # (model, num_ctx) per actual load
     calls: list[tuple[str, int]] = []  # (model, num_ctx) per generate call
+    loop_n: int = 0                    # agent-loop call counter (per test)
 
     @classmethod
     def reset(cls) -> None:
         cls.resident = {}
         cls.loads = []
         cls.calls = []
+        cls.loop_n = 0
 
     def do_GET(self) -> None:
         if self.path.endswith("/api/tags"):
@@ -102,16 +104,17 @@ class _CountingOllama(BaseHTTPRequestHandler):
             type(self).loads.append((model, ctx))
             type(self).resident = {model: ctx}  # one model resident at a time
         prompt = payload.get("prompt", "")
-        if "CLASSIFY MODE:" in prompt:
-            text = "code"
-        elif "VERIFY SIDE EFFECT:" in prompt:
-            text = "yes"
-        elif "PLAN TASKS JSON:" in prompt:
-            text = json.dumps({"tasks": [{
-                "path": "notes.md", "action": "create",
-                "description": "Markdown notes file with a short todo list inside",
-            }], "assumptions": []})
-        elif "TARGET FILE:" in prompt:
+        if "AGENT ACTION JSON:" in prompt:
+            # The loop: write notes.md, then finish. Drive by call count per
+            # model so the write's coder call (same model) never confuses it.
+            type(self).loop_n = getattr(type(self), "loop_n", 0) + 1
+            actions = [
+                {"action": "write_file", "path": "notes.md",
+                 "text": "Markdown notes file with a short todo list inside"},
+                {"action": "finish"},
+            ]
+            text = json.dumps(actions[min(type(self).loop_n - 1, len(actions) - 1)])
+        elif "TARGET FILE:" in prompt or "Write notes.md." in prompt:
             text = "```markdown\n# Notes\n\n- [ ] thing\n```"
         elif "satisfies_request" in prompt:
             text = json.dumps(

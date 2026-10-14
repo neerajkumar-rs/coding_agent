@@ -189,12 +189,15 @@ def test_fastapi_endpoints() -> None:
             "satisfies_request": True, "problems": [], "summary": "A greet module."
         })
 
+        loop_actions = iter([
+            {"action": "write_file", "path": "greet.py", "text": "the greet function"},
+            {"action": "finish"},
+        ])
+
         async def mock_generate(role_or_model, prompt, **kwargs):
-            if "CLASSIFY MODE:" in prompt:
-                return "code"
-            if "PLAN TASKS JSON:" in prompt:
-                return json.dumps({"tasks": json.loads(plan_json), "assumptions": []})
-            if "TARGET FILE: greet.py" in prompt:
+            if "AGENT ACTION JSON:" in prompt:
+                return json.dumps(next(loop_actions, {"action": "finish"}))
+            if "TARGET FILE: greet.py" in prompt or "Write greet.py." in prompt:
                 return good_code
             if "satisfies_request" in prompt:
                 return validate_ok
@@ -214,7 +217,7 @@ def test_fastapi_endpoints() -> None:
             assert "greet.py" in run_data["staged_files"]
             assert run_data["failed_tasks"] == []
             stages = [t["stage"] for t in run_data["trace"]]
-            assert "PLAN" in stages and "CHECK" in stages and "SUMMARY" in stages
+            assert "LOOP" in stages and "CHECK" in stages and "SUMMARY" in stages
 
             # Verify file was written to staging, NOT production root
             staged_file = tmp_path / ".agent_staging" / "greet.py"

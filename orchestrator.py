@@ -36,7 +36,6 @@ from ollama_client import (
     OllamaCancelledError,
     strip_think_blocks,
 )
-from router import route as route_request
 from sandbox import check_plausible_content, tail_lines
 from workspace_staging import WorkspaceStagingManager
 
@@ -48,12 +47,6 @@ from agent_core.engine import (
     RunBudgets,
     RunCancelled,
 )
-from router import (
-    RouteResult,
-    canned_chat_reply,
-)
-from router import route as router_route
-from router import route_rules_only as _route_rules_only
 
 # Re-exported so older imports (tests, e2e, tui) keep resolving.
 __all__ = [
@@ -64,7 +57,6 @@ __all__ = [
     "MAX_ATTEMPTS_PER_TASK",
     "DEFAULT_MAX_WALL_SECONDS",
     "DEFAULT_MAX_LLM_CALLS",
-    "classify_request",
     "run_pipeline",
 ]
 
@@ -89,25 +81,18 @@ LANGUAGE_BY_SUFFIX = {  # read-through view over the registry (never edit here)
     __import__("filetypes").FILE_TYPES.items()
 }
 
+# PLACEHOLDER_STEMS stays as WRITE safety (never a content decision): the
+# loop's write gate rejects scaffold names like your_code.py/untitled.* —
+# a workspace-hygiene rule, not a text-matching routing decision.
 PLACEHOLDER_STEMS = {"your_code", "example", "foo", "file1", "untitled", "file", "code", "test"}
-WEB_HINTS = ("html", "css", "website", "web page", "webpage", "site", "blog", "landing", "page")
 
 MAX_TASK_RETRIES = 2  # retries AFTER the first attempt
 VALIDATE_FILE_HEAD_LINES = 60
 SUMMARY_FILE_HEAD_LINES = 40
-# Feature keywords the summary model may NOT invent: dropped when absent from
-# every generated file's actual content.
-SUMMARY_FEATURE_KEYWORDS = ("search", "login", "database", "dark mode", "comments")
 
 
-def classify_request(user_request: str) -> str:
-    """Sync rules-only classification (router v2 tiers T0+T1, no model call).
-
-    Kept as the cheap pre-check / backwards-compatible import. The pipeline
-    itself uses :func:`router.route` (which adds the T2 grey-zone classifier).
-    Never returns CODE_TASK for a generic statement.
-    """
-    return _route_rules_only(user_request).intent
+# classify_request (the rules-only pre-check) is deleted with the rules router:
+# the agent loop decides, there is no text-matching classification anywhere.
 
 
 # ---------------------------------------------------------------------------
@@ -215,58 +200,10 @@ def _valid_plan_task(task: dict[str, Any]) -> str | None:
     return None
 
 
-def invented_file_rejection(tasks: list[dict[str, Any]], user_request: str) -> str | None:
-    """A plan whose ONLY task is an unrelated invented file is rejected:
-    the file name does not appear in the request and the request has no
-    web/page wording (which legitimises inferred index.html/style.css/...).
-    """
-    if len(tasks) != 1:
-        return None
-    name = Path(str(tasks[0].get("path", ""))).name.lower()
-    if not name:
-        return None
-    msg = user_request.lower()
-    if name in msg:
-        return None
-    if any(h in msg for h in WEB_HINTS):
-        return None
-    return f"plan invents {name} which the request never names"
-
-
-def _valid_plan(tasks: list[dict[str, str]], user_request: str) -> list[str]:
-    """Plan-LEVEL rejection reasons (per-task rules live in _valid_plan_task)."""
-    reasons: list[str] = []
-    requested_app_py = bool(re.search(r"\bapp\.py\b", user_request.lower()))
-    for task in tasks:
-        if Path(task["path"]).name.lower() == "app.py" and not requested_app_py:
-            reasons.append("app.py planned but never requested — name files descriptively")
-    invented = invented_file_rejection(tasks, user_request)
-    if invented:
-        reasons.append(invented)
-    lower = user_request.lower()
-    # Completeness fires when the request EXPLICITLY spans html+css+js (or a
-    # multi-file web plan was produced): all three must be present then.
-    # A single-file page request ("create index.html") stays exempt — cross-
-    # file link checks cannot run before sibling files exist anyway.
-    mentions_all_three = all(k in lower for k in ("html", "css")) and (
-        "js" in lower or "javascript" in lower
-    )
-    is_multi_file_web = len(tasks) > 1 and any(
-        h in lower for h in WEB_HINTS
-    )
-    if mentions_all_three or is_multi_file_web:
-        suffixes = {Path(t["path"]).suffix.lower() for t in tasks}
-        missing = {".html", ".css", ".js"} - suffixes
-        if missing and ".html" not in missing:
-            reasons.append(
-                f"web app plan must include html, css and js files (missing: {sorted(missing)})"
-            )
-    return reasons
-
-
-# _fallback_plan was retired with the rules router (v4): the Understand step
-# produces plans; a total Understand failure is a graceful reply, never a
-# deterministic scaffold.
+# The plan-level text-matching rules (_valid_plan, invented_file_rejection,
+# WEB_HINTS) are deleted with the rules router: the agent loop decides what to
+# write; Python enforces safety (safe_target + the write gate), never content
+# decisions.
 
 
 
@@ -340,9 +277,10 @@ async def _summary_prose(
         head = "\n".join(content.splitlines()[:SUMMARY_FILE_HEAD_LINES])
         sections.append(f"FILE: {name}\n{head}")
     prompt = (
-        "Describe only features visible in the code shown, in 2-3 sentences. "
-        "Do not invent features. Write in GitHub-flavored markdown: short, "
-        "file names in backticks, no headings.\n\n"
+        "Describe only features visible in the code shown, in 2-3 sentences, "
+        "then one line on how to run/open what you wrote (from the files, "
+        "never invented). Do not invent features. GitHub-flavored markdown: "
+        "short, file names in backticks, no headings.\n\n"
         + "\n\n".join(sections)
         + "\n\nREQUEST: " + user_request
     )
@@ -357,13 +295,6 @@ async def _summary_prose(
         return ""
     _, prose = strip_think_blocks(raw)
     prose = prose.strip()
-    if not prose:
-        return ""
-    # Feature-keyword guard: drop prose that invents features.
-    all_content = "\n".join(generated.values()).lower()
-    for keyword in SUMMARY_FEATURE_KEYWORDS:
-        if keyword in prose.lower() and keyword not in all_content:
-            return ""
     return prose
 
 
@@ -414,14 +345,6 @@ def _summary_skeleton(
         lines.append("**Failed:**")
         for t in failed_tasks:
             lines.append(f"- NOT saved (failed): `{t['path']}` — {t['error']}")
-    how: list[str] = []
-    if any(f.endswith((".html", ".htm")) for f in file_list):
-        page = next(f for f in file_list if f.endswith((".html", ".htm")))
-        how.append(f"open `{page}` in a browser")
-    if any(f.endswith(".py") for f in file_list):
-        script = next(f for f in file_list if f.endswith(".py"))
-        how.append(f"run: `python {script}`")
-    lines.append("**How to run:** " + ("; ".join(how) if how else "see file contents"))
     lines.append("**Known issues:** " + ("; ".join(issues) if issues else "none"))
     lines.append(f"**Total time:** {total_seconds:.1f}s")
     return "\n".join(lines)
@@ -634,65 +557,16 @@ async def run_pipeline(
     try:
         # ------------------------------------------------------------------ ROUTE
         _check_cancel()  # a pre-set cancel still records history via the except
-        # Classify-then-act: fast paths (no model, no files) first, then ONE
-        # tiny CLASSIFY call, then ONE act call per label (reply facts / plan).
-        from understand import (
-            PlanFailed,
-            build_listing_skeleton,
-            build_reply_facts,
-            classify_mode,
-            fast_path,
-            is_listing_request,
-            plan_tasks,
-            reply_step,
-            verify_side_effect,
-        )
-
-        def _facts_block() -> str:
-            """FACTS for the reply step: file table + named-file content."""
-            return build_reply_facts(
-                workspace, message, facts,
-                turns=convo.turns,
-                last_result=convo.last_result,
-                last_trace=convo.last_trace,
-                pending_question=convo.pending_question,
-            )
-
-        async def _answer() -> str:
-            """The reply step: deterministic one-sentence answer for a listing
-            ask on an empty workspace; otherwise the model on the FACTS block,
-            with the Python listing skeleton for listing asks. A degenerate
-            reply (only a file name, or under 3 chars) gets ONE honest retry,
-            then a fixed 'could not answer' sentence — never a bare name."""
-            if not facts["files"] and is_listing_request(message):
-                return "The workspace is empty — there are no files to list."
-            skeleton = ""
-            if facts["files"] and is_listing_request(message):
-                skeleton = build_listing_skeleton(facts)
-            names = {str(f.get("name", "")).lower() for f in facts["files"]}
-
-            def _degenerate(text: str) -> bool:
-                stripped = text.strip().strip('"`').strip()
-                return len(stripped) < 3 or stripped.lower() in names
-
-            answer = await reply_step(
-                message, generate=_llm, facts_block=_facts_block(),
-                skeleton=skeleton,
-                table_names=[str(f.get("name", "")) for f in facts["files"]],
-            )
-            if _degenerate(answer):
-                answer = await reply_step(
-                    message, generate=_llm, facts_block=_facts_block(),
-                    skeleton=skeleton,
-                    table_names=[str(f.get("name", "")) for f in facts["files"]],
-                )
-            if _degenerate(answer):
-                return "I could not answer that from the workspace facts."
-            return answer
+        # The bounded agent loop (agent_loop.py) replaces the old
+        # classify/verify/plan dispatch: the model decides (one structured call
+        # per step), Python executes tools and enforces safety.
+        from agent_loop import agent_turn
 
         t0 = time.monotonic()
-        fp = fast_path(user_request)
-        if fp == "COMMAND":
+        fp = user_request.strip()
+        if fp.startswith("/") and re.match(r"^/\w", fp):
+            # Slash commands are dispatched by the client UI; one that reaches
+            # the server gets a polite no-op, never files.
             record("FAST-PATH", "ok", 0.0, "command handled by the client")
             _finish("completed")
             _record_history("fast-path", "ok",
@@ -703,126 +577,77 @@ async def run_pipeline(
                 "trace": trace,
                 "run_id": journal.run_id,
             }
-        if fp == "CHAT":
-            reply = canned_chat_reply(user_request)
-            record("FAST-PATH", "ok", 0.0, "canned", model="")
-            _finish("completed")
-            _record_history("fast-path", "ok", answer=reply)
-            return {"answer": reply, "trace": trace, "run_id": journal.run_id}
 
-        # Conversation state: the models resolve references from it.
+        # Conversation state: the loop sees the last 2 turns as one-line
+        # descriptions (what the agent DID, never raw reply text).
         convo = ConversationState.load(workspace)
         convo_box["convo"] = convo
-        # The state fed to the model THIS turn, captured BEFORE the turn runs:
-        # history's state_snapshot must be this, not the post-turn state.
         import history as _history_mod
 
         convo_box["pre_turn_snapshot"] = _history_mod.state_snapshot(convo)
-        # Merge a pending question into the message; after one question we
-        # proceed with assumptions — never two questions in a row.
         message = user_request
         if convo.pending_question:
             message = (
                 f"PENDING QUESTION FROM THE AGENT: {convo.pending_question}\n"
                 f"USER ANSWER: {user_request}"
             )
-        facts = build_file_facts(workspace)
-        file_names = [str(f.get("name", "")) for f in facts.get("files", [])][:40]
         route_model = understand_model or coder_model
+        history_lines = [
+            f"{t.get('user', '')[:80]} -> {t.get('mode', '')} ({t.get('result', '')[:80]})"
+            for t in convo.turns[-2:]
+        ]
 
-        # ---------------------------------------------------------- CLASSIFY
-        # The classify prompt carries NO previous-turn text (a "Last turn"
-        # line biased labels toward `code`); context still flows to the reply
-        # and plan steps below via the conversation state.
-        mode = await classify_mode(
+        # ------------------------------------------------------------- LOOP
+        # The model drives: read-only tools first (evidence), writes collected
+        # and gated, reply/finish end the turn. Max 6 model steps per turn.
+        async def _loop_llm(model, prompt, system="", temperature=0.1, **kwargs):
+            return await _llm(model, prompt, system=system, temperature=temperature, **kwargs)
+
+        loop = await agent_turn(
             message,
-            generate=_llm,
-            file_names=file_names,
+            workspace,
+            generate=_loop_llm,
+            llm=_loop_llm,
+            history_lines=history_lines,
         )
-        record("CLASSIFY", "ok", time.monotonic() - t0, mode, model=route_model)
-
-        # ------------------------------------------------------------ VERIFY
-        # Before ANY side effect: one tiny yes/no call re-checks a code|both
-        # label. "no" downgrades to reply (listing/showing/reading files is
-        # NOT creating or changing).
-        if mode in ("code", "both"):
-            t0 = time.monotonic()
-            side_effect = await verify_side_effect(message, generate=_llm)
-            if side_effect:
-                record("VERIFY", "ok", time.monotonic() - t0,
-                       f"side effect confirmed ({mode})", model=route_model)
-            else:
-                record("VERIFY", "ok", time.monotonic() - t0,
-                       f"downgraded {mode}->reply (no side effect)", model=route_model)
-                journal.emit_event({"event": "verify_downgrade",
-                                    "from": mode, "to": "reply"})
-                mode = "reply"
-
-        reply_text: str | None = None
-
-        if mode in ("reply", "both"):
-            # ---------------------------------------------------------- ANSWER
-            t0 = time.monotonic()
-            reply_text = await _answer()
-            record("ANSWER", "ok", time.monotonic() - t0, model=route_model)
-            if mode == "reply":
-                # last_result stores a one-line DESCRIPTION of what happened
-                # (never the bare reply text — a bare file name fed back as
-                # context poisons the next turn's reads).
-                convo.record_turn(
-                    user_request, "reply", f"answered: {reply_text[:80]}",
-                    trace=trace,
-                    last_result={"type": "reply",
-                                 "text": f"answered: {reply_text[:80]}"},
-                )
-                _finish("completed")
-                _record_history("reply", "ok", label=mode, answer=reply_text)
-                return {"answer": reply_text, "trace": trace, "run_id": journal.run_id}
-            # both: print the reply first, then continue to the plan step.
-            journal.emit_event({"event": "reply", "text": reply_text[:500]})
-
-        # -------------------------------------------------------------- PLAN
-        t0 = time.monotonic()
-        try:
-            plan = await plan_tasks(
-                message,
-                generate=_llm,
-                file_names=file_names,
-                task_validator=_valid_plan_task,
-                plan_validator=lambda tasks, msg: (
-                    invented_file_rejection(tasks, msg)
-                ),
-            )
-        except PlanFailed as exc:
-            record("PLAN", "failed", time.monotonic() - t0, str(exc)[:200])
-            _finish("needs_human", {"staged_files": [], "failed_tasks": []})
-            _record_history("code", "needs_human", label=mode,
-                            error={"stage": "PLAN", "detail": str(exc)[:500]})
-            return {
-                "status": "needs_human",
-                "summary": f"Could not produce a valid plan: {exc}",
-                "staged_files": [],
-                "failed_tasks": [],
-                "trace": trace,
-                "run_id": journal.run_id,
-            }
-        tasks = plan.tasks
-        assumptions = plan.assumptions
-        record("PLAN", "ok", time.monotonic() - t0,
-               f"{len(tasks)} tasks"
-               + (f" (assumptions: {'; '.join(assumptions[:3])})" if assumptions else ""),
+        record("LOOP", "ok" if loop.stopped_by in ("reply", "finish") else "failed",
+               time.monotonic() - t0,
+               f"{loop.steps} steps, stopped by {loop.stopped_by}",
                model=route_model)
+        for obs in loop.observations:
+            journal.emit_event({"event": "loop_step", "text": obs[:300]})
 
-        if not tasks:
-            # A code/both turn NEVER ends as a chat reply: the planner named no
-            # file -> needs_human with the plan's reason (truthful outcome in
-            # history too).
-            reason = plan.reason or "no file could be named"
-            journal.emit_event({"event": "plan_empty", "reason": reason[:300]})
-            record("PLAN", "ok", 0.0, f"no plannable file: {reason[:120]}")
-            _finish("needs_human", {"staged_files": [], "failed_tasks": []})
-            _record_history("code", "needs_human", label=mode,
-                            error={"stage": "PLAN", "detail": reason[:500]})
+        # A reply with NO pending writes ends the turn as an answer.
+        if loop.stopped_by == "reply" and not loop.pending_writes:
+            reply_text = loop.answer or "I could not answer that from the workspace."
+            convo.record_turn(
+                user_request, "reply", f"answered: {reply_text[:80]}",
+                trace=trace,
+                last_result={"type": "reply",
+                             "text": f"answered: {reply_text[:80]}"},
+            )
+            _finish("completed")
+            _record_history("reply", "ok", answer=reply_text)
+            return {"answer": reply_text, "trace": trace, "run_id": journal.run_id}
+
+        # The loop ended with no usable outcome: needs_human, never a silent
+        # chat fallback. Check failures the loop hit ARE reported as failed
+        # tasks (a write that failed CHECK is never invisible).
+        if loop.stopped_by in ("budget", "no_progress", "error") and not loop.pending_writes:
+            reason = {
+                "budget": f"ran out of steps ({loop.steps}) without an answer",
+                "no_progress": "the model repeated the same action without progress",
+                "error": "the loop hit an error",
+            }.get(loop.stopped_by, loop.stopped_by)
+            failed_from_checks = [
+                {"path": rel, "error": err}
+                for rel, err in loop.checks.items() if err
+            ]
+            record("LOOP", "failed", 0.0, reason)
+            _finish("needs_human", {"staged_files": [],
+                                    "failed_tasks": failed_from_checks})
+            _record_history("code", "needs_human",
+                            error={"stage": "LOOP", "detail": reason})
             convo.record_turn(
                 user_request, "code", f"needs_human: {reason[:80]}",
                 trace=trace,
@@ -830,23 +655,42 @@ async def run_pipeline(
             )
             return {
                 "status": "needs_human",
-                "summary": f"Could not produce a valid plan: {reason}",
+                "summary": f"Could not complete that: {reason}",
                 "staged_files": [],
-                "failed_tasks": [],
+                "failed_tasks": failed_from_checks,
                 "trace": trace,
                 "run_id": journal.run_id,
             }
 
-        planned_paths = {t["path"] for t in tasks}
-
         # ------------------------------------------------------- CONFIRM GATE
-        # Before anything is staged: show planned files + one-line intent and
-        # require approval (Enter/y at the client). ``confirm=None`` (direct
-        # API calls, tests, --yes) skips the gate.
-        if confirm is not None:
+        # The loop collected writes; show them (paths, overwrites, first lines)
+        # and require approval before anything is staged. Nothing touched the
+        # workspace before this point.
+        pending = sorted(loop.pending_writes)
+        # A finish/reply with NOTHING to write but check failures on record:
+        # needs_human (never a silent "completed" with zero files).
+        if not pending and loop.checks and any(loop.checks.values()):
+            failed_from_checks = [
+                {"path": rel, "error": err}
+                for rel, err in loop.checks.items() if err
+            ]
+            record("LOOP", "failed", 0.0,
+                   f"all writes failed CHECK: {len(failed_from_checks)}")
+            _finish("needs_human", {"staged_files": [],
+                                    "failed_tasks": failed_from_checks})
+            _record_history("code", "needs_human",
+                            error={"stage": "CHECK",
+                                   "detail": "; ".join(t["error"] for t in failed_from_checks)[:500]})
+            return {
+                "status": "needs_human",
+                "summary": "Could not complete that: every write failed its check.",
+                "staged_files": [],
+                "failed_tasks": failed_from_checks,
+                "trace": trace,
+                "run_id": journal.run_id,
+            }
+        if confirm is not None and pending:
             _check_cancel()
-            # One warning line when the validator model is unavailable: the
-            # user should know BEFORE approving that VALIDATE cannot run.
             if validator_missing:
                 journal.emit_event({
                     "event": "validator_unavailable", "model": validator_missing})
@@ -857,36 +701,31 @@ async def run_pipeline(
                 )
             else:
                 console_note = ""
-            # Show the file names, the assumptions, and an overwrite marker
-            # for every path that already exists in the workspace.
             gate_tasks = []
-            for t in tasks:
-                overwrites = (workspace / t["path"]).is_file()
-                gate_tasks.append({**t, "overwrites": overwrites})
-            intent_line = (
-                f"{mode}: plan is "
-                + ", ".join(
-                    f"{t['action']} {t['path']}"
-                    + (" (overwrites existing file)" if t["overwrites"] else "")
-                    for t in gate_tasks
-                )
-            )
-            if assumptions:
-                intent_line += " — assumptions: " + "; ".join(assumptions[:3])
-            intent_line += console_note
+            for rel in pending:
+                overwrites = (workspace / rel).is_file()
+                content = loop.writes.get(rel) or loop.edits.get(rel) or ""
+                gate_tasks.append({
+                    "path": rel,
+                    "action": "edit" if rel in loop.edits else "create",
+                    "description": f"{'; '.join(content.splitlines()[:2])[:120]}",
+                    "overwrites": overwrites,
+                })
+            intent_line = ", ".join(
+                f"{t['action']} {t['path']}"
+                + (" (overwrites existing file)" if t["overwrites"] else "")
+                for t in gate_tasks
+            ) + console_note
             journal.emit_event({"event": "confirm_requested",
                                 "plan": [t["path"] for t in gate_tasks],
-                                "assumptions": assumptions[:3],
                                 "intent": intent_line})
             approved = await confirm(gate_tasks, intent_line)
             if not approved:
-                record("PLAN", "ok", 0.0, "declined by user — nothing staged")
+                record("LOOP", "ok", 0.0, "declined by user — nothing staged")
                 _finish("declined", {"staged_files": [], "failed_tasks": []})
-                # Honest outcome: the user cancelled the plan — never "ok".
-                _record_history(mode if mode in ("code", "both") else "code",
-                                "cancelled", label=mode,
+                _record_history("code", "cancelled",
                                 answer="Plan declined by user — nothing was staged.",
-                                files_planned=[t["path"] for t in tasks])
+                                files_planned=pending)
                 return {
                     "status": "declined",
                     "summary": "Plan declined by user — nothing was staged.",
@@ -897,103 +736,49 @@ async def run_pipeline(
                 }
             journal.emit_event({"event": "confirm_approved"})
 
-        # ------------------------------------------------------------------ CODE
+        # --------------------------------------------------------------- STAGE
+        # Writes the loop collected are staged now (post-gate). CHECK already
+        # ran per write inside the loop; the verifier gates .py below.
         t_code = time.monotonic()
         generated: dict[str, str] = {}
         failed_tasks: list[dict[str, str]] = []
         check_seconds = 0.0
         infra_error: str | None = None
 
-        for task in tasks:
-            path, desc = task["path"], task["description"]
-            language = _language_of(path)
-            extra = ""
-            if Path(path).name.lower() == "index.html":
-                links = [
-                    p for p in ("style.css", "script.js") if p in planned_paths
-                ]
-                if links:
-                    extra = (
-                        "\nThe HTML MUST reference "
-                        + " and ".join(links)
-                        + " with <link>/<script> tags using those exact filenames."
-                    )
-            # Understand flags: this task consumes the previous turn's result.
-            last_result_block = ""
-            if task.get("uses_last_result") and convo.last_result.get("text"):
-                last_result_block = (
-                    "\nPREVIOUS RESULT (use this as input data):\n"
-                    + str(convo.last_result.get("text", ""))[:1_500]
-                )
-            assumptions_block = ""
-            if assumptions:
-                assumptions_block = "\nASSUMPTIONS: " + "; ".join(assumptions[:3])
-            code_prompt = (
-                f"Implement exactly one file.\n"
-                f"ORIGINAL USER REQUEST: {user_request[:2000]}\n"
-                f"PLANNED FILES: {', '.join(sorted(planned_paths))}\n"
-                f"TARGET FILE: {path}\n"
-                f"TASK: {desc}\n"
-                f"LANGUAGE: {language}\n"
-                f"Return ONLY the complete file contents inside one "
-                f"```{language} fenced block. No commentary.{extra}"
-                f"{assumptions_block}{last_result_block}"
-            )
-            content: str | None = None
-            error: str | None = None
-            previous_diag_hash: str | None = None
-            no_progress = False
-            for attempt in range(1 + MAX_TASK_RETRIES):
-                prompt = code_prompt
-                if error:
-                    prompt += (
-                        f"\n\nPREVIOUS ATTEMPT FAILED THIS CHECK:\n{error}\n"
-                        "Fix exactly this and return the full corrected file."
-                    )
-                raw = await _llm(
-                    coder_model, prompt,
-                    system=f"You output only complete {language} files in one fenced block.",
-                    temperature=TEMPERATURE_CODE,
-                )
-                _, clean = strip_think_blocks(raw)
-                content = _extract_code(clean, path)
-
-                c0 = time.monotonic()
-                try:
-                    error = _check_generated(path, content)
-                except Exception as exc:  # infra error: checker itself crashed
-                    infra_error = f"CHECK infrastructure error on {path}: {exc}"
-                    check_seconds += time.monotonic() - c0
-                    break
-                check_seconds += time.monotonic() - c0
-                if error is None:
-                    break
-                # No-progress rule: the same diagnostic twice in a row means the
-                # coder is stuck — stop early instead of burning the last retry.
-                diag_hash = diagnostic_hash(error)
-                if previous_diag_hash is not None and diag_hash == previous_diag_hash:
-                    no_progress = True
-                    break
-                previous_diag_hash = diag_hash
-
-            if infra_error:
-                failed_tasks.append({"path": path, "error": infra_error})
-                break  # abort: never retry coder on infra errors
-            if error is not None or content is None:
-                reason = error or "no content generated"
-                if no_progress:
-                    reason += " (needs human: identical failure twice)"
-                failed_tasks.append({"path": path, "error": reason})
+        for rel in pending:
+            content = loop.writes.get(rel) or loop.edits.get(rel) or ""
+            err = loop.checks.get(rel)
+            if err:
+                failed_tasks.append({"path": rel, "error": err})
                 continue
-            safe_target(workspace, path)  # raises on escape/protected
-            staging.stage_file(path, content)
-            generated[path] = content
+            try:
+                safe_target(workspace, rel)
+            except Exception as exc:
+                failed_tasks.append({"path": rel, "error": str(exc)})
+                continue
+            staging.stage_file(rel, content)
+            generated[rel] = content
+        # Writes that failed CHECK inside the loop never reached pending —
+        # surface them as failed tasks (never invisible).
+        for rel, err in loop.checks.items():
+            if err and rel not in {t["path"] for t in failed_tasks} and rel not in generated:
+                failed_tasks.append({"path": rel, "error": err})
+
+        record("CODE", "ok" if generated else ("failed" if failed_tasks else "ok"),
+               time.monotonic() - t_code,
+               f"{len(generated)} staged, {len(failed_tasks)} failed",
+               model=coder_model)
+        record("CHECK", "failed" if (failed_tasks or infra_error) else "ok",
+               check_seconds,
+               infra_error or f"{len(generated)} passed, {len(failed_tasks)} failed",
+               model="-")  # deterministic stage: no model
 
         # Cross-file CHECK: html links resolve against the FULL generated set
         # (sibling files exist only after every task has been coded).
         if not infra_error:
+            generated_paths = set(generated)
             for name in [n for n in generated if n.endswith(".html")]:
-                link_error = _check_html_links(name, generated[name], planned_paths, workspace)
+                link_error = _check_html_links(name, generated[name], generated_paths, workspace)
                 if link_error:
                     staging.get_staged_file_path(name).unlink(missing_ok=True)
                     generated.pop(name)
@@ -1032,15 +817,6 @@ async def run_pipeline(
                     t["error"].startswith("verifier:") for t in failed_tasks
                 )}
             )
-
-        record("CODE", "ok" if generated else ("failed" if failed_tasks else "ok"),
-               time.monotonic() - t_code,
-               f"{len(generated)} coded, {len(failed_tasks)} failed",
-               model=coder_model)
-        record("CHECK", "failed" if (failed_tasks or infra_error) else "ok",
-               check_seconds,
-               infra_error or f"{len(generated)} passed, {len(failed_tasks)} failed",
-               model="-")  # deterministic stage: no model
 
         # sandbox channel: every deterministic CHECK outcome, one block per
         # run (per-file checks + the verifier step chain + infra errors).
@@ -1178,10 +954,9 @@ async def run_pipeline(
 
         _finish("completed", {"staged_files": file_list,
                               "failed_tasks": failed_tasks})
-        # Conversation state: every turn recorded (reply-first for
-        # code_and_reply was emitted as an event at PLAN time).
+        # Conversation state: every turn recorded, described (never raw text).
         convo.record_turn(
-            user_request, mode,
+            user_request, "code",
             "wrote " + ", ".join(file_list) if file_list else "no files passed CHECK",
             trace=trace,
             last_result={
@@ -1200,8 +975,8 @@ async def run_pipeline(
             "trace": trace,
             "run_id": journal.run_id,
         }
-        if mode == "both" and reply_text:
-            out["reply"] = reply_text
+        if loop.answer:
+            out["reply"] = loop.answer
         # Honest outcome vocabulary: ok | unverified (code ran but validation
         # failed/was skipped) | partial (some tasks failed) — see also
         # needs_human / failed / cancelled / error on the other paths.
@@ -1210,8 +985,7 @@ async def run_pipeline(
             else ("partial" if failed_tasks else "ok")
         )
         _record_history(
-            mode if mode in ("code", "both") else "code", outcome, label=mode,
-            answer=summary, files_planned=[t["path"] for t in tasks],
+            "code", outcome, answer=summary, files_planned=pending,
             files_staged=file_list,
         )
         return out
