@@ -435,8 +435,13 @@ async def agent_turn(
         elif action.action == "reply":
             text = action.text.strip()
             # Contradiction guard: after a list_files observation, the Python
-            # table wins over a reply that names a file not in the workspace.
-            if text and last_listing_table and last_listing_names is not None:
+            # table wins over a reply that names a file not in the workspace
+            # AND not written this turn (the turn's own writes are real).
+            if text and last_listing_table and last_listing_names is not None \
+                    and not result.writes and not result.edits and not result.checks:
+                # A pure listing reply that invents a file is replaced by the
+                # Python table. Turns that wrote (or tried to write) files keep
+                # their own answer (the honest outcome lives in failed_tasks).
                 if _reply_contradicts_table(text, last_listing_names) is not None:
                     text = last_listing_table
             result.answer = text

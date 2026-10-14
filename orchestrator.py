@@ -610,7 +610,8 @@ async def run_pipeline(
             llm=_loop_llm,
             history_lines=history_lines,
         )
-        record("LOOP", "ok" if loop.stopped_by in ("reply", "finish") else "failed",
+        record("LOOP", "ok" if loop.stopped_by in ("reply", "finish") or loop.pending_writes
+               else "failed",
                time.monotonic() - t0,
                f"{loop.steps} steps, stopped by {loop.stopped_by}",
                model=route_model)
