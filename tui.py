@@ -1608,6 +1608,65 @@ async def main() -> None:
             elif command.startswith("/router"):
                 await run_router_slash(text.strip()[len("/router"):].strip(), workspace)
 
+            elif command.startswith("/history"):
+                import history as _history
+                args = text.strip()[len("/history"):].strip()
+                if not args:
+                    console.print(_history.format_history_table(workspace))
+                elif args.startswith("search "):
+                    console.print(_history.format_history_search(workspace, args[7:].strip()))
+                elif args.isdigit():
+                    n = int(args)
+                    if _history.get_turn(workspace, n) is not None:
+                        console.print(_history.format_history_detail(workspace, n))
+                    else:
+                        console.print(_history.format_history_table(workspace, n))
+                else:
+                    console.print("[dim]Usage: /history [N] | /history <id> | /history search <text>[/dim]")
+
+            elif command.startswith("/retry"):
+                import history as _history
+                args = text.strip()[len("/retry"):].strip()
+                if not args.isdigit():
+                    console.print("[dim]Usage: /retry <id> — re-sends that turn's text as a NEW turn (old state is not restored).[/dim]")
+                else:
+                    entry = _history.get_turn(workspace, int(args))
+                    if entry is None:
+                        console.print(f"[dim]No turn with id {args}.[/dim]")
+                    else:
+                        console.print(f"[dim]Re-sending turn {args} as a new turn (old state is not restored).[/dim]")
+                        await submit(str(entry.get("text", "")), workspace)
+
+            elif command.startswith("/export"):
+                import export as _export
+                args = text.strip()[len("/export"):].split()
+                flags = {a for a in args if a.startswith("--")}
+                positional = [a for a in args if not a.startswith("--")]
+                target = positional[0] if positional else "last"
+                try:
+                    result = _export.do_export(
+                        workspace, target,
+                        full="--full" in flags, zip_out="--zip" in flags,
+                        fixture="--fixture" in flags, no_redact="--no-redact" in flags,
+                    )
+                except Exception as exc:
+                    console.print(f"[red]Export failed: {exc}[/red]")
+                    result = None
+                if result:
+                    if result.get("error"):
+                        console.print(f"[dim]{result['error']}[/dim]")
+                    else:
+                        if result.get("warning"):
+                            console.print(f"[yellow]{result['warning']}[/yellow]")
+                        console.print(
+                            f"[bright_green]Export written:[/bright_green] {result['path']} "
+                            f"({result.get('size', 0)} bytes, {result.get('turns', 0)} turn(s))"
+                        )
+                        if result.get("zip_path"):
+                            console.print(f"[dim]zip: {result['zip_path']} ({result.get('zip_size', 0)} bytes)[/dim]")
+                        if result.get("note"):
+                            console.print(f"[dim]{result['note']}[/dim]")
+
             elif command == "/setup":
                 await run_setup_slash(workspace)
 
@@ -1660,8 +1719,18 @@ def _parse_cli(argv: list[str]) -> "argparse.Namespace":
         "--benchmark", action="store_true",
         help="headless: start/reuse Ollama only, run benchmark, print, exit",
     )
+    parser.add_argument(
+        "--export", default=None, metavar="TARGET",
+        help="headless: export a debug report for last|<id>|N|a-b|all and exit "
+             "(works with Ollama/FastAPI down). Flags: --zip --fixture --full --no-redact",
+    )
     known, unknown = parser.parse_known_args(argv)
     known.bench_args = unknown  # forwarded to bench.run()
+    # --export flags arrive in `unknown` alongside any bench args; separate them.
+    known.export_zip = "--zip" in unknown
+    known.export_fixture = "--fixture" in unknown
+    known.export_full = "--full" in unknown
+    known.export_no_redact = "--no-redact" in unknown
     return known
 
 
@@ -1694,6 +1763,30 @@ def cli() -> None:
         exit_code = asyncio.run(_benchmark_headless(args))
         _shutdown("benchmark done")
         raise SystemExit(exit_code)
+    if args.export is not None:
+        # Headless debug export: works with Ollama/FastAPI down. Prints the
+        # output path and exits 0 (1 when there is no history).
+        import export as _export
+
+        workspace = args.workspace or str(PROJECT_ROOT)
+        result = _export.do_export(
+            workspace, args.export,
+            full=args.export_full, zip_out=args.export_zip,
+            fixture=args.export_fixture, no_redact=args.export_no_redact,
+        )
+        if result.get("error"):
+            console.print(f"[red]{result['error']}[/red]")
+            raise SystemExit(1)
+        if result.get("warning"):
+            console.print(f"[yellow]{result['warning']}[/yellow]")
+        console.print(f"[bright_green]{result['path']}[/bright_green] "
+                      f"({result.get('size', 0)} bytes, {result.get('turns', 0)} turn(s))")
+        if result.get("zip_path"):
+            console.print(f"[dim]zip: {result['zip_path']} "
+                          f"({result.get('zip_size', 0)} bytes)[/dim]")
+        if result.get("note"):
+            console.print(f"[dim]{result['note']}[/dim]")
+        raise SystemExit(0)
 
     # Prefer the Textual UI; fall back to the Rich TUI when unavailable.
     try:

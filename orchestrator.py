@@ -443,6 +443,7 @@ async def run_pipeline(
     if budgets is None:
         budgets = RunBudgets()
     llm_calls = 0
+    convo_box: dict[str, Any] = {"convo": None}  # set once ConversationState loads
 
     def _cancelled() -> bool:
         return bool(cancel_event is not None and cancel_event.is_set())
@@ -483,6 +484,46 @@ async def run_pipeline(
         journal.emit_event(
             {"event": "run_finished", "run_id": journal.run_id, "status": status}
         )
+
+    def _record_history(
+        path: str,
+        outcome: str,
+        *,
+        label: str = "",
+        answer: str = "",
+        files_planned: list[str] | None = None,
+        files_staged: list[str] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> None:
+        """One history.jsonl entry per turn. Never raises into the flow."""
+        try:
+            import history as _history
+
+            convo_snap: dict[str, Any] = {}
+            convo = convo_box.get("convo")
+            if convo is not None:
+                convo_snap = _history.state_snapshot(convo)
+            _history.append_turn(workspace, {
+                "text": user_request,
+                "path": path,
+                "label": label or None,
+                "run_id": journal.run_id,
+                "models": {"thinker": planner_model, "coder": coder_model},
+                "trace": [
+                    {k: t.get(k) for k in ("stage", "status", "seconds", "model") if t.get(k) is not None}
+                    for t in trace
+                ],
+                "llm_calls": llm_calls,
+                "seconds": round(time.monotonic() - pipeline_start, 3),
+                "outcome": outcome,
+                "error": error,
+                "files_planned": files_planned or [],
+                "files_staged": files_staged or [],
+                "answer_preview": answer[: _history.ANSWER_PREVIEW],
+                "state_snapshot": convo_snap,
+            })
+        except Exception:
+            pass  # history is observability — never breaks a turn
 
     journal.save_state({"run_id": journal.run_id, "status": "running",
                         "request": user_request})
@@ -528,10 +569,9 @@ async def run_pipeline(
                     seconds=round(time.monotonic() - call_t0, 3), error=error,
                 )
 
-    _check_cancel()
-
     try:
         # ------------------------------------------------------------------ ROUTE
+        _check_cancel()  # a pre-set cancel still records history via the except
         # Classify-then-act: fast paths (no model, no files) first, then ONE
         # tiny CLASSIFY call, then ONE act call per label (reply facts / plan).
         from understand import (
@@ -548,6 +588,8 @@ async def run_pipeline(
         if fp == "COMMAND":
             record("FAST-PATH", "ok", 0.0, "command handled by the client")
             _finish("completed")
+            _record_history("fast-path", "ok",
+                            answer="Slash commands are handled by the client UI.")
             return {
                 "answer": "Slash commands are handled by the client UI — "
                           "type /help for the list.",
@@ -558,10 +600,12 @@ async def run_pipeline(
             reply = canned_chat_reply(user_request)
             record("FAST-PATH", "ok", 0.0, "canned", model="")
             _finish("completed")
+            _record_history("fast-path", "ok", answer=reply)
             return {"answer": reply, "trace": trace, "run_id": journal.run_id}
 
         # Conversation state: the models resolve references from it.
         convo = ConversationState.load(workspace)
+        convo_box["convo"] = convo
         # Merge a pending question into the message; after one question we
         # proceed with assumptions — never two questions in a row.
         message = user_request
@@ -609,6 +653,7 @@ async def run_pipeline(
                     last_result={"type": "reply", "text": reply_text},
                 )
                 _finish("completed")
+                _record_history("reply", "ok", label=mode, answer=reply_text)
                 return {"answer": reply_text, "trace": trace, "run_id": journal.run_id}
             # both: print the reply first, then continue to the plan step.
             journal.emit_event({"event": "reply", "text": reply_text[:500]})
@@ -625,6 +670,8 @@ async def run_pipeline(
         except PlanFailed as exc:
             record("PLAN", "failed", time.monotonic() - t0, str(exc)[:200])
             _finish("needs_human", {"staged_files": [], "failed_tasks": []})
+            _record_history("code", "needs_human", label=mode,
+                            error={"stage": "PLAN", "detail": str(exc)[:500]})
             return {
                 "status": "needs_human",
                 "summary": f"Could not produce a valid plan: {exc}",
@@ -659,6 +706,10 @@ async def run_pipeline(
             if not approved:
                 record("PLAN", "ok", 0.0, "declined by user — nothing staged")
                 _finish("declined", {"staged_files": [], "failed_tasks": []})
+                _record_history(mode if mode in ("code", "both") else "code",
+                                "ok", label=mode,
+                                answer="Plan declined by user — nothing was staged.",
+                                files_planned=[t["path"] for t in tasks])
                 return {
                     "status": "declined",
                     "summary": "Plan declined by user — nothing was staged.",
@@ -958,9 +1009,18 @@ async def run_pipeline(
         }
         if mode == "both" and reply_text:
             out["reply"] = reply_text
+        _record_history(
+            mode if mode in ("code", "both") else "code", "ok", label=mode,
+            answer=summary, files_planned=[t["path"] for t in tasks],
+            files_staged=file_list,
+        )
         return out
     except (RunCancelled, OllamaCancelledError):
         _finish("cancelled")
+        _record_history(
+            "code", "cancelled",
+            files_staged=sorted(generated) if "generated" in locals() else [],
+        )
         return {
             "status": "cancelled",
             "summary": "Run cancelled by user.",
@@ -971,6 +1031,11 @@ async def run_pipeline(
         }
     except BudgetExhausted as exc:
         _finish("budget_exhausted")
+        _record_history(
+            "code", "failed",
+            error={"stage": "budget", "detail": str(exc)[:500]},
+            files_staged=sorted(generated) if "generated" in locals() else [],
+        )
         return {
             "status": "budget_exhausted",
             "summary": f"Run stopped: {exc}",
@@ -979,3 +1044,22 @@ async def run_pipeline(
             "trace": trace,
             "run_id": journal.run_id,
         }
+    except Exception as exc:
+        # Any other failure: the turn still lands in history with the error,
+        # and the traceback goes into events.jsonl. Re-raised so main.py's
+        # structured-error envelope carries stage + detail + run_id.
+        import traceback as _tb
+
+        tb_text = _tb.format_exc()
+        stage = trace[-1]["stage"] if trace else "unknown"
+        try:
+            journal.emit_event({"event": "exception", "stage": stage,
+                                "error": str(exc)[:500], "traceback": tb_text})
+        except Exception:
+            pass
+        _finish("failed")
+        _record_history(
+            "error", "error",
+            error={"stage": stage, "detail": str(exc)[:500]},
+        )
+        raise

@@ -198,6 +198,23 @@ class OllamaAgentApp(App):
         self._polling = False
         self._confirm_polling = False
         self._status_bar_at = 0.0
+        # Shell-style input recall (per workspace, persisted from history):
+        # Up walks backwards through prior inputs, Down forwards, Esc clears.
+        self._recall: list[str] = []
+        self._recall_idx: int = -1
+
+    def _load_recall(self) -> None:
+        """Previous inputs, oldest-first, from history (persisted per
+        workspace — survives an app restart)."""
+        try:
+            import history as _history
+
+            entries, _ = _history.read_history(self.workspace, limit=100)
+            self._recall = [str(e.get("text", "")) for e in entries
+                            if str(e.get("text", "")).strip()]
+        except Exception:
+            self._recall = []
+        self._recall_idx = len(self._recall)
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -216,9 +233,34 @@ class OllamaAgentApp(App):
         self.query_one("#status-right", Static).update("loading…")
         self.query_one("#input-bar", Input).focus()
         self._write(f"[{DIM}]Workspace: {self.workspace} — type /help for commands.[/]")
+        self._load_recall()
         # Vitals polling every second, in a thread worker; UI never blocks.
         self.set_interval(1.0, self._tick)
         self._refresh_status_bar()
+
+    def on_key(self, event) -> None:
+        """Up/Down in the input bar recalls previous inputs; Esc clears."""
+        try:
+            input_widget = self.query_one("#input-bar", Input)
+        except Exception:
+            return
+        if not input_widget.has_focus:
+            return
+        if event.key == "up" and self._recall:
+            self._recall_idx = max(0, self._recall_idx - 1)
+            input_widget.value = self._recall[self._recall_idx]
+            event.stop()
+        elif event.key == "down" and self._recall:
+            self._recall_idx = min(len(self._recall), self._recall_idx + 1)
+            input_widget.value = (
+                self._recall[self._recall_idx]
+                if self._recall_idx < len(self._recall) else ""
+            )
+            event.stop()
+        elif event.key == "escape":
+            input_widget.value = ""
+            self._recall_idx = len(self._recall)
+            event.stop()
 
     # ------------------------------------------------------------------ chat
 
@@ -278,6 +320,10 @@ class OllamaAgentApp(App):
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
         event.input.value = ""
+        if text:
+            # recall list: current session's inputs join the persisted ones
+            self._recall.append(text)
+            self._recall_idx = len(self._recall)
 
         # Inline prompts capture the next input (no modal, no "you" echo).
         # Plan-confirm gate: Enter or y approves; anything else declines.
@@ -350,6 +396,24 @@ class OllamaAgentApp(App):
                     else:
                         run_id = run_id or positional[1]
             self._write(_tail_logs_text(self.workspace, channel, count, run_id=run_id))
+        elif command.startswith("/history"):
+            args = text.strip()[len("/history"):].strip()
+            self._write(_history_text(self.workspace, args))
+        elif command.startswith("/retry"):
+            args = text.strip()[len("/retry"):].strip()
+            if not args.isdigit():
+                self._write(f"[{DIM}]Usage: /retry <id> — re-sends that turn's text as a NEW turn (old state is not restored).[/]")
+            else:
+                import history as _history
+                entry = _history.get_turn(self.workspace, int(args))
+                if entry is None:
+                    self._write(f"[{DIM}]No turn with id {args}.[/]")
+                else:
+                    self._write(f"[{DIM}]Re-sending turn {args} as a new turn (old state is not restored).[/]")
+                    self._pipeline_work(str(entry.get("text", "")))
+        elif command.startswith("/export"):
+            args = text.strip()[len("/export"):].strip()
+            self._export_work(args)
         elif command.startswith("/router"):
             self._router_work(text.strip()[len("/router"):].strip())
         elif command == "/roles":
@@ -523,6 +587,50 @@ class OllamaAgentApp(App):
         best = report.get("best_per_role", {})
         if best:
             lines.append("[bold]Best per role:[/] " + ", ".join(f"{k}={v}" for k, v in best.items()))
+        self.call_from_thread(self._write, "\n".join(lines))
+
+    @work(thread=True)
+    def _export_work(self, args: str) -> None:
+        """`/export [target] [--full] [--zip] [--fixture] [--no-redact]` —
+        writes under .agent_runs/exports/, prints the path, copies the report
+        to the clipboard when possible (never fails on clipboard errors)."""
+        import shlex
+
+        import export as _export
+
+        tokens = shlex.split(args) if args.strip() else []
+        flags = {t for t in tokens if t.startswith("--")}
+        positional = [t for t in tokens if not t.startswith("--")]
+        target = positional[0] if positional else "last"
+        try:
+            result = _export.do_export(
+                self.workspace, target,
+                full="--full" in flags, zip_out="--zip" in flags,
+                fixture="--fixture" in flags, no_redact="--no-redact" in flags,
+            )
+        except Exception as exc:
+            self.call_from_thread(self._write, f"[{RED}]Export failed: {exc}[/]")
+            return
+        if result.get("error"):
+            self.call_from_thread(self._write, f"[{DIM}]{result['error']}[/]")
+            return
+        lines: list[str] = []
+        if result.get("warning"):
+            lines.append(f"[yellow]{result['warning']}[/]")
+        lines.append(f"[bold {ACCENT}]Export written:[/] {result['path']} "
+                     f"({result.get('size', 0)} bytes, {result.get('turns', 0)} turn(s))")
+        if result.get("zip_path"):
+            lines.append(f"[{DIM}]zip: {result['zip_path']} ({result.get('zip_size', 0)} bytes)[/]")
+        if result.get("note"):
+            lines.append(f"[{DIM}]{result['note']}[/]")
+        # Clipboard: best-effort, never fails the command.
+        report = result.get("report")
+        if report:
+            try:
+                self.copy_to_clipboard(report)
+                lines.append(f"[{DIM}](report copied to the clipboard)[/]")
+            except Exception:
+                lines.append(f"[{DIM}](clipboard unavailable — the path above has the report)[/]")
         self.call_from_thread(self._write, "\n".join(lines))
 
     @work(thread=True)
@@ -762,6 +870,25 @@ class OllamaAgentApp(App):
 def _post_get_sync(url: str) -> dict:
     with _req.urlopen(url, timeout=5) as r:
         return _json.loads(r.read())
+
+
+def _history_text(workspace: str, args: str) -> str:
+    """`/history` shared dispatch: [N] | <id> | search <text>."""
+    import history as _history
+
+    args = args.strip()
+    if not args:
+        return f"[{DIM}]" + _history.format_history_table(workspace) + "[/]"
+    if args.startswith("search "):
+        return f"[{DIM}]" + _history.format_history_search(workspace, args[7:].strip()) + "[/]"
+    if args.isdigit():
+        # /history <id> shows one turn; /history N (small) could mean a count —
+        # disambiguate: a bare number that matches an existing id wins as id.
+        n = int(args)
+        if _history.get_turn(workspace, n) is not None:
+            return f"[{DIM}]" + _history.format_history_detail(workspace, n) + "[/]"
+        return f"[{DIM}]" + _history.format_history_table(workspace, n) + "[/]"
+    return f"[{DIM}]Usage: /history [N] | /history <id> | /history search <text>[/]"
 
 
 def _short_model(name) -> str:

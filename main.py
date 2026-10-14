@@ -728,6 +728,34 @@ async def agent_events(workspace_dir: str | None = None, run_id: str | None = No
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
+@app.get("/agent/history")
+async def agent_history(workspace_dir: str | None = None, limit: int = 15,
+                        before: int | None = None) -> dict[str, Any]:
+    """Per-turn history for a workspace (chronological; `before` pages back)."""
+    import history as _history
+
+    workspace = Path(workspace_dir).resolve() if workspace_dir else state.workspace_root
+    entries, skipped = _history.read_history(workspace, limit=limit, before=before)
+    return {"workspace": str(workspace), "turns": entries, "skipped": skipped}
+
+
+@app.get("/agent/export")
+async def agent_export(workspace_dir: str | None = None, target: str = "last",
+                       format: str = "md") -> dict[str, Any]:
+    """One-command debug export. format: md (report) | zip | fixture."""
+    import export as _export
+
+    workspace = Path(workspace_dir).resolve() if workspace_dir else state.workspace_root
+    result = _export.do_export(
+        workspace, target,
+        zip_out=(format == "zip"), fixture=(format == "fixture"),
+        config=state.config, build_id=_build_id(),
+    )
+    # Never hand the full report text back over HTTP (the UI reads the file).
+    result.pop("report", None)
+    return result
+
+
 @app.post("/workspace/status")
 async def workspace_status(payload: StatusRequest | None = None) -> dict[str, Any]:
     """4. POST /workspace/status
